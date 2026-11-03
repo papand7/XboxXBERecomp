@@ -175,8 +175,8 @@ std::vector<StylePreset> BuiltIn() {
     e.saturation = 1.1f;
     e.temperature = 0.05f;
     e.sharpen = 0.35f;
-    e.bloom = 0.35f;
-    e.bloom_threshold = 0.7f;
+    e.bloom = 0.2f;
+    e.bloom_threshold = 0.85f;
     e.ao = 0.8f;
     e.vignette = 0.2f;
     e.tex_filter = kFilterAnisotropic;
@@ -186,7 +186,7 @@ std::vector<StylePreset> BuiltIn() {
     t.mode = kStyleToon;
     t.saturation = 1.3f;
     t.contrast = 1.05f;
-    t.bands = 4;
+    t.bands = 5;
     t.outline = 1.5f;
     t.halftone = 0.0f;
     t.tex_filter = kFilterAnisotropic;

@@ -593,7 +593,8 @@ float noise(float2 v) { return frac(sin(dot(v, float2(12.9898, 78.233))) * 43758
 float3 aces(float3 a) { return saturate((a * (2.51 * a + 0.03)) / (a * (2.43 * a + 0.59) + 0.14)); }
 float3 grade(float3 c) {
     c *= p[1].x;
-    if (p[1].y == 1) c = saturate(aces(c * 1.6) / 0.886);          // filmic, white kept near white
+    // filmic: an S-curve with mid grey (0.18) and white kept where they were, so a night stays a night
+    if (p[1].y == 1) c = saturate(aces(c * 0.5) / 0.616);
     if (p[1].y == 2) { float3 x = c * 1.25; c = saturate(x * (1 + x / 2.25) / (1 + x) / 0.871); }
     c = (c - 0.5) * p[1].z + 0.5;
     c = lerp(luma(c).xxx, c, p[1].w);
@@ -674,7 +675,8 @@ float4 ps(O i) : SV_Target {
         float Lp = sqrt(L);
         float Lq = (floor(Lp * bands) + 0.5) / bands;
         Lq *= Lq;
-        c = saturate(c * clamp(Lq / max(L, 1e-3), 0.5, 2.0));
+        float3 banded = saturate(c * clamp(Lq / max(L, 1e-3), 0.5, 2.0));
+        c = lerp(banded, c, 0.3);  // some of the texture's own shading kept: walls and faces stay legible
         if (p[5].w > 0) {
             float cell = 5 * p[7].w;
             float2 g = frac(i.pos.xy / cell) - 0.5;
@@ -991,6 +993,13 @@ private:
     Target* scene_ds_ = nullptr;
     bool post_done_ = false;
     void ScenePass(Target& rt, Target* ds);
+    // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
+    // mod, read again when it changes), else the built-in kScenePostHlsl
+    const std::string& ScenePassSource();
+    std::string builtin_post_ = kScenePostHlsl, mod_post_;
+    std::filesystem::file_time_type mod_post_time_{};
+    std::chrono::steady_clock::time_point mod_post_checked_{};
+    uint64_t scene_src_hash_ = 0;
     // GPU timestamps a frame slot: frame start, frame end, scene pass start, end
     VkQueryPool stamps_ = VK_NULL_HANDLE;
     uint32_t stamp_written_[kFramesInFlight] = {};  // bits of the four written
@@ -1008,6 +1017,7 @@ private:
         ~PerfScope() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
     };
     uint64_t perf_frames_ = 0, perf_submits_ = 0, perf_draws_ = 0;
+    uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0;  // draws by kind
     std::chrono::steady_clock::time_point perf_t_ = std::chrono::steady_clock::now();
     void LogPerf();
     friend VkBool32 VKAPI_PTR DebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -3201,6 +3211,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (counting) vkCmdBeginQuery(cb, queries_, q, 0);
     DrawGeometry(a);
     perf_draws_++;
+    if (draw_2d_) perf_2d_++;
+    else if (sh.prog) perf_prog_++;
+    else if (sh.fixed_transform) perf_fixed_++, perf_lit_ += (sh.fk.light & 1);
     if (counting) {
         vkCmdEndQuery(cb, queries_, q);
         counted_.push_back({q, serial_ + 1, SamplesPerPixel()});
@@ -3498,12 +3511,42 @@ void VulkanBackend::Present(const Surface& front) {
     if (diag::Perf()) LogPerf();
 }
 
+const std::string& VulkanBackend::ScenePassSource() {
+    auto now = std::chrono::steady_clock::now();
+    if (now - mod_post_checked_ >= std::chrono::seconds(1)) {
+        mod_post_checked_ = now;
+        std::filesystem::path f = app::ExeDir() / "mods" / "shaders" / "scene_post.hlsl";
+        std::error_code ec;
+        auto t = std::filesystem::last_write_time(f, ec);
+        if (ec) {
+            if (!mod_post_.empty()) LOGR("vulkan: mods/shaders/scene_post.hlsl gone, the built-in scene pass is used");
+            mod_post_.clear();
+        } else if (t != mod_post_time_ || mod_post_.empty()) {
+            mod_post_time_ = t;
+            std::ifstream in(f, std::ios::binary);
+            mod_post_.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            scene_src_hash_ = Hash(mod_post_.data(), mod_post_.size());
+            LOGR("vulkan: scene pass from mods/shaders/scene_post.hlsl (%zu bytes)", mod_post_.size());
+        }
+    }
+    return mod_post_.empty() ? builtin_post_ : mod_post_;
+}
+
 // the scene, copied, drawn back over itself through the style's pass
 void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     post_done_ = true;
     const GraphicsStyle& st = Style();
     uint64_t vh, ph;
-    if (!Compile(kScenePostHlsl, "vs", "vs_5_0", vh) || !Compile(kScenePostHlsl, "ps", "ps_5_0", ph)) {
+    const std::string& src = ScenePassSource();
+    bool ok = Compile(src, "vs", "vs_5_0", vh) && Compile(src, "ps", "ps_5_0", ph);
+    if (!ok && &src != &builtin_post_) {
+        // a mod's shader that does not compile: the built-in one, until the file changes again
+        static uint64_t told = 0;
+        if (told != scene_src_hash_) LOGR("vulkan: mods/shaders/scene_post.hlsl did not compile (the log above says why), "
+                                          "the built-in scene pass is used"), told = scene_src_hash_;
+        ok = Compile(builtin_post_, "vs", "vs_5_0", vh) && Compile(builtin_post_, "ps", "ps_5_0", ph);
+    }
+    if (!ok) {
         LOG_FIRST(1, "vulkan: the style's scene pass did not compile; the scene is drawn as the game's");
         return;
     }
@@ -3578,6 +3621,9 @@ void VulkanBackend::LogPerf() {
          gpu_frames_ ? gpu_frame_ms_ / gpu_frames_ : 0.0, gpu_posts_ ? gpu_post_ms_ / gpu_posts_ : 0.0, gpu_posts_,
          gpu_frames_, Style().mode == kStyleOriginal ? "original" : Style().mode == kStyleEnhanced ? "enhanced"
                       : Style().mode == kStyleToon ? "toon" : "retro");
+    LOGR("perf: vulkan draws a frame: %.0f 2D, %.0f vertex programs, %.0f fixed function (%.0f lit)",
+         perf_2d_ / n, perf_prog_ / n, perf_fixed_ / n, perf_lit_ / n);
+    perf_prog_ = perf_fixed_ = perf_lit_ = perf_2d_ = 0;
     gpu_frame_ms_ = gpu_post_ms_ = 0;
     gpu_frames_ = gpu_posts_ = 0;
     perf_draw_ = perf_present_ = perf_acquire_ = perf_sync_ = perf_submit_ = 0;
