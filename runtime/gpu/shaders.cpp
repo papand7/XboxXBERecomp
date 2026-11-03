@@ -63,6 +63,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 wdepth;
     float4 hud;
     float4 pts;  // point sprites on, size min, size max, D3DRS_POINTSIZE
+    float4 style;  // graphics styles: xy the vertex snapping grid, 0 off
 };
 )";
 
@@ -237,6 +238,8 @@ const char* kVsEpilogue = R"(
     if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;
     q.x = p.x * 2 / surf.x - 1;
     q.y = 1 - p.y * 2 / surf.y;
+    // Retro style: positions on a coarse screen grid, the console era's wobbling vertices
+    if (style.x > 0) q.xy = round(q.xy * style.xy) / style.xy;
     q.z = p.z * surf.z;
     // W-buffered (hud.w): the pixel shader writes the depth from w and the console clips nothing past the far plane,
     // so z stays within w here: PGR2's sky dome and far hills lie past it and were clipped away (Nurburgring)

@@ -49,7 +49,9 @@
 #include "gpu/d3d_common.h"
 #include "gpu/ext.h"
 #include "gpu/shaders.h"
+#include "gpu/style.h"
 #include "gpu/texture.h"
+#include "gpu/texture_pack.h"
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 
@@ -160,6 +162,7 @@ namespace {
     X(vkCmdCopyImage)               \
     X(vkCmdClearAttachments)        \
     X(vkCmdBeginQuery)              \
+    X(vkCmdWriteTimestamp2)         \
     X(vkCmdEndQuery)
 
 #define VK_DECLARE(f) PFN_##f f = nullptr;
@@ -560,6 +563,143 @@ std::string LocateInputs(std::string src) {
     return src;
 }
 
+// The graphics styles' scene pass (style.h): the 3D scene, copied, drawn back over itself before the first HUD draw.
+// b1 p[8]: [0] mode, 1/width, 1/height, seconds; [1] exposure, tone map, contrast, saturation; [2] temperature,
+// sharpen, bloom, bloom threshold; [3] AO, AO radius, vignette, grain; [4] bands, outline px, internal edges, edge
+// threshold; [5] outline colour, halftone; [6] block px, colour levels, dither, retro grading; [7] depth bound,
+// width, height, host px per console px. t0 the scene, t1 its depth; s0 linear, s1 point.
+const char* kScenePostHlsl = R"(
+cbuffer P : register(b1) { float4 p[8]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+static const float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+float3 tex(float2 uv) { return scene.SampleLevel(pt, uv, 0).rgb; }
+float3 texl(float2 uv) { return scene.SampleLevel(ls, uv, 0).rgb; }
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float rawz(float2 uv) { return depthtex.SampleLevel(pt, uv, 0); }
+// grows with distance for a perspective depth: what neighbour comparisons are made on
+float linz(float d) { return 1.0 / max(1.0 - d, 1e-6); }
+float noise(float2 v) { return frac(sin(dot(v, float2(12.9898, 78.233))) * 43758.5453); }
+float3 aces(float3 a) { return saturate((a * (2.51 * a + 0.03)) / (a * (2.43 * a + 0.59) + 0.14)); }
+float3 grade(float3 c) {
+    c *= p[1].x;
+    if (p[1].y == 1) c = saturate(aces(c * 1.6) / 0.886);          // filmic, white kept near white
+    if (p[1].y == 2) { float3 x = c * 1.25; c = saturate(x * (1 + x / 2.25) / (1 + x) / 0.871); }
+    c = (c - 0.5) * p[1].z + 0.5;
+    c = lerp(luma(c).xxx, c, p[1].w);
+    c *= float3(1 + 0.1 * p[2].x, 1, 1 - 0.1 * p[2].x);
+    return saturate(c);
+}
+float ao(float2 uv, float2 px, float d) {
+    if (p[7].x == 0 || p[3].x == 0 || d >= 0.99999) return 1;
+    float zc = linz(d), occ = 0;
+    float r = 6 * p[3].y * p[7].w;
+    float a0 = noise(uv * 917.0) * 6.2832;
+    [unroll] for (int i = 0; i < 8; i++) {
+        float a = a0 + i * 2.3999;
+        float rr = r * (0.35 + 0.65 * frac(i * 0.618 + a0));
+        float zn = linz(rawz(uv + float2(cos(a), sin(a)) * rr * px));
+        float diff = (zc - zn) / zc;
+        occ += saturate(diff * 12) * saturate(1.5 - diff * 3);
+    }
+    return saturate(1 - occ / 8 * p[3].x);
+}
+float3 bloom(float2 uv, float2 px) {
+    if (p[2].z == 0) return 0;
+    float3 sum = 0;
+    float r = 5 * p[7].w;
+    [unroll] for (int i = 0; i < 12; i++) {
+        float a = i * 0.5236;
+        float2 o = float2(cos(a), sin(a)) * px;
+        sum += max(texl(uv + o * r) - p[2].w, 0) + max(texl(uv + o * r * 2.6) - p[2].w, 0);
+    }
+    return sum / 24 * p[2].z * 2;
+}
+float edge(float2 uv, float2 px, float d) {
+    float t = p[4].y;
+    if (t <= 0) return 0;
+    float2 o = px * t;
+    float e = 0;
+    if (p[7].x != 0 && d < 0.99999) {
+        float zc = linz(d);
+        float zl = linz(rawz(uv - float2(o.x, 0))), zr = linz(rawz(uv + float2(o.x, 0)));
+        float zu = linz(rawz(uv - float2(0, o.y))), zd = linz(rawz(uv + float2(0, o.y)));
+        float dz = max(max(abs(zl - zc), abs(zr - zc)), max(abs(zu - zc), abs(zd - zc))) / zc;
+        e = saturate((dz - 0.06) * 20);
+    } else if (p[7].x != 0) {
+        // sky: an edge where a neighbour is geometry
+        float m = min(min(rawz(uv - float2(o.x, 0)), rawz(uv + float2(o.x, 0))), min(rawz(uv - float2(0, o.y)), rawz(uv + float2(0, o.y))));
+        e = m < 0.99999 ? 1 : 0;
+    }
+    if (p[4].z != 0) {
+        float gx = luma(tex(uv + float2(o.x, 0))) - luma(tex(uv - float2(o.x, 0)));
+        float gy = luma(tex(uv + float2(0, o.y))) - luma(tex(uv - float2(0, o.y)));
+        e = max(e, saturate((sqrt(gx * gx + gy * gy) - p[4].w) * 8));
+    }
+    return e;
+}
+float4 ps(O i) : SV_Target {
+    float2 px = p[0].yz;
+    float2 uv = i.uv;
+    int mode = int(p[0].x);
+    if (mode == 3) {
+        // retro: blocks of the console's pixels, fewer colours, dithered, graded
+        float blk = max(p[6].x, 1);
+        float2 cell = floor(i.pos.xy / blk);
+        float3 c = tex((cell + 0.5) * blk * px);
+        c = lerp(c, saturate(c * float3(1.08, 1.0, 0.82) + float3(0.02, 0.01, 0.0)), p[6].w);
+        c = grade(c);
+        float levels = p[6].y;
+        float b = p[6].z != 0 ? (bayer[(int(cell.x) & 3) + (int(cell.y) & 3) * 4] + 0.5) / 16 - 0.5 : 0;
+        c = saturate(floor(c * levels + 0.5 + b) / levels);
+        return float4(c, 1);
+    }
+    float d = p[7].x != 0 ? rawz(uv) : 1;
+    float3 c = tex(uv);
+    if (mode == 2) {
+        // toon: flat lighting bands, outlines, halftone in the shadows
+        float L = luma(c), bands = p[4].x;
+        // bands even to the eye (in the square root of brightness), each pixel moved to its band's middle, by at most
+        // a factor of two either way (a night scene keeps its darks, noise in them is not lifted into colour)
+        float Lp = sqrt(L);
+        float Lq = (floor(Lp * bands) + 0.5) / bands;
+        Lq *= Lq;
+        c = saturate(c * clamp(Lq / max(L, 1e-3), 0.5, 2.0));
+        if (p[5].w > 0) {
+            float cell = 5 * p[7].w;
+            float2 g = frac(i.pos.xy / cell) - 0.5;
+            float dotr = sqrt(saturate(1 - Lq)) * 0.7;
+            c *= 1 - p[5].w * 0.6 * (length(g) < dotr ? 1 : 0);
+        }
+        c = grade(c);
+        c = lerp(c, p[5].rgb, edge(uv, px, d));
+        return float4(c, 1);
+    }
+    // enhanced
+    if (p[2].y > 0) {
+        float3 n = tex(uv + float2(px.x, 0)) + tex(uv - float2(px.x, 0)) + tex(uv + float2(0, px.y)) + tex(uv - float2(0, px.y));
+        c = saturate(c + (c - n * 0.25) * p[2].y * 1.5);
+    }
+    c *= ao(uv, px, d);
+    c += bloom(uv, px);
+    c = grade(c);
+    float v = length(uv - 0.5) * 1.414;
+    c *= 1 - p[3].z * smoothstep(0.35, 1.0, v);
+    c += (noise(uv * 1000 + p[0].w) - 0.5) * p[3].w * 0.12;
+    return float4(saturate(c), 1);
+}
+)";
+
 // ---- DXC, loaded from dxcompiler.dll beside the exe
 
 struct Dxc {
@@ -846,6 +986,19 @@ private:
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
     uint64_t fps_n_ = 0;
     uint64_t validation_errors_ = 0;
+    // graphics styles: the frame's 3D scene target and depth, and whether its scene pass ran
+    Target* scene_rt_ = nullptr;
+    Target* scene_ds_ = nullptr;
+    bool post_done_ = false;
+    void ScenePass(Target& rt, Target* ds);
+    // GPU timestamps a frame slot: frame start, frame end, scene pass start, end
+    VkQueryPool stamps_ = VK_NULL_HANDLE;
+    uint32_t stamp_written_[kFramesInFlight] = {};  // bits of the four written
+    bool frame_stamp_due_ = true;
+    double gpu_frame_ms_ = 0, gpu_post_ms_ = 0;
+    uint32_t gpu_frames_ = 0, gpu_posts_ = 0;
+    void Stamp(uint32_t which);
+    void ReadStamps(uint32_t slot);
     // XBE_PERF: a line a second
     double perf_wait_ = 0;  // ms the render thread waited for the GPU
     double perf_draw_ = 0, perf_present_ = 0, perf_acquire_ = 0, perf_sync_ = 0, perf_submit_ = 0;  // ms in each
@@ -1277,6 +1430,18 @@ bool VulkanBackend::CreateFixed() {
             LOGW("vulkan: no host query reset, visibility tests stay pending");
         }
     }
+    // GPU timings: four timestamps a frame slot
+    {
+        uint32_t qn = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(pd_, &qn, nullptr);
+        std::vector<VkQueueFamilyProperties> qf(qn);
+        vkGetPhysicalDeviceQueueFamilyProperties(pd_, &qn, qf.data());
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 4 * kFramesInFlight;
+        if (host_reset_ && qf[family_].timestampValidBits && vkCreateQueryPool(dev_, &qi, nullptr, &stamps_) == VK_SUCCESS)
+            vkResetQueryPool(dev_, stamps_, 0, 4 * kFramesInFlight);
+    }
     // the gamma lookup: one BGRA texel per ramp entry; the stand-in texture
     const VkImageUsageFlags sampled = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!MakeImage(lut_, VK_IMAGE_TYPE_2D, kBgra, 256, 1, 1, 1, 1, sampled) ||
@@ -1329,6 +1494,8 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
         LOGE("vulkan: the pass shaders do not compile to SPIR-V (a dxcompiler.dll without SPIR-V?)");
         return false;
     }
+    LoadStyle();
+    SetStyleRendererActive(true);
     ui_ = InitUi();
     if (!ui_) LOGW("vulkan: the overlay could not start");
     if (g_extension) LOGW("vulkan: the renderer extension is not used under Vulkan");
@@ -1367,6 +1534,7 @@ VulkanBackend::~VulkanBackend() {
     for (auto& [k, s] : samplers_) vkDestroySampler(dev_, s, nullptr);
     for (VkSampler s : pass_samplers_) vkDestroySampler(dev_, s, nullptr);
     if (queries_) vkDestroyQueryPool(dev_, queries_, nullptr);
+    if (stamps_) vkDestroyQueryPool(dev_, stamps_, nullptr);
     if (ui_pool_) vkDestroyDescriptorPool(dev_, ui_pool_, nullptr);
     vkDestroyPipelineCache(dev_, cache_, nullptr);
     vkDestroyPipelineLayout(dev_, layout_, nullptr);
@@ -1414,6 +1582,10 @@ VkCommandBuffer VulkanBackend::Cmd() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd_, &bi);
     ForgetDrawState();
+    if (frame_stamp_due_) {
+        frame_stamp_due_ = false;
+        Stamp(0);
+    }
     return cmd_;
 }
 
@@ -1791,6 +1963,7 @@ bool VulkanBackend::CreateTarget(Target& t) {
 
 void VulkanBackend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) Unbind();
+    if (scene_rt_ == &it->second || scene_ds_ == &it->second) scene_rt_ = scene_ds_ = nullptr;
     DropImage(it->second.res);
     DropImage(it->second.fb);
     DropImage(it->second.shrunk);
@@ -2545,6 +2718,8 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         if (sig != tx.sig || !same) {
             tx.sig = sig;
             UploadTexture(tx, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr);
+            TexturePackSeen(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr,
+                            palette.hash);
         }
     }
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
@@ -2921,12 +3096,40 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         FillTransformConstants(s, size, c);
         FillLightConstants(s, sh.fk, c);
     }
-    // samplers
+    // graphics styles: the 3D scene goes to a screen sized target with depth; the first 2D draw over it after that
+    // (the HUD, menus) has the scene pass drawn first, so the 2D keeps the game's look
+    const GraphicsStyle& st = Style();
+    bool styled = st.mode != kStyleOriginal;
+    if (styled && bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_) {
+        if (!draw_2d_ && bound_ds_) {
+            scene_rt_ = bound_rt_;
+            scene_ds_ = bound_ds_;
+        } else if (draw_2d_ && !post_done_ && scene_rt_ == bound_rt_) {
+            ScenePass(*scene_rt_, scene_ds_);
+        }
+    }
+    if (styled && !draw_2d_ && st.mode == kStyleRetro && st.vertex_snap) {
+        c.style[0] = float(size.w) / (2.0f * float(st.pixel));
+        c.style[1] = float(size.h) / (2.0f * float(st.pixel));
+    }
+    // samplers; a style's filtering for the 3D scene's textures
     VkSampler smp[4];
     bool clamp = UnitTexcoords(a);
     uint32_t aniso = app::Get().aniso;
-    for (int i = 0; i < 4; i++)
-        smp[i] = Sampler(StageSampler(s, i, stages.levels[i], stages.info[i].shadow, clamp, aniso, stages.replaced[i]));
+    for (int i = 0; i < 4; i++) {
+        D3D12_SAMPLER_DESC sd = StageSampler(s, i, stages.levels[i], stages.info[i].shadow, clamp, aniso, stages.replaced[i]);
+        if (styled && !draw_2d_ && !stages.info[i].shadow && !stages.reads.rt[i]) {
+            if (st.tex_filter == kFilterNearest) {
+                sd.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+                sd.MaxAnisotropy = 0;
+            } else if (st.tex_filter == kFilterAnisotropic && stages.levels[i] > 1) {
+                sd.Filter = D3D12_FILTER_ANISOTROPIC;
+                sd.MaxAnisotropy = 16;
+                sd.MaxLOD = D3D12_FLOAT32_MAX;
+            }
+        }
+        smp[i] = Sampler(sd);
+    }
 
     // the rendering instance, then everything recorded inside it
     Begin(TargetAttachments(bound_rt_, bound_ds_));
@@ -3155,8 +3358,30 @@ void VulkanBackend::Present(const Surface& front) {
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (ramp_dirty_) UploadGammaRamp();
-    // at most kFramesInFlight frames ahead of the GPU
-    Wait(frame_serial_[frame_slot_]);
+    if (t && Style().mode != kStyleOriginal && !post_done_ && scene_rt_ == t) ScenePass(*t, scene_ds_);
+    // XBE_PAD_CMD's diagnostic: a file named shot beside the exe holding a PNG path gets the frame, as drawn, there
+    static const bool shots = [] {
+        const char* e = std::getenv("XBE_PAD_CMD");
+        return e && *e && *e != '0';
+    }();
+    if (shots && t && presents_ % 15 == 0) {
+        std::filesystem::path req = app::ExeDir() / "shot";
+        std::error_code ec;
+        if (std::filesystem::exists(req, ec)) {
+            std::wstring out;
+            if (std::wifstream in{req}) std::getline(in, out);
+            std::filesystem::remove(req, ec);
+            std::vector<uint8_t> px;
+            if (!out.empty() && ReadBack(t->res, t->w, t->h, px)) {
+                std::vector<uint32_t> bgra(px.size() / 4);
+                std::memcpy(bgra.data(), px.data(), px.size());
+                for (uint32_t& p : bgra) p |= 0xFF000000u;
+                LOGR("vulkan: shot %ls %s", out.c_str(), WritePngFile(out, bgra, t->w, t->h) ? "written" : "failed");
+            }
+        }
+    }
+    scene_rt_ = scene_ds_ = nullptr;
+    post_done_ = false;
     uint32_t index = 0;
     bool acquired;
     {
@@ -3199,6 +3424,7 @@ void VulkanBackend::Present(const Surface& front) {
         vkCmdEndRendering(cb);
         open_ = false;
         cur_ = {};
+        Stamp(1);
         ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         ib.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
         ib.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
@@ -3221,6 +3447,11 @@ void VulkanBackend::Present(const Surface& front) {
     } else {
         Submit();
     }
+    // at most kFramesInFlight frames ahead of the GPU; the slot's timings read before it is used again
+    Wait(frame_serial_[frame_slot_]);
+    ReadStamps(frame_slot_);
+    frame_stamp_due_ = true;
+    SaveStyleIfDue();
     Unbind();
     DeliverReports(false);
     Collect();
@@ -3233,6 +3464,70 @@ void VulkanBackend::Present(const Surface& front) {
     if (diag::Perf()) LogPerf();
 }
 
+// the scene, copied, drawn back over itself through the style's pass
+void VulkanBackend::ScenePass(Target& rt, Target* ds) {
+    post_done_ = true;
+    const GraphicsStyle& st = Style();
+    uint64_t vh, ph;
+    if (!Compile(kScenePostHlsl, "vs", "vs_5_0", vh) || !Compile(kScenePostHlsl, "ps", "ps_5_0", ph)) {
+        LOG_FIRST(1, "vulkan: the style's scene pass did not compile; the scene is drawn as the game's");
+        return;
+    }
+    VkPipeline pipe = PassPipeline({vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pipe) return;
+    if (!rt.fb && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    bool depth = ds && ds->w == rt.w && ds->h == rt.h;
+    End();
+    Stamp(2);
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    float k = float(rt.h) / float(rt.gh);  // host pixels per console pixel
+    float levels = float((1u << st.color_bits) - 1);
+    float c[32] = {float(st.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
+                   st.exposure, float(st.tonemap), st.contrast, st.saturation,
+                   st.temperature, st.sharpen, st.bloom, st.bloom_threshold,
+                   st.ao, st.ao_radius, st.vignette, st.grain,
+                   float(st.bands), st.outline * k, st.internal_edges ? 1.0f : 0.0f, st.edge_threshold,
+                   st.outline_color[0], st.outline_color[1], st.outline_color[2], st.halftone,
+                   float(st.pixel) * k, levels, st.dither ? 1.0f : 0.0f, st.retro_tint,
+                   depth ? 1.0f : 0.0f, float(rt.w), float(rt.h), k};
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[2] = {rt.fb.view, depth ? ds->res.view : VK_NULL_HANDLE};
+    if (!views[1] && !null_descriptor_) views[1] = dummy_.view;
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 32, views, 2);
+    End();
+    Stamp(3);
+    ForgetDrawState();  // the draw that asked for it goes on with its targets
+}
+
+// a timestamp of the frame slot being recorded: 0 frame start, 1 frame end, 2 scene pass start, 3 its end
+void VulkanBackend::Stamp(uint32_t which) {
+    if (!stamps_ || (stamp_written_[frame_slot_] >> which & 1)) return;
+    vkCmdWriteTimestamp2(Cmd(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, stamps_, frame_slot_ * 4 + which);
+    stamp_written_[frame_slot_] |= 1u << which;
+}
+
+// a finished slot's timings into the perf counters, its queries reset for the next frame
+void VulkanBackend::ReadStamps(uint32_t slot) {
+    if (!stamps_) return;
+    uint32_t w = stamp_written_[slot];
+    uint64_t t[4] = {};
+    for (uint32_t i = 0; i < 4; i++)
+        if (w >> i & 1) vkGetQueryPoolResults(dev_, stamps_, slot * 4 + i, 1, 8, &t[i], 8, VK_QUERY_RESULT_64_BIT);
+    double ns = props_.limits.timestampPeriod;
+    if ((w & 3) == 3 && t[1] > t[0]) gpu_frame_ms_ += double(t[1] - t[0]) * ns / 1e6, gpu_frames_++;
+    if ((w & 12) == 12 && t[3] > t[2]) gpu_post_ms_ += double(t[3] - t[2]) * ns / 1e6, gpu_posts_++;
+    vkResetQueryPool(dev_, stamps_, slot * 4, 4);
+    stamp_written_[slot] = 0;
+}
+
 void VulkanBackend::LogPerf() {
     perf_frames_++;
     auto now = std::chrono::steady_clock::now();
@@ -3243,8 +3538,14 @@ void VulkanBackend::LogPerf() {
          perf_frames_ / el, el * 1000 / perf_frames_, perf_wait_ / perf_frames_, double(perf_draws_) / perf_frames_,
          double(perf_submits_) / perf_frames_, pipelines_.size(), textures_.size(), targets_.size());
     double n = double(perf_frames_);
-    LOGR("perf: vulkan per frame: draw %.2f ms, present %.2f (acquire %.2f), sync %.2f, queue submits %.2f",
-         perf_draw_ / n, perf_present_ / n, perf_acquire_ / n, perf_sync_ / n, perf_submit_ / n);
+    LOGR("perf: vulkan per frame: draw %.2f ms, present %.2f (acquire %.2f), sync %.2f, queue submits %.2f | GPU frame "
+         "%.2f ms, scene pass %.3f ms (%u of %u frames), style %s",
+         perf_draw_ / n, perf_present_ / n, perf_acquire_ / n, perf_sync_ / n, perf_submit_ / n,
+         gpu_frames_ ? gpu_frame_ms_ / gpu_frames_ : 0.0, gpu_posts_ ? gpu_post_ms_ / gpu_posts_ : 0.0, gpu_posts_,
+         gpu_frames_, Style().mode == kStyleOriginal ? "original" : Style().mode == kStyleEnhanced ? "enhanced"
+                      : Style().mode == kStyleToon ? "toon" : "retro");
+    gpu_frame_ms_ = gpu_post_ms_ = 0;
+    gpu_frames_ = gpu_posts_ = 0;
     perf_draw_ = perf_present_ = perf_acquire_ = perf_sync_ = perf_submit_ = 0;
     LOGR("perf: title thread per frame: recording %.2f ms, waiting %.2f ms (%.1f waits: read-back %.2f resource %.2f "
          "fence %.2f flush %.2f copy %.2f, next frame %.2f)",
@@ -3283,6 +3584,7 @@ void VulkanBackend::ApplySettings() {
 // a new render scale or shape: colour targets keep their pictures, scaled into new ones, depth targets start again
 void VulkanBackend::RescaleTargets() {
     Unbind();
+    scene_rt_ = scene_ds_ = nullptr;
     for (auto it = targets_.begin(); it != targets_.end();) {
         Target& old = it->second;
         if (old.depth) {

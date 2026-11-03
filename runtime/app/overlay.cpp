@@ -20,6 +20,7 @@
 #include "app/app.h"
 #include "core/input.h"
 #include "core/log.h"
+#include "gpu/style.h"
 
 namespace app {
 
@@ -594,6 +595,10 @@ void DrawOverlay() {
             }
             if (ImGui::BeginTabItem("Graphics")) {
                 Graphics(s);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Graphics Style")) {
+                gpu::DrawStyleSettings(gpu::StyleRendererActive());
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Game")) {
