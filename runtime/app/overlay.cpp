@@ -148,13 +148,14 @@ void Graphics(Settings& s) {
     ImGui::TextDisabled("MSAA smooths the edges of the 3D scene at once; render scale above 100%% also smooths edges.");
     if (ImGui::Checkbox("Show frames a second", &s.show_fps)) Save();
     if (kGame.sharpen_2d && ImGui::Checkbox("Sharp text and HUD", &s.sharp_2d)) Save();
-    int renderer = int(s.renderer % 2);
-    const char* renderers[] = {"Direct3D 12", "Direct3D 11"};
-    if (ImGui::Combo("Renderer", &renderer, renderers, 2)) {
+    int renderer = int(s.renderer % 3);
+    const char* renderers[] = {"Direct3D 12", "Direct3D 11", "Vulkan (experimental)"};
+    if (ImGui::Combo("Renderer", &renderer, renderers, 3)) {
         s.renderer = uint32_t(renderer);
         Save();
     }
-    ImGui::TextDisabled("Renderer applies at the next start; Direct3D 11 for GPUs or drivers where 12 runs badly.");
+    ImGui::TextDisabled("Renderer applies at the next start; Direct3D 11 for GPUs or drivers where 12 runs badly; "
+                        "Vulkan falls back to Direct3D 12 when it cannot start.");
 }
 
 void General(Settings& s) {

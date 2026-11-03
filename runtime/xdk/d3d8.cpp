@@ -570,7 +570,8 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
             g_backend.reset();
             g_backend = gpu::CreateFallbackBackend();
             if (g_backend && g_backend->Init(w, h)) {
-                LOGR("d3d: the chosen renderer could not start, running on the fallback (Direct3D 11)");
+                LOGR("d3d: the chosen renderer could not start, running on the fallback (%s)",
+                     app::Get().renderer == 2 ? "Direct3D 12" : "Direct3D 11");
             } else {
                 LOGE("d3d: renderer init failed");
                 if (!g_backend) g_backend = gpu::CreateBackend();

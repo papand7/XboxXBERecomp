@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <xaudio2.h>
 
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -32,8 +33,22 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         wf.nAvgBytesPerSec = kRate * 8;
         if (FAILED(XAudio2Create(&xa, 0, XAUDIO2_DEFAULT_PROCESSOR)) || FAILED(xa->CreateMasteringVoice(&master)) ||
             FAILED(xa->CreateSourceVoice(&voice, &wf))) {
-            LOGE("audio: XAudio2 unavailable, no sound");
-            return;
+            // no output device (a remote session, nothing plugged in): the mixer is still pulled in real time and the
+            // samples dropped, so the title's sample clock runs and what waits on it (a movie's sound) goes on
+            LOGE("audio: XAudio2 unavailable, no sound (the mixer runs silent)");
+            constexpr uint32_t kFrames = kRate / 100;
+            std::vector<float> buf(kFrames * 2);
+            auto next = std::chrono::steady_clock::now();
+            for (;;) {
+                if (app::Paused()) {
+                    Sleep(10);
+                    next = std::chrono::steady_clock::now();
+                    continue;
+                }
+                render(buf.data(), kFrames);
+                next += std::chrono::milliseconds(10);
+                std::this_thread::sleep_until(next);
+            }
         }
         voice->Start();
         constexpr uint32_t kFrames = kRate / 100, kSlots = 4;

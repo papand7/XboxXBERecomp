@@ -14,10 +14,13 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include <SDL3/SDL.h>
 
@@ -241,6 +244,73 @@ int ControlByName(const char* name) {
 
 uint32_t HeldControls() { return g_held[0] | g_held[1] | g_held[2] | g_held[3]; }
 
+// Diagnostics, off unless set: XBE_PAD_SCRIPT, a harness pad script ("vblank buttons [vblanks held]", buttons joined
+// by +; vblanks counted here as sixtieths of a second from the first poll), and XBE_PAD_CMD=1, a file named cmd in the
+// exe's folder holding "buttons [vblanks held]", pressed once when read and then removed. Both press controller 1.
+struct ScriptedPress {
+    double at;
+    std::string buttons;
+    double len;
+};
+
+void PressNamed(const std::string& names, float out[kControls]) {
+    static const std::pair<const char*, int> kNames[] = {
+        {"UP", kUp}, {"DOWN", kDown}, {"LEFT", kLeft}, {"RIGHT", kRight}, {"START", kStart}, {"BACK", kBack},
+        {"A", kA}, {"B", kB}, {"X", kX}, {"Y", kY}, {"BLACK", kBlack}, {"WHITE", kWhite}, {"LT", kLT}, {"RT", kRT},
+        {"LS", kLSUp}, {"LSD", kLSDown}, {"LSL", kLSLeft}, {"LSR", kLSRight},
+        {"RS", kRSUp}, {"RSD", kRSDown}, {"RSL", kRSLeft}, {"RSR", kRSRight}};
+    size_t at = 0;
+    while (at <= names.size()) {
+        size_t e = names.find('+', at);
+        if (e == std::string::npos) e = names.size();
+        std::string b = names.substr(at, e - at);
+        at = e + 1;
+        for (auto& [n, c] : kNames)
+            if (b == n) out[c] = 1.0f;
+    }
+}
+
+bool Scripted(float out[kControls]) {
+    static const std::vector<ScriptedPress> script = [] {
+        std::vector<ScriptedPress> v;
+        const char* path = std::getenv("XBE_PAD_SCRIPT");
+        if (FILE* f = path && *path ? std::fopen(path, "r") : nullptr) {
+            char line[160];
+            while (std::fgets(line, sizeof line, f)) {
+                char b[64];
+                double t, len = 8;
+                if (line[0] != '#' && std::sscanf(line, "%lf %63s %lf", &t, b, &len) >= 2) v.push_back({t, b, len});
+            }
+            std::fclose(f);
+            LOGR("input: pad script %s, %zu presses", path, v.size());
+        }
+        return v;
+    }();
+    static const bool cmd_on = [] {
+        const char* e = std::getenv("XBE_PAD_CMD");
+        return e && *e && *e != '0';
+    }();
+    if (script.empty() && !cmd_on) return false;
+    static const auto start = std::chrono::steady_clock::now();
+    static ScriptedPress live{-1, "", 0};
+    double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() * 60.0;
+    if (cmd_on) {
+        std::string cmd = (app::ExeDir() / "cmd").string();
+        if (FILE* f = std::fopen(cmd.c_str(), "r")) {
+            char b[64] = {};
+            double len = 8;
+            if (std::fscanf(f, "%63s %lf", b, &len) >= 1) live = {t, b, len};
+            std::fclose(f);
+            std::remove(cmd.c_str());
+            LOGR("input: cmd %s for %.0f vblanks", b, len);
+        }
+    }
+    for (const ScriptedPress& p : script)
+        if (t >= p.at && t <= p.at + p.len) PressNamed(p.buttons, out);
+    if (live.at >= 0 && t >= live.at && t <= live.at + live.len) PressNamed(live.buttons, out);
+    return true;
+}
+
 Pad Poll(int port) {
     Pad p;
     float in[kControls] = {}, out[kControls] = {};
@@ -292,6 +362,7 @@ Pad Poll(int port) {
             g_keyboard = true;
         }
     }
+    if (port == 0 && Scripted(out)) p.connected = true;
     // Back + Start on a controller opens or closes the settings window, Start alone closes it; what was held then
     // stays from the game until let go
     uint32_t held = 0;
