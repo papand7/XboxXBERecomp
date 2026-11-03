@@ -22,6 +22,13 @@ set(SDL_GPU OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3)
+# the Vulkan renderer: Khronos' headers (vulkan-1.dll is loaded at run time, nothing is linked) and DXC, which compiles
+# the HLSL shaders to SPIR-V (its dxcompiler.dll goes beside each exe)
+FetchContent_Declare(VulkanHeaders URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.296.tar.gz
+    URL_HASH SHA256=e204e0b3c19f622d197df945737f5db913d6621830999b8578d34e80a7c90585)
+FetchContent_Declare(dxc URL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2407/dxc_2024_07_31.zip
+    URL_HASH SHA256=e2627f004f0f9424d8c71ea1314d04f38c5a5096884ae9217f1f18bd320267b5)
+FetchContent_MakeAvailable(VulkanHeaders dxc)
 
 # XBE_GAME_DLL, set by a game before including this: a release holds the runtime and the compiler, and the game's code
 # is built on the player's PC into <exe>.dll (runtime/app/game_code.cpp, from TGP482's XboxXBE-Recomp, MIT). Without it
@@ -81,7 +88,14 @@ set(XBE_IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp)
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+
+# Vulkan's entry points are loaded at run time (gpu/vulkan.cpp hands ImGui its loader)
+set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp PROPERTIES
+    COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_NO_PROTOTYPES INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include")
+set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/vulkan.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include;${dxc_SOURCE_DIR}/inc")
 
 # the settings window reads controllers from the runtime's SDL input (app::FeedPad), not XInput
 set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp PROPERTIES
@@ -189,6 +203,9 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 d3d11 dinput8 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
+    # the Vulkan renderer's shader compiler, beside the exe
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll $<TARGET_FILE_DIR:${target}>)
     # lld keeps the recompiled weak functions overridable by the host ones
     target_link_options(${target} PRIVATE -fuse-ld=lld -g)
 endfunction()

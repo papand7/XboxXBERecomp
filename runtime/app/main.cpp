@@ -359,6 +359,7 @@ void Pace(uint32_t vblanks) {
         if (slow) LOGR("frames: %u of %u in the last 10 s over %.1f ms (%u a second paced), the longest %.1f ms; "
                        "%u shaders compiled", slow, frames, 1.5 * std::chrono::duration<double, std::milli>(period).count(),
                        cap, longest, compiled);
+        if (slow) logx::Flush();  // kept when the game is closed by force
         report = now + std::chrono::seconds(10);
         frames = slow = 0;
         longest = 0;

@@ -4802,7 +4802,7 @@ void D3D12Backend::Present(const Surface& front) {
     ReleaseOldTextures();
     ResetFrame();
     CountFps();
-    if (diag::Perf()) LogPerf();
+    if (diag::Perf()) LogPerf(), logx::Flush();
     ApplySettings();
 }
 
@@ -5420,11 +5420,14 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
 
 std::unique_ptr<Backend> CreateBackend() {
     if (app::Get().renderer == 1) return CreateD3D11Backend();
+    if (app::Get().renderer == 2) return CreateVulkanBackend();
     return std::make_unique<D3D12Backend>();
 }
 
+// Vulkan falls back to Direct3D 12, Direct3D 12 to 11
 std::unique_ptr<Backend> CreateFallbackBackend() {
     if (app::Get().renderer == 1) return nullptr;
+    if (app::Get().renderer == 2) return std::make_unique<D3D12Backend>();
     return CreateD3D11Backend();
 }
 
