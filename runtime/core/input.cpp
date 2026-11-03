@@ -362,7 +362,11 @@ Pad Poll(int port) {
             g_keyboard = true;
         }
     }
-    if (port == 0 && Scripted(out)) p.connected = true;
+    // scripted presses count as the controller's own: the settings window (Back + Start, its navigation) sees them too
+    if (float sc[kControls] = {}; port == 0 && Scripted(sc)) {
+        p.connected = true;
+        for (int c = 0; c < kControls; c++) out[c] = std::max(out[c], sc[c]), in[c] = std::max(in[c], sc[c]);
+    }
     // Back + Start on a controller opens or closes the settings window, Start alone closes it; what was held then
     // stays from the game until let go
     uint32_t held = 0;

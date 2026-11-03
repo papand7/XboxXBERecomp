@@ -1315,6 +1315,7 @@ bool VulkanBackend::CreateSwapchain() {
     ci.imageExtent = {w, h};
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -3359,25 +3360,19 @@ void VulkanBackend::Present(const Surface& front) {
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (ramp_dirty_) UploadGammaRamp();
     if (t && Style().mode != kStyleOriginal && !post_done_ && scene_rt_ == t) ScenePass(*t, scene_ds_);
-    // XBE_PAD_CMD's diagnostic: a file named shot beside the exe holding a PNG path gets the frame, as drawn, there
+    // XBE_PAD_CMD's diagnostic: a file named shot beside the exe holding a PNG path gets the window's picture, as
+    // shown (the settings window too), there
     static const bool shots = [] {
         const char* e = std::getenv("XBE_PAD_CMD");
         return e && *e && *e != '0';
     }();
-    if (shots && t && presents_ % 15 == 0) {
+    std::wstring shot_path;
+    if (shots && presents_ % 15 == 0) {
         std::filesystem::path req = app::ExeDir() / "shot";
         std::error_code ec;
         if (std::filesystem::exists(req, ec)) {
-            std::wstring out;
-            if (std::wifstream in{req}) std::getline(in, out);
+            if (std::wifstream in{req}) std::getline(in, shot_path);
             std::filesystem::remove(req, ec);
-            std::vector<uint8_t> px;
-            if (!out.empty() && ReadBack(t->res, t->w, t->h, px)) {
-                std::vector<uint32_t> bgra(px.size() / 4);
-                std::memcpy(bgra.data(), px.data(), px.size());
-                for (uint32_t& p : bgra) p |= 0xFF000000u;
-                LOGR("vulkan: shot %ls %s", out.c_str(), WritePngFile(out, bgra, t->w, t->h) ? "written" : "failed");
-            }
         }
     }
     scene_rt_ = scene_ds_ = nullptr;
@@ -3425,14 +3420,53 @@ void VulkanBackend::Present(const Surface& front) {
         open_ = false;
         cur_ = {};
         Stamp(1);
+        bool shot = !shot_path.empty();
+        VkDeviceSize shot_bytes = VkDeviceSize(bb_w_) * bb_h_ * 4;
+        if (shot && readback_.size < shot_bytes) {
+            DropBuffer(readback_);
+            shot = MakeBuffer(readback_, shot_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        }
         ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         ib.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        if (shot) {
+            ib.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            ib.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            ib.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            vkCmdPipelineBarrier2(cb, &di);
+            VkBufferImageCopy r{};
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            r.imageExtent = {bb_w_, bb_h_, 1};
+            vkCmdCopyImageToBuffer(cb, swap_images_[index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_.buf, 1, &r);
+            VkMemoryBarrier2 hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            hb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            hb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            hb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            hb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+            VkDependencyInfo hd{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            hd.memoryBarrierCount = 1;
+            hd.pMemoryBarriers = &hb;
+            vkCmdPipelineBarrier2(cb, &hd);
+            ib.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            ib.srcAccessMask = 0;
+            ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        } else {
+            ib.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        }
         ib.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
         ib.dstAccessMask = 0;
-        ib.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         ib.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         vkCmdPipelineBarrier2(cb, &di);
         Submit(acquire_sem_[frame_slot_], present_sem_[index]);
+        if (shot) {
+            Wait(serial_);
+            std::vector<uint32_t> px(size_t(bb_w_) * bb_h_);
+            std::memcpy(px.data(), readback_.mem.map, px.size() * 4);
+            if (swap_fmt_ == VK_FORMAT_R8G8B8A8_UNORM)
+                for (uint32_t& p : px) p = (p & 0xFF00FF00u) | (p >> 16 & 0xFF) | (p & 0xFF) << 16;
+            for (uint32_t& p : px) p |= 0xFF000000u;
+            LOGR("vulkan: shot %ls %s", shot_path.c_str(), WritePngFile(shot_path, px, bb_w_, bb_h_) ? "written" : "failed");
+        }
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.waitSemaphoreCount = 1;
         pi.pWaitSemaphores = &present_sem_[index];
