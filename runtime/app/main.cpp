@@ -14,10 +14,12 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <imgui.h>
 #include <backends/imgui_impl_win32.h>
@@ -158,6 +160,48 @@ void ApplyNow() {
     }
 }
 
+// the title's pointer for its menus (GameInfo::menu_cursor), made again when the window's height asks another size
+HCURSOR MenuCursor(HWND hwnd) {
+    static HCURSOR made = nullptr;
+    static int made_size = 0;
+    if (!kGame.menu_cursor) return nullptr;
+    RECT r;
+    GetClientRect(hwnd, &r);
+    int size = std::clamp(int(r.bottom - r.top) / 24, 16, 96);
+    if (made && size == made_size) return made;
+    std::vector<uint32_t> px;
+    int hx = 0, hy = 0;
+    kGame.menu_cursor(size, px, hx, hy);
+    if (px.size() != size_t(size) * size) return made;
+    BITMAPV5HEADER bh{};
+    bh.bV5Size = sizeof(bh);
+    bh.bV5Width = size;
+    bh.bV5Height = -size;
+    bh.bV5Planes = 1;
+    bh.bV5BitCount = 32;
+    bh.bV5Compression = BI_BITFIELDS;
+    bh.bV5RedMask = 0x00FF0000;
+    bh.bV5GreenMask = 0x0000FF00;
+    bh.bV5BlueMask = 0x000000FF;
+    bh.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HDC dc = GetDC(nullptr);
+    HBITMAP color = CreateDIBSection(dc, reinterpret_cast<BITMAPINFO*>(&bh), DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, dc);
+    if (!color) return made;
+    std::memcpy(bits, px.data(), px.size() * 4);
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
+    ICONINFO ii{FALSE, DWORD(hx), DWORD(hy), mask, color};
+    HCURSOR c = CreateIconIndirect(&ii);
+    DeleteObject(color);
+    DeleteObject(mask);
+    if (!c) return made;
+    if (made) DestroyCursor(made);
+    made = c;
+    made_size = size;
+    return made;
+}
+
 // mouse look (Settings::mouse_look): the cursor hidden and held in the window while the mouse plays the right stick
 void HoldCursor(HWND hwnd) {
     static bool held = false;
@@ -179,8 +223,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RAWINPUT ri;
         UINT size = sizeof(ri);
         if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != UINT(-1) &&
-            ri.header.dwType == RIM_TYPEMOUSE && input::MouseLooking()) {
-            if (!(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) input::MouseMoved(ri.data.mouse.lLastX, ri.data.mouse.lLastY);
+            ri.header.dwType == RIM_TYPEMOUSE && (input::MouseLooking() || input::MousePointing())) {
+            if (!(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && input::MouseLooking())
+                input::MouseMoved(ri.data.mouse.lLastX, ri.data.mouse.lLastY);
             if (ri.data.mouse.usButtonFlags & RI_MOUSE_WHEEL) input::MouseWheel(short(ri.data.mouse.usButtonData));
         }
         HoldCursor(hwnd);
@@ -190,6 +235,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HoldCursor(hwnd);
         if (input::MouseLooking()) {
             SetCursor(nullptr);
+            return TRUE;
+        }
+        if (HCURSOR c = kGame.menu_up && kGame.menu_up() && !OverlayOpen() ? MenuCursor(hwnd) : nullptr) {
+            SetCursor(c);
             return TRUE;
         }
     }
@@ -285,6 +334,37 @@ int Instance() {
 }
 
 void* Window() { return g_hwnd; }
+
+namespace {
+std::atomic<bool> g_point_override{false};
+std::atomic<float> g_point_u{0}, g_point_v{0};
+}  // namespace
+void SetFramePointOverride(float u, float v) {
+    g_point_u = u, g_point_v = v;
+    g_point_override = true;
+}
+
+bool FramePoint(float& u, float& v) {
+    if (g_point_override) {
+        u = g_point_u, v = g_point_v;
+        return true;
+    }
+    if (!g_hwnd) return false;
+    POINT pt;
+    GetCursorPos(&pt);
+    ScreenToClient(g_hwnd, &pt);
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    float w = float(rc.right - rc.left), h = float(rc.bottom - rc.top);
+    if (w <= 0 || h <= 0 || pt.x < 0 || pt.y < 0 || pt.x >= rc.right || pt.y >= rc.bottom) return false;
+    // the frame at its shape, centred (the renderers' BlitFrame), then the 2D's own shape in its middle
+    float aspect = FrameAspect();
+    float vw = std::min(w, h * aspect), vh = vw / aspect;
+    u = (pt.x - (w - vw) / 2) / vw;
+    v = (pt.y - (h - vh) / 2) / vh;
+    if (aspect > kGame.hud_aspect + 1e-3f) u = 0.5f + (u - 0.5f) * aspect / kGame.hud_aspect;
+    return true;
+}
 
 std::recursive_mutex& UiLock() {
     static std::recursive_mutex m;

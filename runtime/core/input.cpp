@@ -193,7 +193,7 @@ void MouseWheel(int delta) {
 }
 
 int TakeWheel() {
-    if (!MouseLooking()) {
+    if (!MouseLooking() && !MousePointing()) {
         g_wheel = 0;
         return 0;
     }
@@ -202,10 +202,12 @@ int TakeWheel() {
     return notches;
 }
 
+uint32_t g_script_mouse = 0;  // XBE_PAD_CMD's CLICKL and CLICKR, held while their press is
+
 uint32_t MouseButtons() {
-    if (!MouseLooking()) return 0;
-    return uint32_t((GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0) | ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) ? 2 : 0) |
-           ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) ? 4 : 0);
+    if (!MouseLooking() && !MousePointing()) return g_script_mouse;
+    return g_script_mouse | uint32_t((GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0) |
+           ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) ? 2 : 0) | ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) ? 4 : 0);
 }
 
 std::array<uint16_t, 2> ControlKeys(int c) {
@@ -227,11 +229,16 @@ bool TakeMouse(float& x, float& y) {
     return true;
 }
 
+bool MousePointing() {
+    HWND hwnd = static_cast<HWND>(app::Window());
+    return app::kGame.menu_up && app::kGame.menu_up() && hwnd && GetForegroundWindow() == hwnd && !app::OverlayOpen();
+}
+
 bool MouseLooking() {
     const app::Settings& s = app::Get();
     HWND hwnd = static_cast<HWND>(app::Window());
     return app::kGame.mouse_look && s.mouse_look && s.keyboard && hwnd && GetForegroundWindow() == hwnd &&
-           !app::OverlayOpen();
+           !app::OverlayOpen() && !(app::kGame.menu_up && app::kGame.menu_up());
 }
 
 const char* ControlName(int c) { return c >= 0 && c < kControls ? kNames[c] : ""; }
@@ -267,6 +274,8 @@ void PressNamed(const std::string& names, float out[kControls]) {
         at = e + 1;
         for (auto& [n, c] : kNames)
             if (b == n) out[c] = 1.0f;
+        if (b == "CLICKL") g_script_mouse |= 1;
+        if (b == "CLICKR") g_script_mouse |= 2;
     }
 }
 
@@ -298,13 +307,20 @@ bool Scripted(float out[kControls]) {
         std::string cmd = (app::ExeDir() / "cmd").string();
         if (FILE* f = std::fopen(cmd.c_str(), "r")) {
             char b[64] = {};
-            double len = 8;
-            if (std::fscanf(f, "%63s %lf", b, &len) >= 1) live = {t, b, len};
+            double len = 8, y = 0;
+            int got = std::fscanf(f, "%63s %lf %lf", b, &len, &y);
             std::fclose(f);
             std::remove(cmd.c_str());
-            LOGR("input: cmd %s for %.0f vblanks", b, len);
+            if (got == 3 && std::string(b) == "PTR") {  // the pointer at x, y of the title's 640 x 480 2D
+                app::SetFramePointOverride(float(len) / 640.0f, float(y) / 480.0f);
+                LOGR("input: cmd pointer at %.0f, %.0f", len, y);
+            } else if (got >= 1) {
+                live = {t, b, len};
+                LOGR("input: cmd %s for %.0f vblanks", b, len);
+            }
         }
     }
+    g_script_mouse = 0;
     for (const ScriptedPress& p : script)
         if (t >= p.at && t <= p.at + p.len) PressNamed(p.buttons, out);
     if (live.at >= 0 && t >= live.at && t <= live.at + live.len) PressNamed(live.buttons, out);

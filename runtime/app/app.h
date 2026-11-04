@@ -106,6 +106,10 @@ float RenderScale(uint32_t guest_height);
 bool Widescreen();
 // the shape the frame is shown at: 4:3, 16:9, or the screen's when the aspect setting fills it (never under 16:9)
 float FrameAspect();
+// the cursor in the title's 2D layout (0 to 1 across its width and height as GameInfo::hud_aspect lays it out, the
+// shown frame's letterbox and ultrawide squeeze taken out); false when it is outside the window
+bool FramePoint(float& u, float& v);
+void SetFramePointOverride(float u, float v);  // XBE_PAD_CMD's PTR: a pointer of the test's in its place
 
 std::filesystem::path ExeDir();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
@@ -217,6 +221,11 @@ struct GameInfo {
     // DSP image would have balanced drown it out): the level of PCM streams and of every other voice; none is full level
     float (*pcm_stream_level)() = nullptr;
     float (*other_voice_level)() = nullptr;
+    // a menu of the title's is up: the mouse is a pointer there (the cursor shown and free, not mouse look)
+    bool (*menu_up)() = nullptr;
+    // the pointer's picture in the menus: size x size premultiplied B8G8R8A8 pixels for a cursor that many pixels
+    // high, and its hot spot; none, the system's arrow
+    void (*menu_cursor)(int size, std::vector<uint32_t>& bgra, int& hot_x, int& hot_y) = nullptr;
 };
 extern const GameInfo kGame;
 

@@ -33,6 +33,8 @@ Pad Poll(int port);
 void MouseMoved(int dx, int dy);
 // the mouse plays the right stick now: mouse look on, the game window in front, the settings window shut
 bool MouseLooking();
+// the mouse a pointer in a title's menu (GameInfo::menu_up), the window in front: its buttons and wheel are read
+bool MousePointing();
 // for a title taking the mouse itself (GameInfo::mouse_direct): the movement since the last call as a rate, in full
 // stick deflections (2400 counts a second at 100% sensitivity is 1), up positive, the settings' sensitivity and invert
 // applied; false and nothing taken while the mouse is not looking
