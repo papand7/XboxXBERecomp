@@ -69,6 +69,7 @@ void Clamp(GraphicsStyle& s) {
     s.reflection_strength = std::clamp(s.reflection_strength, 0.0f, 1.0f);
     s.particle_fade = std::clamp(s.particle_fade, 0.005f, 0.2f);
     s.material_strength = std::clamp(s.material_strength, 0.0f, 1.5f);
+    s.surface_depth = std::clamp(s.surface_depth, 0.0f, 2.0f);
 }
 
 int Index(const std::string& v, const char* const* names, int n, int fallback) {
@@ -86,7 +87,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "retro_tint", "vertex_snap", "texture_pack", "dump_textures", "quality",
                                   "quality_ao", "quality_bloom", "reflections", "reflection_strength",
                                   "reflections_auto", "soft_particles", "particle_fade",
-                                  "materials", "material_strength"};
+                                  "materials", "material_strength", "surface_depth"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -151,6 +152,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     num("particle_fade", s.particle_fade);
     flag("materials", s.materials);
     num("material_strength", s.material_strength);
+    num("surface_depth", s.surface_depth);
     Clamp(s);
 }
 
@@ -193,7 +195,8 @@ toml::table Write(const GraphicsStyle& s) {
                        {"soft_particles", s.soft_particles},
                        {"particle_fade", double(s.particle_fade)},
                        {"materials", s.materials},
-                       {"material_strength", double(s.material_strength)}};
+                       {"material_strength", double(s.material_strength)},
+                       {"surface_depth", double(s.surface_depth)}};
 }
 
 // the built-in presets
@@ -391,6 +394,7 @@ void ApplyPreset(const StylePreset& p) {
     g_style.particle_fade = keep.particle_fade;
     g_style.materials = keep.materials;
     g_style.material_strength = keep.material_strength;
+    g_style.surface_depth = keep.surface_depth;
     StyleChanged();
 }
 
@@ -649,6 +653,7 @@ void DrawStyleSettings(bool vulkan) {
     if (ImGui::CollapsingHeader("Materials (PBR)", ImGuiTreeNodeFlags_DefaultOpen)) {
         changed |= ImGui::Checkbox("Normal and roughness maps", &s.materials);
         changed |= ImGui::SliderFloat("Material strength", &s.material_strength, 0.0f, 1.5f, "%.2f");
+        changed |= ImGui::SliderFloat("Relief depth (0 off)", &s.surface_depth, 0.0f, 2.0f, "%.2f");
         ImGui::TextDisabled("A texture pack's maps (tools\\hd_pack.exe --pbr) over the game's lighting: bumps and a\n"
                             "specular sheen. Turning them on takes effect at the next start. Not drawn in Retro.");
     }

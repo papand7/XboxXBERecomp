@@ -858,31 +858,55 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
     return c;
 }
 )";
-// materials (VulkanBackend::MaterialShader): the draw's own pixel shader (renamed game_main), its colour shaded by the
-// pack picture's material (tex%d: normal xy, roughness, height) over the game's lighting. The surface's frame is made
-// from the screen derivatives of its position (the view taken as pbr.z wide) and of its texture coordinates (a
-// cotangent frame); light from above the view and from the camera: the ratio of the bumped normal's light to the flat
-// one's scales the game's colour, and a GGX highlight of the roughness adds a sheen, kept in proportion to it
+// materials (VulkanBackend::MaterialShader): the draw's own pixel shader (renamed game_main) with the pack picture's
+// material (tex%d: normal xy, roughness, height). The surface's frame is made from the screen derivatives of its
+// position (the view taken as 60 degrees) and of its texture coordinates (a cotangent frame). Relief (pbr.z above 0):
+// parallax occlusion mapping, the view's ray stepped down the height map from the surface, its texture coordinates
+// moved to where it meets it, for the game's own textures too (game_main is handed the moved stage 0 coordinates).
+// Light from above the view and from the camera: the ratio of the bumped normal's light to the flat one's scales the
+// game's colour, and a GGX highlight of the roughness adds a sheen, kept in proportion to it
 const char* kMatMain = R"(
 float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
-    float4 c = game_main(i, front%s);
-    float2 uv = %s;
-    float4 m = tex%d.Sample(smp%d, uv);
+    float2 uv0 = %s;
+    float2 tcscale = %s;
     float w = max(abs(i.wlin * wdepth.w), 1e-4);
-    float aspect = pbr.y / pbr.x;
-    float3 P = float3((i.pos.x * pbr.x * 2 - 1) * aspect * pbr.z * w, -(i.pos.y * pbr.y * 2 - 1) * pbr.z * w, w);
+    float aspect = pbr.y / pbr.x, tanv = 0.5774;
+    float3 P = float3((i.pos.x * pbr.x * 2 - 1) * aspect * tanv * w, -(i.pos.y * pbr.y * 2 - 1) * tanv * w, w);
     float3 dpx = ddx(P), dpy = ddy(P);
-    float2 dux = ddx(uv), duy = ddy(uv);
+    float2 dux = ddx(uv0), duy = ddy(uv0);
     float3 Ng = normalize(cross(dpx, dpy));
     if (dot(Ng, P) > 0) Ng = -Ng;
     float3 t1 = cross(dpy, Ng), t2 = cross(Ng, dpx);
     float3 T = t1 * dux.x + t2 * duy.x, B = t1 * dux.y + t2 * duy.y;
     float inv = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-20));
+    T *= inv, B *= inv;
+    float3 V = normalize(-P);
+    float2 uv = uv0;
+    if (pbr.z > 0) {
+        // the view in the texture's frame; steps down from the top (height 1) until under the height map
+        float3 vt = float3(dot(V, T), dot(V, B), max(dot(V, Ng), 0.08));
+        float2 dir = -vt.xy / vt.z * pbr.z * 0.05;
+        int steps = int(lerp(24, 8, saturate(vt.z)));
+        float layer = 1.0 / steps, d = 0, hd = 1 - tex%d.SampleGrad(smp%d, uv, dux, duy).a, prev_hd = hd;
+        float2 st = dir * layer, cur = uv;
+        [loop] for (int k = 0; k < steps && d < hd; k++) {
+            cur += st;
+            d += layer;
+            prev_hd = hd;
+            hd = 1 - tex%d.SampleGrad(smp%d, cur, dux, duy).a;
+        }
+        // between the last two steps, where the ray crossed
+        float after = hd - d, before = prev_hd - (d - layer);
+        float f = after / min(after - before, -1e-5);
+        uv = cur - st * saturate(f);
+        i.tc0.xy += (uv - uv0) * tcscale;
+    }
+    float4 c = game_main(i, front%s);
+    float4 m = tex%d.SampleGrad(smp%d, uv, dux, duy);
     float3 nt = float3(m.rg * 2 - 1, 0);
     nt.z = sqrt(saturate(1 - dot(nt.xy, nt.xy)));
-    float3 N = normalize(T * inv * nt.x + B * inv * nt.y + Ng * nt.z);
+    float3 N = normalize(T * nt.x + B * nt.y + Ng * nt.z);
     if (any(isnan(N))) N = Ng;
-    float3 V = normalize(-P);
     float3 L = normalize(float3(0.3, 0.8, -0.5));
     float flat = 0.55 * saturate(dot(Ng, L)) + 0.45 * saturate(dot(Ng, V)) + 0.15;
     float bump = 0.55 * saturate(dot(N, L)) + 0.45 * saturate(dot(N, V)) + 0.15;
@@ -3400,7 +3424,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
                 mat_slot = slot;
                 c.pbr[0] = 1.0f / float(bound_rt_->w);
                 c.pbr[1] = 1.0f / float(bound_rt_->h);
-                c.pbr[2] = 0.5774f;  // an assumed 60 degree vertical view, as the reflections take it
+                c.pbr[2] = st.surface_depth;
                 c.pbr[3] = st.material_strength;
                 perf_mat_++;
             }
@@ -3592,11 +3616,14 @@ uint64_t VulkanBackend::MaterialShader(const DrawShaders& sh, const PixelKey& pk
     if (at != std::string::npos) {
         src.replace(at, 12, "float4 game_main(");
         // stage 0's coordinates as its fetch takes them (projected for a combiner's or a projected stage)
-        std::string uv = pk.programmable || (pk.proj & 1) ? "i.tc0.xy / i.tc0.w" : "i.tc0.xy";
+        bool proj = pk.programmable || (pk.proj & 1);
+        std::string uv = proj ? "i.tc0.xy / i.tc0.w" : "i.tc0.xy";
         uv = "(" + uv + ")" + (pk.tex[0].rect ? " / texsize[0].xy" : "") + " + texsize[0].zw";
-        char tail[4096];
-        std::snprintf(tail, sizeof(tail), kMatMain, pk.wbuf ? ", out float depth : SV_Depth" : "",
-                      pk.wbuf ? ", depth" : "", uv.c_str(), slot, slot);
+        // a move of uv as one of stage 0's coordinates (undoing the projection and a rectangle's scale)
+        std::string scale = std::string("float2(1, 1)") + (proj ? " * i.tc0.w" : "") + (pk.tex[0].rect ? " * texsize[0].xy" : "");
+        char tail[8192];
+        std::snprintf(tail, sizeof(tail), kMatMain, pk.wbuf ? ", out float depth : SV_Depth" : "", uv.c_str(),
+                      scale.c_str(), slot, slot, slot, slot, pk.wbuf ? ", depth" : "", slot, slot);
         src += tail;
         if (!Compile(src, "main", "ps_5_0", h)) h = 0;
     }

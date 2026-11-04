@@ -64,6 +64,7 @@ struct GraphicsStyle {
     // the game's own lighting: bumps and a specular sheen; at the next start (the maps are read with the pack)
     bool materials = false;
     float material_strength = 0.7f;
+    float surface_depth = 0.0f;  // relief: parallax occlusion mapping of the height map, 0 off to 2
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;
