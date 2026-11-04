@@ -56,6 +56,10 @@ struct GraphicsStyle {
     int reflections = kReflectOff;
     float reflection_strength = 0.5f;
     bool reflections_auto = true;
+    // soft particles (Vulkan; every style but Retro): smoke, flashes and sparks fade where they meet the scene
+    // instead of cutting through it; the fade's depth in parts of the particle's distance
+    bool soft_particles = false;
+    float particle_fade = 0.03f;
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;

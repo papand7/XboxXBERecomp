@@ -435,6 +435,10 @@ struct Target {
     // much each pixel reflects) and its depth (the nearest reflective surface), cleared once a frame
     Image smaa_edges, smaa_weights, mask, mask_ds;
     uint64_t mask_frame = 0;  // the frame (presents_ + 1) it was cleared for
+    // a depth target's copy soft particles read (drawn into the target at the time: no feedback loop), made at the
+    // frame's first soft particle
+    Image soft_depth;
+    uint64_t soft_frame = 0;
 };
 
 // a texture from guest memory
@@ -840,6 +844,21 @@ float4 main(VOut i, bool front : SV_IsFrontFace, out float depth : SV_Depth) : S
     return float4(style.z * cover, ddx_fine(vz) / vz, ddy_fine(vz) / vz, vz);
 }
 )";
+// soft particles (VulkanBackend::SoftParticle): the draw's own pixel shader (renamed game_main), its output faded
+// where the scene behind is near: tex%d the scene depth's copy (a stage the draw does not use), style z 1 fades
+// alpha (alpha blended), 2 colour and alpha (added), style w the fade's depth in parts of the particle's distance
+const char* kSoftMain = R"(
+float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
+    float4 c = game_main(i, front%s);
+    float fz = %s, sz = tex%d.Load(int3(i.pos.xy, 0)).r;
+    float lf = %s, ls = %s;
+    float soft = saturate((ls - lf) / max(lf * style.w, 1e-6));
+    if (style.z == 2) c.rgb *= soft;
+    c.a *= soft;
+    return c;
+}
+)";
+constexpr uint64_t kSoftKeySalt = 0x736F667470617274ull;  // "softpart"
 constexpr uint64_t kMaskKeySalt = 0x6D61736B6D61736Cull;
 constexpr VkFormat kMaskFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr uint32_t kMaskRtFmt = 0x4D41534Bu;  // PsoKey::rtfmt of the mask's pipelines  // "maskmask": the mask's pixel shaders apart from the game's
@@ -1151,11 +1170,16 @@ private:
     bool draw_env_ = false;
     bool scene_wbuf_ = false;  // the scene's last 3D draw wrote W (D3DZB_USEW), not Z, to its depth  // the draw samples a cube map: the game's own environment reflection (shiny metal)
     float Reflectivity(const PsoKey& k);
+    // soft particles: 0 none, 1 alpha blended, 2 added; the variant's pixel shader and the depth copy's stage
+    int SoftParticle(const PsoKey& k, const PixelKey& pk, float refl);
+    uint64_t SoftShader(const DrawShaders& sh, const PixelKey& pk, int slot);
+    VkImageView SoftDepth(Target& ds);
     bool EnsureMask(Target& t);
     void DrawMask(const Assembled& a, PsoKey k, const DrawShaders& sh, const PixelKey& pk, const DrawTextures& stages,
                   const VkSampler smp[4], const float bf[4], uint32_t sref, const VkViewport& vp, const VkRect2D& sc);
     void DropScene(Target& t) {
         DropImage(t.smaa_edges), DropImage(t.smaa_weights), DropImage(t.mask), DropImage(t.mask_ds);
+        DropImage(t.soft_depth);
     }
     // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
     // mod, read again when it changes), else the built-in kScenePostHlsl
@@ -1181,7 +1205,7 @@ private:
         ~PerfScope() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
     };
     uint64_t perf_frames_ = 0, perf_submits_ = 0, perf_draws_ = 0;
-    uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0, perf_reflect_ = 0;  // draws by kind
+    uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0, perf_reflect_ = 0, perf_soft_ = 0;  // draws by kind
     std::chrono::steady_clock::time_point perf_t_ = std::chrono::steady_clock::now();
     void LogPerf();
     friend VkBool32 VKAPI_PTR DebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -3311,6 +3335,25 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     const float refl = Reflectivity(k);
     c.style[2] = refl;
     c.style[3] = Opaque(k) || stage_solid_ ? 1.0f : 0.0f;
+    // soft particles: the variant shader reads the scene depth's copy from a stage the draw leaves free
+    if (int soft = SoftParticle(k, pk, refl)) {
+        int slot = -1;
+        for (int i = 3; i >= 0 && slot < 0; i--)
+            if (!stages.view[i] && pk.tex[i].kind == kTexNone) slot = i;
+        uint64_t vh = slot >= 0 ? SoftShader(sh, pk, slot) : 0;
+        VkImageView depth = vh ? SoftDepth(*bound_ds_) : VK_NULL_HANDLE;
+        if (depth) {
+            PsoKey sk = k;
+            sk.ps = vh;
+            if (VkPipeline sp = EnsurePipeline(sk)) {
+                p = sp;
+                stages.view[slot] = depth;
+                c.style[2] = float(soft);
+                c.style[3] = Style().particle_fade;
+                perf_soft_++;
+            }
+        }
+    }
     // samplers; a style's filtering for the 3D scene's textures
     VkSampler smp[4];
     bool clamp = UnitTexcoords(a);
@@ -3413,6 +3456,63 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         counted_.push_back({q, serial_ + 1, SamplesPerPixel()});
     }
     if (refl > 0) DrawMask(a, k, sh, pk, stages, smp, bf, sref, vp, sc), perf_reflect_++;
+}
+
+// a particle: blended over the 3D scene (alpha blended, or added), depth tested but not written, no reflective
+// surface, no glass; how its blend is faded (1 its alpha, 2 its colour and alpha), 0 not one
+int VulkanBackend::SoftParticle(const PsoKey& k, const PixelKey& pk, float refl) {
+    const GraphicsStyle& st = Style();
+    if (!st.soft_particles || st.mode == kStyleRetro || draw_2d_ || !bound_rt_ || !bound_ds_ ||
+        bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_ || bound_ds_->w != bound_rt_->w ||
+        bound_ds_->h != bound_rt_->h || !k.blend || !k.zen || k.zwrite || refl > 0 || stage_glass_ > 0)
+        return 0;
+    (void)pk;
+    constexpr uint32_t kOne = 1, kSrcAlpha = 0x302, kInvSrcAlpha = 0x303;  // GL values
+    if (k.src == kSrcAlpha && (k.dst == kInvSrcAlpha || k.dst == kOne)) return 1;
+    if (k.src == kOne && k.dst == kOne) return 2;
+    return 0;
+}
+
+uint64_t VulkanBackend::SoftShader(const DrawShaders& sh, const PixelKey& pk, int slot) {
+    uint64_t key = sh.pkey ^ kSoftKeySalt ^ uint64_t(slot) << 56;
+    if (auto it = shader_src_.find(key); it != shader_src_.end()) return it->second;
+    uint64_t h = 0;
+    std::string src = PixelHlsl(pk);
+    size_t at = src.find("float4 main(");
+    if (at != std::string::npos) {
+        src.replace(at, 12, "float4 game_main(");
+        char tail[1024];
+        // a W-buffer's depth is the distance (game_main writes it); else Z, made a distance as the scene pass does
+        std::snprintf(tail, sizeof(tail), kSoftMain, pk.wbuf ? ", out float depth : SV_Depth" : "",
+                      pk.wbuf ? ", depth" : "", pk.wbuf ? "depth" : "i.pos.z", slot,
+                      pk.wbuf ? "fz" : "1 / max(1 - fz, 1e-6)", pk.wbuf ? "sz" : "1 / max(1 - sz, 1e-6)");
+        src += tail;
+        if (!Compile(src, "main", "ps_5_0", h)) h = 0;
+    }
+    if (!h) LOG_FIRST(4, "vulkan: a soft particle shader could not be made, the particle is drawn as the game's");
+    shader_src_[key] = h;
+    return h;
+}
+
+// the depth target's copy, made at the frame's first soft particle (the particles that follow fade against it)
+VkImageView VulkanBackend::SoftDepth(Target& ds) {
+    if (ds.soft_depth.img && (ds.soft_depth.w != ds.w || ds.soft_depth.h != ds.h)) DropImage(ds.soft_depth);
+    if (!ds.soft_depth.img && !MakeImage(ds.soft_depth, VK_IMAGE_TYPE_2D, depth_fmt_, ds.w, ds.h, 1, 1, 1,
+                                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        LOG_FIRST(1, "vulkan: no memory for soft particles' depth, particles are drawn as the game's");
+        return VK_NULL_HANDLE;
+    }
+    if (ds.soft_frame != presents_ + 1) {
+        ds.soft_frame = presents_ + 1;
+        End();
+        if (dirty_) Barrier();
+        VkImageCopy cp{};
+        cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        cp.extent = {ds.w, ds.h, 1};
+        vkCmdCopyImage(Cmd(), ds.res.img, VK_IMAGE_LAYOUT_GENERAL, ds.soft_depth.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        dirty_ = true;
+    }
+    return ds.soft_depth.view;
 }
 
 // ---- reflections
@@ -4054,6 +4154,8 @@ void VulkanBackend::LogPerf() {
                       : Style().mode == kStyleToon ? "toon" : "retro");
     LOGR("perf: vulkan draws a frame: %.0f 2D, %.0f vertex programs, %.0f fixed function (%.0f lit)",
          perf_2d_ / n, perf_prog_ / n, perf_fixed_ / n, perf_lit_ / n);
+    LOGR("perf: vulkan soft particles a frame: %.1f", perf_soft_ / n);
+    perf_soft_ = 0;
     LOGR("perf: vulkan reflective draws a frame: %.1f (3D %.0f, stage 0 seen %.0f, rt+ds %.0f, scene size %.0f, opaque %.0f, W-buffer %.0f)",
          perf_reflect_ / n, g_ssr_diag[0] / n, g_ssr_diag[1] / n, g_ssr_diag[2] / n, g_ssr_diag[3] / n, g_ssr_diag[4] / n,
          g_ssr_diag[5] / n);

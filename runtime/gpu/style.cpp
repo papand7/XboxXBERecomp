@@ -67,6 +67,7 @@ void Clamp(GraphicsStyle& s) {
     s.quality_ao = std::clamp(s.quality_ao, 0, 2);
     s.reflections = std::clamp(s.reflections, 0, int(kReflectLevels) - 1);
     s.reflection_strength = std::clamp(s.reflection_strength, 0.0f, 1.0f);
+    s.particle_fade = std::clamp(s.particle_fade, 0.005f, 0.2f);
 }
 
 int Index(const std::string& v, const char* const* names, int n, int fallback) {
@@ -83,7 +84,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "internal_edges", "edge_threshold", "halftone", "pixel", "color_bits", "dither",
                                   "retro_tint", "vertex_snap", "texture_pack", "dump_textures", "quality",
                                   "quality_ao", "quality_bloom", "reflections", "reflection_strength",
-                                  "reflections_auto"};
+                                  "reflections_auto", "soft_particles", "particle_fade"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -144,6 +145,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     named("reflections", s.reflections, kReflectNames, 3);
     num("reflection_strength", s.reflection_strength);
     flag("reflections_auto", s.reflections_auto);
+    flag("soft_particles", s.soft_particles);
+    num("particle_fade", s.particle_fade);
     Clamp(s);
 }
 
@@ -182,7 +185,9 @@ toml::table Write(const GraphicsStyle& s) {
                        {"quality_bloom", s.quality_bloom},
                        {"reflections", kReflectNames[s.reflections]},
                        {"reflection_strength", double(s.reflection_strength)},
-                       {"reflections_auto", s.reflections_auto}};
+                       {"reflections_auto", s.reflections_auto},
+                       {"soft_particles", s.soft_particles},
+                       {"particle_fade", double(s.particle_fade)}};
 }
 
 // the built-in presets
@@ -376,6 +381,8 @@ void ApplyPreset(const StylePreset& p) {
     g_style.reflections = keep.reflections;
     g_style.reflection_strength = keep.reflection_strength;
     g_style.reflections_auto = keep.reflections_auto;
+    g_style.soft_particles = keep.soft_particles;
+    g_style.particle_fade = keep.particle_fade;
     StyleChanged();
 }
 
@@ -625,6 +632,11 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::Checkbox("Find glass by itself", &s.reflections_auto);
         ImGui::TextDisabled("Screen-space: what is on screen is mirrored in glass, and in the textures\n"
                             "mods/reflections.toml lists (docs/graphics_styles.md). Not drawn in Retro.");
+    }
+    if (ImGui::CollapsingHeader("Particles", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::Checkbox("Soft particles", &s.soft_particles);
+        changed |= ImGui::SliderFloat("Fade depth", &s.particle_fade, 0.005f, 0.2f, "%.3f");
+        ImGui::TextDisabled("Smoke, flashes and sparks fade where they meet walls and floors. Not drawn in Retro.");
     }
     if (ImGui::CollapsingHeader("Textures")) {
         changed |= ImGui::Checkbox("Texture packs (mods/textures)", &s.texture_pack);
