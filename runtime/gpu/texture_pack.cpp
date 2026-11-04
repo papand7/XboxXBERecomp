@@ -13,9 +13,11 @@
 #include <wincodec.h>
 #include <wrl/client.h>
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "app/app.h"
@@ -99,6 +101,14 @@ bool WritePng(const std::filesystem::path& path, const std::vector<uint32_t>& px
 std::mutex g_lock;
 std::unordered_set<uint64_t> g_files;   // keys with a picture in the pack
 std::unordered_set<uint64_t> g_dumped;  // keys written this run
+std::unordered_map<uint64_t, float> g_rough;  // a pack picture's mean roughness, from its <key>_r.png (hd_pack --pbr)
+// pictures by where they sit: one whose contents change again within a second (a movie's frames, an animated
+// screen) is no texture to repaint and is not dumped; a level's textures loaded where another's were are
+struct Seen {
+    uint64_t key;
+    std::chrono::steady_clock::time_point changed;
+};
+std::unordered_map<uint32_t, Seen> g_seen_at;
 bool g_scanned = false;
 
 void Scan() {
@@ -117,6 +127,12 @@ void Scan() {
 }
 
 }  // namespace
+
+float PackRoughness(uint64_t key) {
+    std::lock_guard lock(g_lock);
+    auto it = g_rough.find(key);
+    return it == g_rough.end() ? -1.0f : it->second;
+}
 
 bool WritePngFile(const std::wstring& path, const std::vector<uint32_t>& px, uint32_t w, uint32_t h) {
     return WritePng(path, px, w, h);
@@ -137,7 +153,17 @@ void TexturePackSeen(const TextureDesc& d, const uint8_t* guest, const uint32_t*
     uint64_t key = TextureKey(d, guest, palette_hash);
     char name[32];
     std::snprintf(name, sizeof(name), "%016llx.png", (unsigned long long)key);
-    if (st.dump_textures && g_dumped.insert(key).second) {
+    bool moving = false;
+    if (st.dump_textures) {
+        auto now = std::chrono::steady_clock::now();
+        auto [it, fresh] = g_seen_at.try_emplace(d.data, Seen{key, now - std::chrono::seconds(10)});
+        if (!fresh && it->second.key != key) {
+            moving = now - it->second.changed < std::chrono::seconds(1);
+            if (moving) PACK_LOG(8, "texture pack: the picture at %08X changes as it plays (a movie?), not dumped", d.data);
+            it->second = {key, now};
+        }
+    }
+    if (st.dump_textures && !moving && g_dumped.insert(key).second) {
         std::error_code ec;
         std::filesystem::path dir = PackDir() / "dump";
         std::filesystem::create_directories(dir, ec);
@@ -157,6 +183,16 @@ void TexturePackSeen(const TextureDesc& d, const uint8_t* guest, const uint32_t*
         uint32_t w = 0, h = 0;
         if (ReadPng(PackDir() / name, px, w, h)) {
             SetReplacement(d.data, LevelSize(d, 0), w, h, std::move(px));
+            char rname[40];
+            std::snprintf(rname, sizeof(rname), "%016llx_r.png", (unsigned long long)key);
+            std::vector<uint32_t> rp;
+            uint32_t rw = 0, rh = 0;
+            std::error_code ec;
+            if (std::filesystem::exists(PackDir() / rname, ec) && ReadPng(PackDir() / rname, rp, rw, rh) && !rp.empty()) {
+                double sum = 0;
+                for (uint32_t c : rp) sum += (c >> 8 & 0xFF) / 255.0;
+                g_rough[key] = float(sum / double(rp.size()));
+            }
             PACK_LOG(32, "texture pack: %s in place of %08X (%ux%u, %ux%u)", name, d.data, d.width, d.height, w, h);
         }
     }

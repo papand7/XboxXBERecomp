@@ -2881,6 +2881,10 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         if (r && ((r->sharpened && !app::Get().sharp_2d) || !ReplacementFits(*r, d))) r = nullptr;
         if (VkImageView v = r ? BindReplacement(*r, d, stages.levels[stage]) : VK_NULL_HANDLE) {
             stages.replaced[stage] = true;
+            // the game's picture it stands for (uploaded before the pack's was set): what reflections know it by
+            if (auto it = textures_.find(d.data); stage == 0 && it != textures_.end())
+                stage_key_ = it->second.key, stage_glass_ = it->second.glass, stage_solid_ = it->second.solid,
+                stage_seen_ = true;
             return v;
         }
     }
@@ -3437,6 +3441,8 @@ float VulkanBackend::Reflectivity(const PsoKey& k) {
     if (!st.reflections_auto || !k.zen) return 0;
     // metal: the game gives it an environment cube map of its own; ours shows the real surroundings over it
     if (draw_env_ && covers) return 0.5f;
+    // a pack picture with a roughness map (hd_pack --pbr): polished where it says so
+    if (float r = PackRoughness(stage_key_); r >= 0 && r < 0.45f && covers) return (0.45f - r) / 0.45f * 0.8f;
     constexpr uint32_t kSrcAlpha = 0x302, kInvSrcAlpha = 0x303;  // GL values
     if (!k.blend || k.src != kSrcAlpha || k.dst != kInvSrcAlpha) return 0;
     return stage_glass_;

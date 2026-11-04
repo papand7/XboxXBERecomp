@@ -14,6 +14,8 @@ uint64_t TextureKey(const TextureDesc& d, const uint8_t* guest, uint64_t palette
 bool WritePngFile(const std::wstring& path, const std::vector<uint32_t>& px, uint32_t w, uint32_t h);
 // a renderer uploaded d's bytes: dumped when asked, and its pack picture set as its replacement when there is one
 // (the next bind draws it)
+// a pack picture's mean roughness (0 polished to 1 rough) from its <key>_r.png, -1 when it has none
+float PackRoughness(uint64_t key);
 void TexturePackSeen(const TextureDesc& d, const uint8_t* guest, const uint32_t* palette, uint64_t palette_hash);
 
 }  // namespace gpu

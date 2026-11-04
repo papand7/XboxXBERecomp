@@ -38,6 +38,17 @@ file(READ ${smaa_SOURCE_DIR}/SMAA.hlsl XBE_SMAA_HLSL)
 file(WRITE ${CMAKE_BINARY_DIR}/smaa/smaa_hlsl.inc.new "R\"smaa(${XBE_SMAA_HLSL})smaa\"\n")
 configure_file(${CMAKE_BINARY_DIR}/smaa/smaa_hlsl.inc.new ${CMAKE_BINARY_DIR}/smaa/smaa_hlsl.inc COPYONLY)
 
+# hd_pack (tools/hd_pack): a texture pack upscaled on the player's PC by Real-ESRGAN (BSD-3; its ncnn Vulkan build,
+# MIT, with the realesrgan-x4plus models), copied beside each game exe in tools/
+if(WIN32)
+    FetchContent_Declare(realesrgan URL https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip
+        URL_HASH SHA256=abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d)
+    FetchContent_MakeAvailable(realesrgan)
+    add_executable(hd_pack ${XBE_SDK_DIR}/tools/hd_pack/main.cpp)
+    target_compile_definitions(hd_pack PRIVATE UNICODE _UNICODE)
+    target_link_libraries(hd_pack PRIVATE windowscodecs ole32)
+endif()
+
 # x86 to C++ recompiler
 file(GLOB XBE_RECOMP_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/tools/recomp/*.cpp)
 add_executable(xbe_recomp ${XBE_RECOMP_SOURCES})
@@ -117,6 +128,18 @@ function(add_xbe_image target xbe config partitions game_dir)
     # the Vulkan renderer's shader compiler, beside the exe
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll $<TARGET_FILE_DIR:${target}>)
+    # the texture pack tool and its upscaler, in tools\ beside the exe
+    if(WIN32)
+        add_dependencies(${target} hd_pack)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:hd_pack> $<TARGET_FILE_DIR:${target}>/tools
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${realesrgan_SOURCE_DIR}/realesrgan-ncnn-vulkan.exe
+                    ${realesrgan_SOURCE_DIR}/vcomp140.dll $<TARGET_FILE_DIR:${target}>/tools/realesrgan
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.bin
+                    ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.param ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.bin
+                    ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.param $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models)
+    endif()
     # lld keeps the recompiled weak functions overridable by the host ones
     target_link_options(${target} PRIVATE -fuse-ld=lld -g)
 endfunction()
