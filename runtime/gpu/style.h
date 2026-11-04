@@ -12,6 +12,9 @@ namespace gpu {
 enum StyleMode : int { kStyleOriginal, kStyleEnhanced, kStyleToon, kStyleRetro, kStyleModes };
 enum TexFilter : int { kFilterGame, kFilterNearest, kFilterAnisotropic };
 enum Tonemap : int { kToneOff, kToneFilmic, kToneReinhard };
+// graphics quality, apart from the style: Low, Medium, High, Ultra set the values below and the settings' anisotropic
+// filtering and FXAA together; Custom is any other mix (a value changed by itself)
+enum Quality : int { kQualityLow, kQualityMedium, kQualityHigh, kQualityUltra, kQualityCustom, kQualities };
 
 struct GraphicsStyle {
     std::string preset = "original";  // the preset the values came from ("" once edited)
@@ -43,6 +46,10 @@ struct GraphicsStyle {
     bool dither = true;
     float retro_tint = 0.4f;
     bool vertex_snap = true;
+    // quality: ambient occlusion 0 off, 1 low, 2 high; bloom; drawn whatever the style (Vulkan)
+    int quality = kQualityCustom;
+    int quality_ao = 0;
+    bool quality_bloom = false;
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;
@@ -62,6 +69,23 @@ const std::vector<StylePreset>& StylePresets();
 void LoadStyle();       // graphics.toml and the presets, once at start
 void ApplyPreset(const StylePreset& p);
 void SaveStyleIfDue();  // a changed style written once it has held for a second
+
+// a quality preset: its values set (the settings' anisotropic filtering and FXAA too, saved); the preset these
+// values make, or Custom
+void ApplyQuality(int q);
+int MatchQuality();
+int MatchQuality(const GraphicsStyle& s, uint32_t aniso, bool fxaa);
+void QualityValues(int q, uint32_t& aniso, bool& fxaa, int& ao, bool& bloom);  // Low to Ultra's
+
+// from another thread (the game's own menus): the style as of the last frame, and one to take at the next frame
+GraphicsStyle StyleSnapshot();
+void RequestStyle(const GraphicsStyle& s);
+void TakeRequestedStyle();  // the render thread, once a frame (SaveStyleIfDue does it)
+// the scene pass is drawn: a style other than Original, or quality's AO or bloom
+bool ScenePassWanted();
+// what the scene pass draws for each style's values with quality's AO and bloom over them
+float QualityAo(const GraphicsStyle& s);
+float QualityBloom(const GraphicsStyle& s);
 
 // the settings window's Graphics Style tab; vulkan says whether the running renderer draws styles
 void DrawStyleSettings(bool vulkan);

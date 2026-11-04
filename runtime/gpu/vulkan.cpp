@@ -3111,7 +3111,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // (the HUD, menus) has the scene pass drawn first, so the 2D keeps the game's look
     const GraphicsStyle& st = Style();
     bool styled = st.mode != kStyleOriginal;
-    if (styled && bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_) {
+    if (ScenePassWanted() && bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_) {
         if (!draw_2d_ && bound_ds_) {
             scene_rt_ = bound_rt_;
             scene_ds_ = bound_ds_;
@@ -3372,7 +3372,7 @@ void VulkanBackend::Present(const Surface& front) {
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (ramp_dirty_) UploadGammaRamp();
-    if (t && Style().mode != kStyleOriginal && !post_done_ && scene_rt_ == t) ScenePass(*t, scene_ds_);
+    if (t && ScenePassWanted() && !post_done_ && scene_rt_ == t) ScenePass(*t, scene_ds_);
     // XBE_PAD_CMD's diagnostic: a file named shot beside the exe holding a PNG path gets the window's picture, as
     // shown (the settings window too), there
     static const bool shots = [] {
@@ -3566,10 +3566,20 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     dirty_ = true;
     float k = float(rt.h) / float(rt.gh);  // host pixels per console pixel
     float levels = float((1u << st.color_bits) - 1);
-    float c[32] = {float(st.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
-                   st.exposure, float(st.tonemap), st.contrast, st.saturation,
-                   st.temperature, st.sharpen, st.bloom, st.bloom_threshold,
-                   st.ao, st.ao_radius, st.vignette, st.grain,
+    // Original with quality's AO or bloom: Enhanced's path with its grading left as the game's
+    GraphicsStyle g = st;
+    if (g.mode == kStyleOriginal) {
+        GraphicsStyle neutral;
+        g.mode = kStyleEnhanced;
+        g.exposure = neutral.exposure, g.tonemap = kToneOff, g.contrast = 1, g.saturation = 1, g.temperature = 0;
+        g.sharpen = 0, g.vignette = 0, g.grain = 0, g.bloom_threshold = 0.85f;
+    }
+    float ao = QualityAo(st), bloom = st.mode == kStyleOriginal || st.mode == kStyleEnhanced ? QualityBloom(st) : 0.0f;
+    if (st.mode == kStyleOriginal && st.quality_bloom) g.bloom_threshold = 0.85f;
+    float c[32] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
+                   g.exposure, float(g.tonemap), g.contrast, g.saturation,
+                   g.temperature, g.sharpen, bloom, g.bloom_threshold,
+                   ao, g.ao_radius, g.vignette, g.grain,
                    float(st.bands), st.outline * k, st.internal_edges ? 1.0f : 0.0f, st.edge_threshold,
                    st.outline_color[0], st.outline_color[1], st.outline_color[2], st.halftone,
                    float(st.pixel) * k, levels, st.dither ? 1.0f : 0.0f, st.retro_tint,

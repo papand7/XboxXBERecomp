@@ -2,11 +2,13 @@
 #include "gpu/style.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 
 #include <imgui.h>
 #include <toml++/toml.hpp>
@@ -58,6 +60,8 @@ void Clamp(GraphicsStyle& s) {
     s.pixel = std::clamp(s.pixel, 1, 8);
     s.color_bits = std::clamp(s.color_bits, 2, 8);
     s.retro_tint = std::clamp(s.retro_tint, 0.0f, 1.0f);
+    s.quality = std::clamp(s.quality, 0, int(kQualities) - 1);
+    s.quality_ao = std::clamp(s.quality_ao, 0, 2);
 }
 
 int Index(const std::string& v, const char* const* names, int n, int fallback) {
@@ -72,7 +76,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "temperature", "sharpen", "bloom", "bloom_threshold", "ambient_occlusion", "ao_radius",
                                   "vignette", "grain", "texture_filter", "bands", "outline", "outline_color",
                                   "internal_edges", "edge_threshold", "halftone", "pixel", "color_bits", "dither",
-                                  "retro_tint", "vertex_snap", "texture_pack", "dump_textures"};
+                                  "retro_tint", "vertex_snap", "texture_pack", "dump_textures", "quality",
+                                  "quality_ao", "quality_bloom"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -126,6 +131,10 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("vertex_snap", s.vertex_snap);
     flag("texture_pack", s.texture_pack);
     flag("dump_textures", s.dump_textures);
+    static const char* quality_names[] = {"low", "medium", "high", "ultra", "custom"};
+    named("quality", s.quality, quality_names, 5);
+    integer("quality_ao", s.quality_ao);
+    flag("quality_bloom", s.quality_bloom);
     Clamp(s);
 }
 
@@ -158,7 +167,10 @@ toml::table Write(const GraphicsStyle& s) {
                        {"retro_tint", double(s.retro_tint)},
                        {"vertex_snap", s.vertex_snap},
                        {"texture_pack", s.texture_pack},
-                       {"dump_textures", s.dump_textures}};
+                       {"dump_textures", s.dump_textures},
+                       {"quality", std::array<const char*, 5>{"low", "medium", "high", "ultra", "custom"}[size_t(s.quality)]},
+                       {"quality_ao", int64_t(s.quality_ao)},
+                       {"quality_bloom", s.quality_bloom}};
 }
 
 // the built-in presets
@@ -207,6 +219,46 @@ std::vector<StylePreset> BuiltIn() {
 }  // namespace
 
 GraphicsStyle& Style() { return g_style; }
+
+namespace {
+std::mutex g_handoff;
+GraphicsStyle g_snapshot;   // the style as the last frame drew it
+GraphicsStyle g_requested;  // a menu's, taken at the next frame
+bool g_has_request = false;
+}  // namespace
+
+// without the Vulkan renderer nothing draws from the style: the menu's thread reads and writes it at once
+GraphicsStyle StyleSnapshot() {
+    LoadStyle();
+    std::lock_guard lock(g_handoff);
+    return g_vulkan ? g_snapshot : g_style;
+}
+void RequestStyle(const GraphicsStyle& s) {
+    std::lock_guard lock(g_handoff);
+    if (!g_vulkan) {
+        g_style = s;
+        StyleChanged();
+        g_changed = {};  // saved at once below
+        g_saved = 0;
+    } else {
+        g_requested = s;
+        g_has_request = true;
+        return;
+    }
+    // (outside the render thread's frame loop: written here)
+    std::ofstream out(StyleFile());
+    out << "# graphics styles (docs/graphics_styles.md); written by the game's settings\n" << Write(g_style) << "\n";
+    g_saved = g_version.load();
+}
+void TakeRequestedStyle() {
+    std::lock_guard lock(g_handoff);
+    if (g_has_request) {
+        g_has_request = false;
+        g_style = g_requested;
+        StyleChanged();
+    }
+    g_snapshot = g_style;
+}
 uint64_t StyleVersion() { return g_version.load(); }
 void StyleChanged() {
     Clamp(g_style);
@@ -265,20 +317,79 @@ void LoadStyle() {
     }
     g_saved = g_version.load();
     g_file_time = std::filesystem::last_write_time(StyleFile(), ec);
+    g_snapshot = g_style;
     LOGR("graphics: style %s (%s), %zu presets", kModes[g_style.mode], g_style.preset.empty() ? "custom" : g_style.preset.c_str(),
          g_presets.size());
 }
 
 void ApplyPreset(const StylePreset& p) {
-    bool pack = g_style.texture_pack, dump = g_style.dump_textures;  // texture settings are not a look
+    // texture settings and quality are not a look: kept
+    GraphicsStyle keep = g_style;
     g_style = p.values;
     g_style.preset = p.name;
-    g_style.texture_pack = pack;
-    g_style.dump_textures = dump;
+    g_style.texture_pack = keep.texture_pack;
+    g_style.dump_textures = keep.dump_textures;
+    g_style.quality = keep.quality;
+    g_style.quality_ao = keep.quality_ao;
+    g_style.quality_bloom = keep.quality_bloom;
     StyleChanged();
 }
 
+namespace {
+// the presets' values: anisotropic filtering (0 as the game asks), FXAA, AO, bloom
+struct QualitySet {
+    uint32_t aniso;
+    bool fxaa;
+    int ao;
+    bool bloom;
+};
+constexpr QualitySet kQuality[4] = {{0, false, 0, false}, {4, true, 0, true}, {8, true, 1, true}, {16, true, 2, true}};
+}  // namespace
+
+void ApplyQuality(int q) {
+    if (q < 0 || q >= kQualityCustom) {
+        g_style.quality = kQualityCustom;
+        StyleChanged();
+        return;
+    }
+    const QualitySet& v = kQuality[q];
+    {
+        std::lock_guard<std::recursive_mutex> lock(app::UiLock());
+        app::Settings& s = app::Get();
+        s.aniso = v.aniso;
+        s.fxaa = v.fxaa;
+        app::Save();
+    }
+    g_style.quality = q;
+    g_style.quality_ao = v.ao;
+    g_style.quality_bloom = v.bloom;
+    StyleChanged();
+}
+
+int MatchQuality(const GraphicsStyle& st, uint32_t aniso, bool fxaa) {
+    for (int q = 0; q < kQualityCustom; q++) {
+        const QualitySet& v = kQuality[q];
+        if (aniso == v.aniso && fxaa == v.fxaa && st.quality_ao == v.ao && st.quality_bloom == v.bloom) return q;
+    }
+    return kQualityCustom;
+}
+int MatchQuality() { return MatchQuality(g_style, app::Get().aniso, app::Get().fxaa); }
+void QualityValues(int q, uint32_t& aniso, bool& fxaa, int& ao, bool& bloom) {
+    const auto& v = kQuality[std::clamp(q, 0, 3)];
+    aniso = v.aniso, fxaa = v.fxaa, ao = v.ao, bloom = v.bloom;
+}
+
+bool ScenePassWanted() { return g_style.mode != kStyleOriginal || g_style.quality_ao > 0 || g_style.quality_bloom; }
+float QualityAo(const GraphicsStyle& s) {
+    static const float levels[3] = {0.0f, 0.5f, 0.9f};
+    return std::max(s.mode == kStyleEnhanced ? s.ao : 0.0f, levels[s.quality_ao]);
+}
+float QualityBloom(const GraphicsStyle& s) {
+    return std::max(s.mode == kStyleEnhanced ? s.bloom : 0.0f, s.quality_bloom ? 0.2f : 0.0f);
+}
+
 void SaveStyleIfDue() {
+    TakeRequestedStyle();
     // graphics.toml edited outside the game (a mod author tuning a look): read again, once a second at most
     auto now = std::chrono::steady_clock::now();
     if (now - g_checked >= std::chrono::seconds(1)) {
