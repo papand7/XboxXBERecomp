@@ -52,6 +52,12 @@ void AddPad(SDL_JoystickID id) {
     LOGI("input: controller %d %s: %s", int(slot - g_pads) + 1, *slot ? "plugged in" : "failed to open", name ? name : "");
 }
 
+// the controller a port reads: the first one plays port 1 with the keyboard, or port 2 when the keyboard is alone
+SDL_Gamepad* PadOf(int port, const app::Settings& s) {
+    int i = s.keyboard && s.keyboard_alone ? port - 1 : port;
+    return i >= 0 && i < 4 ? g_pads[i] : nullptr;
+}
+
 void RemovePad(SDL_JoystickID id) {
     for (int i = 0; i < 4; i++) {
         if (!g_pads[i] || SDL_GetGamepadID(g_pads[i]) != id) continue;
@@ -292,7 +298,16 @@ void PressNamed(const std::string& names, float out[kControls], uint32_t& mouse)
     }
 }
 
-bool Scripted(float out[kControls]) {
+// XBE_PAD_PORTS=N: controllers 2 to N plugged in for the cmd file's presses ("2:A 8"), a split screen's test
+int ScriptedPorts() {
+    static const int n = [] {
+        const char* e = std::getenv("XBE_PAD_PORTS");
+        return e && *e ? std::clamp(std::atoi(e), 1, 4) : 1;
+    }();
+    return n;
+}
+
+bool Scripted(int port, float out[kControls]) {
     static const std::vector<ScriptedPress> script = [] {
         std::vector<ScriptedPress> v;
         const char* path = std::getenv("XBE_PAD_SCRIPT");
@@ -313,10 +328,11 @@ bool Scripted(float out[kControls]) {
         return e && *e && *e != '0';
     }();
     if (script.empty() && !cmd_on) return false;
+    if (port >= ScriptedPorts()) return false;
     static const auto start = std::chrono::steady_clock::now();
     // the cmd file's press, read and replaced by whichever thread polls controller 1
     static std::mutex live_lock;
-    static ScriptedPress live{-1, "", 0};
+    static ScriptedPress live[4] = {{-1, "", 0}, {-1, "", 0}, {-1, "", 0}, {-1, "", 0}};
     std::lock_guard lock(live_lock);
     double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() * 60.0;
     if (cmd_on) {
@@ -331,16 +347,22 @@ bool Scripted(float out[kControls]) {
                 app::SetFramePointOverride(float(len) / 640.0f, float(y) / 480.0f);
                 LOGR("input: cmd pointer at %.0f, %.0f", len, y);
             } else if (got >= 1) {
-                live = {t, b, len};
-                LOGR("input: cmd %s for %.0f vblanks", b, len);
+                int to = 0;  // "2:A" a press of controller 2's
+                std::string name = b;
+                if (name.size() > 2 && name[1] == ':' && name[0] >= '1' && name[0] <= '4')
+                    to = name[0] - '1', name = name.substr(2);
+                live[to] = {t, name, len};
+                LOGR("input: cmd %s for %.0f vblanks on controller %d", name.c_str(), len, to + 1);
             }
         }
     }
     uint32_t mouse = 0;
-    for (const ScriptedPress& p : script)
-        if (t >= p.at && t <= p.at + p.len) PressNamed(p.buttons, out, mouse);
-    if (live.at >= 0 && t >= live.at && t <= live.at + live.len) PressNamed(live.buttons, out, mouse);
-    g_script_mouse = mouse;
+    if (port == 0)
+        for (const ScriptedPress& p : script)
+            if (t >= p.at && t <= p.at + p.len) PressNamed(p.buttons, out, mouse);
+    const ScriptedPress& l = live[port];
+    if (l.at >= 0 && t >= l.at && t <= l.at + l.len) PressNamed(l.buttons, out, mouse);
+    if (port == 0) g_script_mouse = mouse;
     return true;
 }
 
@@ -351,7 +373,7 @@ Pad Poll(int port) {
     {
         std::lock_guard lock(g_lock);
         UpdatePads();
-        if (SDL_Gamepad* pad = port >= 0 && port < 4 ? g_pads[port] : nullptr) {
+        if (SDL_Gamepad* pad = PadOf(port, s)) {
             p.connected = true;
             ReadPad(pad, in);
         }
@@ -396,7 +418,7 @@ Pad Poll(int port) {
         }
     }
     // scripted presses count as the controller's own: the settings window (Back + Start, its navigation) sees them too
-    if (float sc[kControls] = {}; port == 0 && Scripted(sc)) {
+    if (float sc[kControls] = {}; port >= 0 && port < 4 && Scripted(port, sc)) {
         p.connected = true;
         for (int c = 0; c < kControls; c++) out[c] = std::max(out[c], sc[c]), in[c] = std::max(in[c], sc[c]);
     }
@@ -442,7 +464,7 @@ void Rumble(int port, uint16_t left, uint16_t right) {
     if (app::kGame.rumble) app::kGame.rumble(port, left, right);
     if (port == 0) g_rumble[0] = left, g_rumble[1] = right;
     std::lock_guard lock(g_lock);
-    if (port >= 0 && port < 4 && g_pads[port]) SDL_RumbleGamepad(g_pads[port], left, right, 0);
+    if (SDL_Gamepad* pad = PadOf(port, app::Get())) SDL_RumbleGamepad(pad, left, right, 0);
 }
 
 }  // namespace input

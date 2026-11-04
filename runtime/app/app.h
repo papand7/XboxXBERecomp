@@ -35,6 +35,9 @@ struct Settings {
     std::vector<uint8_t> pad_map;    // empty: each input drives itself
     std::vector<std::array<uint16_t, 2>> keys;  // empty: the default keys
     bool keyboard = true;
+    // the keyboard and mouse are controller 1 alone, the controllers 2 to 4 (split screen with one controller and the
+    // keyboard); else the first controller is controller 1 with them
+    bool keyboard_alone = false;
     // the mouse moves controller 1's right stick, for a title that offers it (GameInfo::mouse_look): the cursor is
     // held in the window while the game has it
     bool mouse_look = true;

@@ -225,6 +225,7 @@ void Load() {
     for (uint32_t i = 0; i < kAspectCount; i++)
         if (aspect == kAspects[i]) s.aspect = i;
     s.keyboard = t["keyboard"].value_or(s.keyboard);
+    s.keyboard_alone = t["keyboard_alone"].value_or(s.keyboard_alone);
     s.mouse_look = t["mouse_look"].value_or(s.mouse_look);
     s.mouse_sensitivity = std::clamp<uint32_t>(t["mouse_sensitivity"].value_or(s.mouse_sensitivity), 10, 1000);
     s.mouse_invert_y = t["mouse_invert_y"].value_or(s.mouse_invert_y);
@@ -327,6 +328,7 @@ toml::table Table() {
                   {"join_ip", s.join_ip},
                   {"aspect", kAspects[s.aspect % kAspectCount]},
                   {"keyboard", s.keyboard},
+                  {"keyboard_alone", s.keyboard_alone},
                   {"monitor", int64_t(s.monitor)},
                   {"pause_unfocused", s.pause_unfocused},
                   {"show_fps", s.show_fps},

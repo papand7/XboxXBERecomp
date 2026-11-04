@@ -384,6 +384,11 @@ void Controls(Settings& s) {
     if (s.keys.size() != input::kControls || s.pad_map.size() != input::kControls) return;  // sized in Get
     if (ImGui::Checkbox("Keyboard plays as controller 1", &s.keyboard)) Save();
     ImGui::SameLine();
+    if (ImGui::Checkbox("Keyboard alone (controllers from 2)", &s.keyboard_alone)) Save();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Split screen with the keyboard and mouse: they are controller 1 and the first controller is "
+                          "controller 2. Off: the first controller and the keyboard are both controller 1.");
+    ImGui::SameLine();
     if (ImGui::Button("Default keys")) {
         for (int c = 0; c < input::kControls; c++) s.keys[c] = DefaultKeys(c);
         Save();
