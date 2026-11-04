@@ -149,6 +149,14 @@ void Graphics(Settings& s) {
     }
     ImGui::TextDisabled("MSAA smooths the edges of the 3D scene at once; render scale above 100%% also smooths edges.");
     if (ImGui::Checkbox("Show frames a second", &s.show_fps)) Save();
+    if (kGame.hit_feedback) {
+        int hit = int(s.hit_feedback % 3);
+        const char* hits[] = {"Off", "Marker", "Marker and sound"};
+        if (ImGui::Combo("Hit feedback (your shots hitting)", &hit, hits, 3)) {
+            s.hit_feedback = uint32_t(hit);
+            Save();
+        }
+    }
     if (kGame.sharpen_2d && ImGui::Checkbox("Sharp text and HUD", &s.sharp_2d)) Save();
     int renderer = int(s.renderer % 3);
     const char* renderers[] = {"Direct3D 12", "Direct3D 11", "Vulkan (experimental)"};
@@ -529,6 +537,7 @@ void Achievements() {
 
 void DrawHud(double fps) {
     DrawUnlock();
+    DrawHitMarkers();
     if (!Get().show_fps) return;
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 8, vp->WorkPos.y + 8));

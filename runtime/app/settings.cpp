@@ -232,6 +232,7 @@ void Load() {
     s.monitor = t["monitor"].value_or(s.monitor);
     s.pause_unfocused = t["pause_unfocused"].value_or(s.pause_unfocused);
     s.show_fps = t["show_fps"].value_or(s.show_fps);
+    s.hit_feedback = std::min<uint32_t>(t["hit_feedback"].value_or(s.hit_feedback), 2);
     s.sharp_2d = t["sharp_2d"].value_or(s.sharp_2d);
     // only a language the title has (GameInfo::languages): the console's setting goes to the guest as it is
     if (uint32_t l = t["language"].value_or(s.language); !kGame.languages.empty()) {
@@ -333,6 +334,7 @@ toml::table Table() {
                   {"monitor", int64_t(s.monitor)},
                   {"pause_unfocused", s.pause_unfocused},
                   {"show_fps", s.show_fps},
+                  {"hit_feedback", int64_t(s.hit_feedback)},
                   {"sharp_2d", s.sharp_2d},
                   {"language", int64_t(s.language)},
                   {"msaa", kMsaa[s.msaa % kMsaaCount]},
