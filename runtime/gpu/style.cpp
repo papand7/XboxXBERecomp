@@ -9,6 +9,8 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <unordered_map>
 
 #include <imgui.h>
 #include <toml++/toml.hpp>
@@ -33,6 +35,7 @@ const char* kModes[] = {"original", "enhanced", "toon", "retro"};
 const char* kModeLabels[] = {"Original", "Enhanced", "Toon", "Retro"};
 const char* kFilters[] = {"game", "nearest", "anisotropic"};
 const char* kTonemaps[] = {"off", "filmic", "reinhard"};
+const char* kReflectNames[] = {"off", "low", "high"};
 
 std::filesystem::path StyleFile() { return app::ExeDir() / "graphics.toml"; }
 
@@ -62,6 +65,8 @@ void Clamp(GraphicsStyle& s) {
     s.retro_tint = std::clamp(s.retro_tint, 0.0f, 1.0f);
     s.quality = std::clamp(s.quality, 0, int(kQualities) - 1);
     s.quality_ao = std::clamp(s.quality_ao, 0, 2);
+    s.reflections = std::clamp(s.reflections, 0, int(kReflectLevels) - 1);
+    s.reflection_strength = std::clamp(s.reflection_strength, 0.0f, 1.0f);
 }
 
 int Index(const std::string& v, const char* const* names, int n, int fallback) {
@@ -77,7 +82,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "vignette", "grain", "texture_filter", "bands", "outline", "outline_color",
                                   "internal_edges", "edge_threshold", "halftone", "pixel", "color_bits", "dither",
                                   "retro_tint", "vertex_snap", "texture_pack", "dump_textures", "quality",
-                                  "quality_ao", "quality_bloom"};
+                                  "quality_ao", "quality_bloom", "reflections", "reflection_strength",
+                                  "reflections_auto"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -135,6 +141,9 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     named("quality", s.quality, quality_names, 5);
     integer("quality_ao", s.quality_ao);
     flag("quality_bloom", s.quality_bloom);
+    named("reflections", s.reflections, kReflectNames, 3);
+    num("reflection_strength", s.reflection_strength);
+    flag("reflections_auto", s.reflections_auto);
     Clamp(s);
 }
 
@@ -170,7 +179,10 @@ toml::table Write(const GraphicsStyle& s) {
                        {"dump_textures", s.dump_textures},
                        {"quality", std::array<const char*, 5>{"low", "medium", "high", "ultra", "custom"}[size_t(s.quality)]},
                        {"quality_ao", int64_t(s.quality_ao)},
-                       {"quality_bloom", s.quality_bloom}};
+                       {"quality_bloom", s.quality_bloom},
+                       {"reflections", kReflectNames[s.reflections]},
+                       {"reflection_strength", double(s.reflection_strength)},
+                       {"reflections_auto", s.reflections_auto}};
 }
 
 // the built-in presets
@@ -361,18 +373,29 @@ void ApplyPreset(const StylePreset& p) {
     g_style.quality = keep.quality;
     g_style.quality_ao = keep.quality_ao;
     g_style.quality_bloom = keep.quality_bloom;
+    g_style.reflections = keep.reflections;
+    g_style.reflection_strength = keep.reflection_strength;
+    g_style.reflections_auto = keep.reflections_auto;
     StyleChanged();
 }
 
 namespace {
-// the presets' values: anisotropic filtering (0 as the game asks), FXAA, AO, bloom
+// the presets' values: anisotropic filtering (0 as the game asks), FXAA, SMAA, AO, bloom
 struct QualitySet {
     uint32_t aniso;
     bool fxaa;
+    bool smaa;
     int ao;
     bool bloom;
 };
-constexpr QualitySet kQuality[4] = {{0, false, 0, false}, {4, true, 0, true}, {8, true, 1, true}, {16, true, 2, true}};
+constexpr QualitySet kQuality[4] = {
+    {0, false, false, 0, false}, {4, true, false, 0, true}, {8, false, true, 1, true}, {16, false, true, 2, true}};
+// a renderer without SMAA takes FXAA in its place
+QualitySet Drawn(const QualitySet& v) {
+    QualitySet d = v;
+    if (!g_vulkan && d.smaa) d.fxaa = true, d.smaa = false;
+    return d;
+}
 }  // namespace
 
 void ApplyQuality(int q) {
@@ -382,12 +405,13 @@ void ApplyQuality(int q) {
         StyleChanged();
         return;
     }
-    const QualitySet& v = kQuality[q];
+    const QualitySet v = Drawn(kQuality[q]);
     {
         std::lock_guard<std::recursive_mutex> lock(app::UiLock());
         app::Settings& s = app::Get();
         s.aniso = v.aniso;
         s.fxaa = v.fxaa;
+        s.smaa = v.smaa;
         app::Save();
     }
     std::lock_guard lock(g_handoff);
@@ -397,20 +421,27 @@ void ApplyQuality(int q) {
     StyleChanged();
 }
 
-int MatchQuality(const GraphicsStyle& st, uint32_t aniso, bool fxaa) {
+int MatchQuality(const GraphicsStyle& st, uint32_t aniso, bool fxaa, bool smaa) {
+    if (!g_vulkan) smaa = false;  // kept in the settings, not drawn
     for (int q = 0; q < kQualityCustom; q++) {
-        const QualitySet& v = kQuality[q];
-        if (aniso == v.aniso && fxaa == v.fxaa && st.quality_ao == v.ao && st.quality_bloom == v.bloom) return q;
+        const QualitySet v = Drawn(kQuality[q]);
+        if (aniso == v.aniso && fxaa == v.fxaa && smaa == v.smaa && st.quality_ao == v.ao &&
+            st.quality_bloom == v.bloom)
+            return q;
     }
     return kQualityCustom;
 }
-int MatchQuality() { return MatchQuality(g_style, app::Get().aniso, app::Get().fxaa); }
-void QualityValues(int q, uint32_t& aniso, bool& fxaa, int& ao, bool& bloom) {
-    const auto& v = kQuality[std::clamp(q, 0, 3)];
-    aniso = v.aniso, fxaa = v.fxaa, ao = v.ao, bloom = v.bloom;
+int MatchQuality() { return MatchQuality(g_style, app::Get().aniso, app::Get().fxaa, app::Get().smaa); }
+void QualityValues(int q, uint32_t& aniso, bool& fxaa, bool& smaa, int& ao, bool& bloom) {
+    const QualitySet v = Drawn(kQuality[std::clamp(q, 0, 3)]);
+    aniso = v.aniso, fxaa = v.fxaa, smaa = v.smaa, ao = v.ao, bloom = v.bloom;
 }
 
-bool ScenePassWanted() { return g_style.mode != kStyleOriginal || g_style.quality_ao > 0 || g_style.quality_bloom; }
+bool StylePassWanted() {
+    return g_style.mode != kStyleOriginal || g_style.quality_ao > 0 || g_style.quality_bloom ||
+           (g_style.reflections != kReflectOff && g_style.mode != kStyleRetro);
+}
+bool ScenePassWanted() { return StylePassWanted() || (app::Get().smaa && g_style.mode != kStyleRetro); }
 float QualityAo(const GraphicsStyle& s) {
     static const float levels[3] = {0.0f, 0.5f, 0.9f};
     return std::max(s.mode == kStyleEnhanced ? s.ao : 0.0f, levels[s.quality_ao]);
@@ -419,8 +450,60 @@ float QualityBloom(const GraphicsStyle& s) {
     return std::max(s.mode == kStyleEnhanced ? s.bloom : 0.0f, s.quality_bloom ? 0.2f : 0.0f);
 }
 
+// ---- mods/reflections.toml
+
+namespace {
+std::unordered_map<uint64_t, float> g_reflect;
+std::filesystem::file_time_type g_reflect_time{};
+std::chrono::steady_clock::time_point g_reflect_checked;
+bool g_reflect_read = false;
+
+void ReadReflectionList() {
+    std::filesystem::path f = app::ExeDir() / "mods" / "reflections.toml";
+    std::error_code ec;
+    auto t = std::filesystem::last_write_time(f, ec);
+    if (g_reflect_read && (ec ? g_reflect.empty() : t == g_reflect_time)) return;
+    g_reflect_read = true;
+    g_reflect_time = ec ? std::filesystem::file_time_type{} : t;
+    g_reflect.clear();
+    if (ec) return;
+    try {
+        toml::table tb = toml::parse_file(f.string());
+        if (const toml::table* list = tb["textures"].as_table())
+            for (auto&& [k, v] : *list) {
+                std::string name(k.str());
+                char* end = nullptr;
+                uint64_t key = std::strtoull(name.c_str(), &end, 16);
+                std::optional<double> s = v.value<double>();
+                if (name.size() != 16 || !end || *end || !s) {
+                    LOGR("graphics: reflections.toml: '%s' is not a texture's 16 hex digits = a strength, ignored",
+                         name.c_str());
+                    continue;
+                }
+                g_reflect[key] = std::clamp(float(*s), 0.0f, 1.0f);
+            }
+        LOGR("graphics: reflections.toml lists %zu textures", g_reflect.size());
+    } catch (const toml::parse_error& e) {
+        LOGR("graphics: reflections.toml is not valid TOML (%s), not used", std::string(e.description()).c_str());
+    }
+}
+}  // namespace
+
+float ReflectionOf(uint64_t texture_key) {
+    auto it = g_reflect.find(texture_key);
+    return it == g_reflect.end() ? -1.0f : it->second;
+}
+
+void CheckReflectionList() {
+    auto now = std::chrono::steady_clock::now();
+    if (g_reflect_read && now - g_reflect_checked < std::chrono::seconds(1)) return;
+    g_reflect_checked = now;
+    ReadReflectionList();
+}
+
 void SaveStyleIfDue() {
     TakeRequestedStyle();
+    CheckReflectionList();
     // graphics.toml edited outside the game (a mod author tuning a look): read again, once a second at most
     auto now = std::chrono::steady_clock::now();
     if (now - g_checked >= std::chrono::seconds(1)) {
@@ -534,6 +617,14 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::Checkbox("Ordered dithering", &s.dither);
         changed |= ImGui::SliderFloat("Retro grading", &s.retro_tint, 0.0f, 1.0f, "%.2f");
         changed |= ImGui::Checkbox("Vertex snapping", &s.vertex_snap);
+    }
+    if (ImGui::CollapsingHeader("Reflections", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int r = s.reflections;
+        if (ImGui::Combo("Reflections", &r, "Off\0Low\0High\0")) s.reflections = r, changed = true;
+        changed |= ImGui::SliderFloat("Reflection strength", &s.reflection_strength, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::Checkbox("Find glass by itself", &s.reflections_auto);
+        ImGui::TextDisabled("Screen-space: what is on screen is mirrored in glass, and in the textures\n"
+                            "mods/reflections.toml lists (docs/graphics_styles.md). Not drawn in Retro.");
     }
     if (ImGui::CollapsingHeader("Textures")) {
         changed |= ImGui::Checkbox("Texture packs (mods/textures)", &s.texture_pack);

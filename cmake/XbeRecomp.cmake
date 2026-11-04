@@ -29,6 +29,14 @@ FetchContent_Declare(VulkanHeaders URL https://github.com/KhronosGroup/Vulkan-He
 FetchContent_Declare(dxc URL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2407/dxc_2024_07_31.zip
     URL_HASH SHA256=e2627f004f0f9424d8c71ea1314d04f38c5a5096884ae9217f1f18bd320267b5)
 FetchContent_MakeAvailable(VulkanHeaders dxc)
+# SMAA (MIT, Jimenez et al.): the Vulkan renderer's scene antialiasing; its shader source as a string, its lookup
+# textures' bytes from its headers (gpu/smaa.cpp)
+FetchContent_Declare(smaa URL https://github.com/iryoku/smaa/archive/71c806a838bdd7d517df19192a20f0c61b3ca29d.tar.gz
+    URL_HASH SHA256=046a435f5713f8bfe8148fe6305c2abf1409fc2122bee6070061c675e1e55f57)
+FetchContent_MakeAvailable(smaa)
+file(READ ${smaa_SOURCE_DIR}/SMAA.hlsl XBE_SMAA_HLSL)
+file(WRITE ${CMAKE_BINARY_DIR}/smaa/smaa_hlsl.inc.new "R\"smaa(${XBE_SMAA_HLSL})smaa\"\n")
+configure_file(${CMAKE_BINARY_DIR}/smaa/smaa_hlsl.inc.new ${CMAKE_BINARY_DIR}/smaa/smaa_hlsl.inc COPYONLY)
 
 # x86 to C++ recompiler
 file(GLOB XBE_RECOMP_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/tools/recomp/*.cpp)
@@ -66,6 +74,8 @@ set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp PR
 file(GLOB XBE_RUNTIME_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/runtime/*/*.cpp)
 # SDL's headers go to the input code alone (it is linked LINK_ONLY), so the generated sources' compile line stays the same
 set_source_files_properties(${XBE_SDK_DIR}/runtime/core/input.cpp PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
+set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/smaa.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${smaa_SOURCE_DIR}/Textures;${CMAKE_BINARY_DIR}/smaa")
 
 # One executable per recompiled image: its code from config/<config> (partitions as that config sets them),
 # the SDK runtime, XBE_HOST_SOURCES shared by every image of the game, and src/<game_dir> hooks only this image has.

@@ -49,6 +49,7 @@
 #include "gpu/d3d_common.h"
 #include "gpu/ext.h"
 #include "gpu/shaders.h"
+#include "gpu/smaa.h"
 #include "gpu/style.h"
 #include "gpu/texture.h"
 #include "gpu/texture_pack.h"
@@ -430,6 +431,10 @@ struct Target {
     bool linear32 = true;         // a 32 bit linear surface in guest memory, written back row by row
     bool swizzled32 = false;      // a 32 bit swizzled one, written back in Morton order (a title reading it as data)
     std::vector<uint8_t> read;    // what Sync left in guest memory
+    // the scene pass's, made for the 3D scene's target alone: SMAA's edges and weights; the reflection mask (r: how
+    // much each pixel reflects) and its depth (the nearest reflective surface), cleared once a frame
+    Image smaa_edges, smaa_weights, mask, mask_ds;
+    uint64_t mask_frame = 0;  // the frame (presents_ + 1) it was cleared for
 };
 
 // a texture from guest memory
@@ -442,6 +447,9 @@ struct Tex {
     uint64_t frame = 0;
     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
     uint64_t faces = 0;    // a cube's frame its faces drawn on the GPU were last copied in
+    uint64_t key = 0;      // its texture pack name (TextureKey), what mods/reflections.toml lists
+    float glass = 0;       // how much its alpha looks like window glass, 0 to 1 (GlassScore)
+    bool solid = false;    // its alpha is all 1 (or it has none): drawn blended, it still covers
 };
 
 // a draw's four texture stages
@@ -545,6 +553,50 @@ bool SameTexture(const Tex& tx, const TextureDesc& d) {
            tx.d.depth == d.depth && tx.d.levels == d.levels && tx.d.cube == d.cube && tx.d.pitch == d.pitch;
 }
 
+// a texture's level 0 alpha as window glass has it: see-through all over and even (a smoke puff or a leaf's alpha
+// spans the range, a cut-out's is 0 or 1); 0 to 1, 0 for formats without alpha. Up to 4096 texels are read
+float GlassScore(VkFormat fmt, const std::vector<uint8_t>& px, uint32_t pitch, uint32_t w, uint32_t h, bool& solid) {
+    solid = fmt != VK_FORMAT_B8G8R8A8_UNORM && fmt != VK_FORMAT_R8G8B8A8_UNORM && fmt != VK_FORMAT_BC2_UNORM_BLOCK &&
+            fmt != VK_FORMAT_BC3_UNORM_BLOCK;  // BC1 too: its cut-outs are what alpha test drops
+    std::vector<uint8_t> a;
+    a.reserve(4096);
+    if (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_UNORM) {
+        uint32_t step = std::max(1u, uint32_t(std::sqrt(double(w) * h / 4096.0)));
+        for (uint32_t y = 0; y < h; y += step)
+            for (uint32_t x = 0; x < w; x += step)
+                if (size_t(y) * pitch + x * 4 + 3 < px.size()) a.push_back(px[size_t(y) * pitch + x * 4 + 3]);
+    } else if (fmt == VK_FORMAT_BC2_UNORM_BLOCK || fmt == VK_FORMAT_BC3_UNORM_BLOCK) {
+        size_t blocks = px.size() / 16, step = std::max<size_t>(1, blocks / 256);
+        for (size_t b = 0; b < blocks; b += step) {
+            const uint8_t* q = &px[b * 16];
+            for (int i = 0; i < 16; i++) {
+                if (fmt == VK_FORMAT_BC2_UNORM_BLOCK) {
+                    a.push_back(uint8_t(((q[i / 2] >> (i & 1) * 4) & 15) * 17));
+                    continue;
+                }
+                uint32_t a0 = q[0], a1 = q[1], bit = 16 + i * 3;
+                uint32_t idx = ((q[bit / 8] | q[std::min(bit / 8 + 1, 7u)] << 8) >> (bit & 7)) & 7;
+                uint32_t v = idx == 0 ? a0 : idx == 1 ? a1
+                             : a0 > a1 ? ((8 - idx) * a0 + (idx - 1) * a1) / 7
+                             : idx == 6 ? 0 : idx == 7 ? 255 : ((6 - idx) * a0 + (idx - 1) * a1) / 5;
+                a.push_back(uint8_t(v));
+            }
+        }
+    }
+    if (a.size() < 16) return 0;
+    double sum = 0, sq = 0;
+    size_t mid = 0, full = 0;
+    for (uint8_t v : a) sum += v, sq += double(v) * v, mid += v >= 16 && v <= 235, full += v >= 240;
+    solid = full == a.size();
+    double n = double(a.size()), mean = sum / n, sd = std::sqrt(std::max(0.0, sq / n - mean * mean));
+    double part = double(mid) / n;
+    if (part < 0.6 || sd > 45 || mean < 16 || mean > 215) return 0;
+    return float(std::clamp((part - 0.6) / 0.3, 0.0, 1.0) * std::clamp((45 - sd) / 25, 0.0, 1.0));
+}
+
+// drawn over what is there without mixing: blending off, or on with ONE, ZERO (NightFire leaves it on for walls)
+bool Opaque(const PsoKey& k) { return !k.blend || (k.src == 1 && k.dst == 0); }
+
 // HLSL's vertex inputs ATTRn at location n, as the pipeline's vertex attributes number them (DXC numbers them in
 // declaration order otherwise)
 std::string LocateInputs(std::string src) {
@@ -567,11 +619,15 @@ std::string LocateInputs(std::string src) {
 // b1 p[8]: [0] mode, 1/width, 1/height, seconds; [1] exposure, tone map, contrast, saturation; [2] temperature,
 // sharpen, bloom, bloom threshold; [3] AO, AO radius, vignette, grain; [4] bands, outline px, internal edges, edge
 // threshold; [5] outline colour, halftone; [6] block px, colour levels, dither, retro grading; [7] depth bound,
-// width, height, host px per console px. t0 the scene, t1 its depth; s0 linear, s1 point.
+// width, height, host px per console px; [8] reflections' strength (0 none), ray steps, tan of half the vertical view
+// angle, width / height; [9] the thickness a ray hits and its reach (parts of the surface's distance). t0 the scene, t1
+// its depth, t2 the reflection mask (r), t3 its depth; s0 linear, s1 point.
 const char* kScenePostHlsl = R"(
-cbuffer P : register(b1) { float4 p[8]; };
+cbuffer P : register(b1) { float4 p[10]; };
 Texture2D scene : register(t0);
 Texture2D<float> depthtex : register(t1);
+Texture2D maskc : register(t2);
+Texture2D<float> maskz : register(t3);
 SamplerState ls : register(s0);
 SamplerState pt : register(s1);
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -589,6 +645,9 @@ float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 float rawz(float2 uv) { return depthtex.SampleLevel(pt, uv, 0); }
 // grows with distance for a perspective depth: what neighbour comparisons are made on
 float linz(float d) { return 1.0 / max(1.0 - d, 1e-6); }
+// the distance a depth stands for: a W-buffer's (p[9].w 1, NightFire's) is the distance itself, scaled; linz would
+// make all of it nearly 1 and every comparison nothing
+float viewz(float d) { return p[9].w != 0 ? d * 4096 : linz(d); }
 float noise(float2 v) { return frac(sin(dot(v, float2(12.9898, 78.233))) * 43758.5453); }
 float3 aces(float3 a) { return saturate((a * (2.51 * a + 0.03)) / (a * (2.43 * a + 0.59) + 0.14)); }
 float3 grade(float3 c) {
@@ -603,13 +662,13 @@ float3 grade(float3 c) {
 }
 float ao(float2 uv, float2 px, float d) {
     if (p[7].x == 0 || p[3].x == 0 || d >= 0.99999) return 1;
-    float zc = linz(d), occ = 0;
+    float zc = viewz(d), occ = 0;
     float r = 6 * p[3].y * p[7].w;
     float a0 = noise(uv * 917.0) * 6.2832;
     [unroll] for (int i = 0; i < 8; i++) {
         float a = a0 + i * 2.3999;
         float rr = r * (0.35 + 0.65 * frac(i * 0.618 + a0));
-        float zn = linz(rawz(uv + float2(cos(a), sin(a)) * rr * px));
+        float zn = viewz(rawz(uv + float2(cos(a), sin(a)) * rr * px));
         float diff = (zc - zn) / zc;
         occ += saturate(diff * 12) * saturate(1.5 - diff * 3);
     }
@@ -632,9 +691,9 @@ float edge(float2 uv, float2 px, float d) {
     float2 o = px * t;
     float e = 0;
     if (p[7].x != 0 && d < 0.99999) {
-        float zc = linz(d);
-        float zl = linz(rawz(uv - float2(o.x, 0))), zr = linz(rawz(uv + float2(o.x, 0)));
-        float zu = linz(rawz(uv - float2(0, o.y))), zd = linz(rawz(uv + float2(0, o.y)));
+        float zc = viewz(d);
+        float zl = viewz(rawz(uv - float2(o.x, 0))), zr = viewz(rawz(uv + float2(o.x, 0)));
+        float zu = viewz(rawz(uv - float2(0, o.y))), zd = viewz(rawz(uv + float2(0, o.y)));
         float dz = max(max(abs(zl - zc), abs(zr - zc)), max(abs(zu - zc), abs(zd - zc))) / zc;
         e = saturate((dz - 0.06) * 20);
     } else if (p[7].x != 0) {
@@ -648,6 +707,63 @@ float edge(float2 uv, float2 px, float d) {
         e = max(e, saturate((sqrt(gx * gx + gy * gy) - p[4].w) * 8));
     }
     return e;
+}
+// screen-space reflections: from each pixel of a reflective surface (the mask, its own depth: glass need not write
+// the scene's), a ray mirrored about the surface's slope is marched through the scene's depth; what it meets on screen
+// is mixed in, more at a grazing view, fading where the ray nears the picture's edge or its reach. The view is taken
+// as p[8].z wide (the game's projection is in its own matrices): positions are then off by a scale, not in direction
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[8].w, -1) * p[8].z * z, z); }
+float2 screenuv(float3 v) { return v.xy / (v.z * p[8].z * float2(p[8].w, -1)) * 0.5 + 0.5; }
+
+float3 ssr(float2 uv, float2 px, float3 c) {
+    if (p[8].x == 0) return c;
+    float4 mk = maskc.SampleLevel(pt, uv, 0);
+    float m = mk.r;
+    if (m < 0.01) return c;
+    if (p[9].z == 1) return lerp(c, float3(1, 0, 0), 0.5 * m);  // XBE_SSR_TEST=2: the mask shown
+    float gz = mk.a;
+    if (gz <= 0 || viewz(rawz(uv)) < gz * 0.995) return c;  // drawn over since by something nearer
+    float3 P = viewpos(uv, gz);
+    // the slope: the surface a pixel across and a pixel down, its distance as the mask gives its change
+    float3 dx = viewpos(uv + float2(px.x, 0), gz * (1 + mk.g)) - P;
+    float3 dy = viewpos(uv + float2(0, px.y), gz * (1 + mk.b)) - P;
+    float3 N = normalize(cross(dx, dy));
+    if (dot(N, P) > 0) N = -N;
+    float3 V = normalize(P);
+    float3 R = reflect(V, N);
+    if (p[9].z == 2) return N * 0.5 + 0.5;  // XBE_SSR_TEST=3: the slope
+    int steps = int(p[8].y);
+    float len = gz * p[9].y / steps;
+    float t = len * (0.5 + noise(uv * 731.0 + p[0].w));
+    float3 hit = 0;
+    float found = 0;
+    [loop] for (int i = 0; i < steps; i++) {
+        float3 Q = P + R * t;
+        if (Q.z < gz * 0.02) break;  // nearly at the camera
+        float2 q = screenuv(Q);
+        if (any(q < 0) || any(q > 1)) break;
+        float diff = Q.z - viewz(rawz(q));
+        if (diff > 0 && diff < Q.z * p[9].x + len) {
+            float a = t - len, b = t;
+            [unroll] for (int k = 0; k < 5; k++) {
+                float mid = (a + b) * 0.5;
+                float3 M = P + R * mid;
+                if (M.z - viewz(rawz(screenuv(M))) > 0) b = mid;
+                else a = mid;
+            }
+            q = screenuv(P + R * b);
+            float2 e = min(q, 1 - q);
+            found = saturate(min(e.x, e.y) * 12) * (1 - float(i) / steps);
+            hit = texl(q);
+            break;
+        }
+        t += len;
+        len *= 1.06;
+    }
+    if (p[9].z == 3) return float3(found <= 0, found, 0);  // XBE_SSR_TEST=4: red missed, green met
+    if (found <= 0) return c;
+    float fres = 0.3 + 0.7 * pow(1 - saturate(dot(-V, N)), 4);
+    return lerp(c, hit, saturate(m * p[8].x * fres * found));
 }
 float4 ps(O i) : SV_Target {
     float2 px = p[0].yz;
@@ -666,7 +782,7 @@ float4 ps(O i) : SV_Target {
         return float4(c, 1);
     }
     float d = p[7].x != 0 ? rawz(uv) : 1;
-    float3 c = tex(uv);
+    float3 c = ssr(uv, px, tex(uv));
     if (mode == 2) {
         // toon: flat lighting bands, outlines, halftone in the shadows
         float L = luma(c), bands = p[4].x;
@@ -701,6 +817,32 @@ float4 ps(O i) : SV_Target {
     return float4(saturate(c), 1);
 }
 )";
+
+// the reflection mask (VulkanBackend::DrawMask, RGBA16F): the draw's own pixel shader (renamed game_main) for its
+// coverage, out r its strength (DrawConstants::style z; w 1 for a surface drawn opaque, all of it covered) by that,
+// g b how its distance changes a pixel across and down (in parts of it: the surface's slope, exact where the depth
+// buffer's W is whole units), a its distance as the scene pass's viewz reads a depth
+const char* kMaskMain = R"(
+float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
+    float4 c = game_main(i, front);
+    float cover = style.w > 0 ? 1 : smoothstep(0.02, 0.12, c.a);
+    if (cover <= 0) discard;
+    float vz = 1 / max(1 - i.pos.z, 1e-6);
+    return float4(style.z * cover, ddx_fine(vz) / vz, ddy_fine(vz) / vz, vz);
+}
+)";
+const char* kMaskMainW = R"(
+float4 main(VOut i, bool front : SV_IsFrontFace, out float depth : SV_Depth) : SV_Target {
+    float4 c = game_main(i, front, depth);
+    float cover = style.w > 0 ? 1 : smoothstep(0.02, 0.12, c.a);
+    if (cover <= 0) discard;
+    float vz = i.wlin * wdepth.w * wdepth.z * 4096;
+    return float4(style.z * cover, ddx_fine(vz) / vz, ddy_fine(vz) / vz, vz);
+}
+)";
+constexpr uint64_t kMaskKeySalt = 0x6D61736B6D61736Cull;
+constexpr VkFormat kMaskFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+constexpr uint32_t kMaskRtFmt = 0x4D41534Bu;  // PsoKey::rtfmt of the mask's pipelines  // "maskmask": the mask's pixel shaders apart from the game's
 
 // ---- DXC, loaded from dxcompiler.dll beside the exe
 
@@ -995,6 +1137,26 @@ private:
     Target* scene_ds_ = nullptr;
     bool post_done_ = false;
     void ScenePass(Target& rt, Target* ds);
+    void StylePass(Target& rt, Target* ds);  // the style's own pass (StylePassWanted)
+    // SMAA over the scene: its shaders (vs, edges, weights, blend) and lookup textures, made at the first use
+    void SmaaPass(Target& rt);
+    bool EnsureSmaa();
+    uint64_t smaa_h_[4] = {};
+    bool smaa_tried_ = false, smaa_ok_ = false;
+    Image smaa_area_, smaa_search_;
+    // reflections: the draw's stage 0 texture as BindGuestTexture saw it (none for a target or a replacement)
+    uint64_t stage_key_ = 0;
+    float stage_glass_ = 0;
+    bool stage_solid_ = false, stage_seen_ = false;
+    bool draw_env_ = false;
+    bool scene_wbuf_ = false;  // the scene's last 3D draw wrote W (D3DZB_USEW), not Z, to its depth  // the draw samples a cube map: the game's own environment reflection (shiny metal)
+    float Reflectivity(const PsoKey& k);
+    bool EnsureMask(Target& t);
+    void DrawMask(const Assembled& a, PsoKey k, const DrawShaders& sh, const PixelKey& pk, const DrawTextures& stages,
+                  const VkSampler smp[4], const float bf[4], uint32_t sref, const VkViewport& vp, const VkRect2D& sc);
+    void DropScene(Target& t) {
+        DropImage(t.smaa_edges), DropImage(t.smaa_weights), DropImage(t.mask), DropImage(t.mask_ds);
+    }
     // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
     // mod, read again when it changes), else the built-in kScenePostHlsl
     const std::string& ScenePassSource();
@@ -1019,7 +1181,7 @@ private:
         ~PerfScope() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
     };
     uint64_t perf_frames_ = 0, perf_submits_ = 0, perf_draws_ = 0;
-    uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0;  // draws by kind
+    uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0, perf_reflect_ = 0;  // draws by kind
     std::chrono::steady_clock::time_point perf_t_ = std::chrono::steady_clock::now();
     void LogPerf();
     friend VkBool32 VKAPI_PTR DebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -1528,11 +1690,13 @@ VulkanBackend::~VulkanBackend() {
     WaitIdle();
     SavePipelineCache();
     if (ui_) ImGui_ImplVulkan_Shutdown();
-    for (auto& [k, t] : targets_) DropImage(t.res), DropImage(t.fb), DropImage(t.shrunk);
+    for (auto& [k, t] : targets_) DropImage(t.res), DropImage(t.fb), DropImage(t.shrunk), DropScene(t);
     targets_.clear();
     for (auto& [k, t] : textures_) DropImage(t.img);
     textures_.clear();
     DropImage(lut_);
+    DropImage(smaa_area_);
+    DropImage(smaa_search_);
     DropImage(dummy_);
     for (Chunk& c : chunks_) DropBuffer(c.b);
     DropBuffer(readback_);
@@ -1980,6 +2144,7 @@ void VulkanBackend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator
     if (scene_rt_ == &it->second || scene_ds_ == &it->second) scene_rt_ = scene_ds_ = nullptr;
     DropImage(it->second.res);
     DropImage(it->second.fb);
+    DropScene(it->second);
     DropImage(it->second.shrunk);
     targets_.erase(it);
 }
@@ -2693,6 +2858,7 @@ void VulkanBackend::UploadTexture(Tex& tx, const TextureDesc& d, const uint8_t* 
             uint32_t pitch = 0;
             DecodeLevel(d, l, f, p, colours, px, pitch);
             uint32_t lw = std::max(1u, w0 >> l), lh = std::max(1u, h0 >> l);
+            if (f == 0 && l == 0) tx.glass = GlassScore(tx.fmt, px, pitch, lw, lh, tx.solid);
             uint32_t slices = volume ? std::max(1u, d.depth >> l) : 1;
             uint32_t row_bytes = block ? std::max(1u, (lw + 3) / 4) * block : lw * 4;
             uint32_t n_rows = block ? std::max(1u, (lh + 3) / 4) : lh;
@@ -2736,6 +2902,7 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         if (sig != tx.sig || !same) {
             tx.sig = sig;
             UploadTexture(tx, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr);
+            tx.key = TextureKey(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.hash);
             TexturePackSeen(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr,
                             palette.hash);
         }
@@ -2743,6 +2910,7 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
     stages.levels[stage] = tx.levels;
     if (fi.depth) stages.info[stage].shadow = ShadowDepthKind(d.format);
+    if (stage == 0) stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_seen_ = true;
     return tx.img.view;
 }
 
@@ -2956,7 +3124,7 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k) {
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = uint32_t(std::size(dyn)) - (n_bind ? 0 : 1);  // the strides: only with vertex buffers
     dy.pDynamicStates = dyn;
-    VkFormat color = kBgra;
+    VkFormat color = k.rtfmt == kMaskRtFmt ? kMaskFormat : kBgra;
     VkPipelineRenderingCreateInfo rci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rci.colorAttachmentCount = k.has_rt ? 1 : 0;
     rci.pColorAttachmentFormats = &color;
@@ -3056,7 +3224,10 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     draw_rt_ = bound_rt_;
     draw_ds_ = bound_ds_;
     draw_2d_ = a.pretransformed || ScreenDraw(s);
+    stage_seen_ = false;
     for (int i = 0; i < 4; i++) stages.view[i] = BindTexture(s, i, stages);
+    draw_env_ = false;
+    for (int i = 0; i < 4; i++) draw_env_ |= stages.view[i] && stages.info[i].kind == kTexCube;
     if (!BindTargets(s)) return;
     // the pixel shader made for the textures
     PixelKey pk = MakePixelKey(s, stages.info);
@@ -3066,6 +3237,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         return !(e && *e == '0');
     }();
     pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
+    if (!draw_2d_ && bound_ds_) scene_wbuf_ = pk.wbuf;
     sh.pkey = Hash(&pk, sizeof(pk));
     EnsurePixelShader(pk, sh);
     if (!sh.vs_code || !sh.ps_code) return;
@@ -3131,6 +3303,10 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         c.style[0] = float(size.w) / (2.0f * float(st.pixel));
         c.style[1] = float(size.h) / (2.0f * float(st.pixel));
     }
+    // reflections: drawn into the mask after (DrawMask), which reads its strength from these constants
+    const float refl = Reflectivity(k);
+    c.style[2] = refl;
+    c.style[3] = Opaque(k) || stage_solid_ ? 1.0f : 0.0f;
     // samplers; a style's filtering for the 3D scene's textures
     VkSampler smp[4];
     bool clamp = UnitTexcoords(a);
@@ -3232,6 +3408,113 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         vkCmdEndQuery(cb, queries_, q);
         counted_.push_back({q, serial_ + 1, SamplesPerPixel()});
     }
+    if (refl > 0) DrawMask(a, k, sh, pk, stages, smp, bf, sref, vp, sc), perf_reflect_++;
+}
+
+// ---- reflections
+
+uint64_t g_ssr_diag[6];
+// how much the draw reflects: what mods/reflections.toml gives its texture, else, found by itself, window glass (alpha
+// blended over the 3D scene, depth tested, a texture whose alpha looks like glass); 0 none
+float VulkanBackend::Reflectivity(const PsoKey& k) {
+    const GraphicsStyle& st = Style();
+    if (st.reflections != kReflectOff && !draw_2d_)
+        g_ssr_diag[0]++, g_ssr_diag[1] += stage_seen_, g_ssr_diag[2] += bound_rt_ && bound_ds_,
+            g_ssr_diag[3] += bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_,
+            g_ssr_diag[4] += Opaque(k) || stage_solid_, g_ssr_diag[5] += scene_wbuf_;
+    if (st.reflections == kReflectOff || st.mode == kStyleRetro || draw_2d_ || !stage_seen_ || !bound_rt_ ||
+        !bound_ds_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_)
+        return 0;
+    float listed = ReflectionOf(stage_key_);
+    if (listed >= 0) return listed;
+    // XBE_SSR_TEST=1: every opaque 3D surface reflects (the reflection pass checked without a list)
+    static const bool test = [] {
+        const char* e = std::getenv("XBE_SSR_TEST");
+        return e && *e >= '1' && *e <= '4';
+    }();
+    const bool covers = Opaque(k) || stage_solid_;
+    if (test && covers && k.zen) return 0.6f;
+    if (!st.reflections_auto || !k.zen) return 0;
+    // metal: the game gives it an environment cube map of its own; ours shows the real surroundings over it
+    if (draw_env_ && covers) return 0.5f;
+    constexpr uint32_t kSrcAlpha = 0x302, kInvSrcAlpha = 0x303;  // GL values
+    if (!k.blend || k.src != kSrcAlpha || k.dst != kInvSrcAlpha) return 0;
+    return stage_glass_;
+}
+
+// the target's mask and its depth, cleared at its first use in a frame
+bool VulkanBackend::EnsureMask(Target& t) {
+    if (t.mask.img && (t.mask.w != t.w || t.mask.h != t.h)) DropImage(t.mask), DropImage(t.mask_ds);
+    if (!t.mask.img) {
+        const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!MakeImage(t.mask, VK_IMAGE_TYPE_2D, kMaskFormat, t.w, t.h, 1, 1, 1, u | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+            !MakeImage(t.mask_ds, VK_IMAGE_TYPE_2D, depth_fmt_, t.w, t.h, 1, 1, 1,
+                       u | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+            LOG_FIRST(1, "vulkan: no memory for the reflection mask, reflections are not drawn");
+            DropImage(t.mask), DropImage(t.mask_ds);
+            return false;
+        }
+        t.mask_frame = 0;
+    }
+    if (t.mask_frame != presents_ + 1) {
+        t.mask_frame = presents_ + 1;
+        Begin({t.mask.att, t.mask_ds.att, t.w, t.h});
+        VkClearAttachment ca[2]{};
+        ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ca[0].clearValue.color = {{0, 0, 0, 0}};
+        ca[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        ca[1].clearValue.depthStencil = {1.0f, 0};
+        VkClearRect cr{{{0, 0}, {t.w, t.h}}, 0, 1};
+        vkCmdClearAttachments(cmd_, 2, ca, 1, &cr);
+    }
+    return true;
+}
+
+// the draw again into the mask: its vertex shader, its pixel shader for the coverage, the nearest surface kept
+void VulkanBackend::DrawMask(const Assembled& a, PsoKey k, const DrawShaders& sh, const PixelKey& pk,
+                             const DrawTextures& stages, const VkSampler smp[4], const float bf[4], uint32_t sref,
+                             const VkViewport& vp, const VkRect2D& sc) {
+    if (!bound_rt_ || k.topo == uint32_t(Topology::Points)) return;
+    Target& t = *bound_rt_;
+    if (!EnsureMask(t)) return;
+    uint64_t mh = 0;
+    if (auto it = shader_src_.find(sh.pkey ^ kMaskKeySalt); it != shader_src_.end()) {
+        mh = it->second;
+    } else {
+        std::string src = PixelHlsl(pk);
+        size_t at = src.find("float4 main(");
+        if (at != std::string::npos) {
+            src.replace(at, 12, "float4 game_main(");
+            src += pk.wbuf ? kMaskMainW : kMaskMain;
+            if (!Compile(src, "main", "ps_5_0", mh)) mh = 0;
+        }
+        if (!mh) LOG_FIRST(4, "vulkan: a reflective draw's mask shader could not be made, it does not reflect");
+        shader_src_[sh.pkey ^ kMaskKeySalt] = mh;
+    }
+    if (!mh) return;
+    k.ps = mh;
+    k.blend = k.src = k.dst = k.op = 0;
+    k.wmask = 0xF;
+    k.zen = k.zwrite = 1;
+    k.zfunc = 0x203;  // GL_LEQUAL
+    k.sten = k.sfunc = k.smask = k.swmask = k.sfail = k.szfail = k.spass = 0;
+    k.has_rt = k.has_ds = 1;
+    k.rtfmt = kMaskRtFmt;
+    VkPipeline p = EnsurePipeline(k);
+    if (!p) return;
+    Begin({t.mask.att, t.mask_ds.att, t.w, t.h});
+    VkCommandBuffer cb = cmd_;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ds_.pipeline = p);
+    PushDescriptors(last_vsc_, last_dc_, stages, smp);
+    vkCmdSetBlendConstants(cb, bf);
+    std::memcpy(ds_.bf, bf, sizeof(ds_.bf));
+    vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, ds_.sref = sref);
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    ds_.vp = vp;
+    ds_.sc = sc;
+    ds_.vp_ok = true;
+    DrawGeometry(a);
 }
 
 // ---- visibility tests
@@ -3576,6 +3859,16 @@ const std::string& VulkanBackend::ScenePassSource() {
 // the scene, copied, drawn back over itself through the style's pass
 void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     post_done_ = true;
+    End();
+    Stamp(2);
+    if (StylePassWanted()) StylePass(rt, ds);
+    if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt);
+    End();
+    Stamp(3);
+    ForgetDrawState();  // the draw that asked for it goes on with its targets
+}
+
+void VulkanBackend::StylePass(Target& rt, Target* ds) {
     const GraphicsStyle& st = Style();
     uint64_t vh, ph;
     const std::string& src = ScenePassSource();
@@ -3598,7 +3891,6 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
         return;
     bool depth = ds && ds->w == rt.w && ds->h == rt.h;
     End();
-    Stamp(2);
     if (dirty_) Barrier();
     VkImageCopy cp{};
     cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -3617,7 +3909,7 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     }
     float ao = QualityAo(st), bloom = st.mode == kStyleOriginal || st.mode == kStyleEnhanced ? QualityBloom(st) : 0.0f;
     if (st.mode == kStyleOriginal && st.quality_bloom) g.bloom_threshold = 0.85f;
-    float c[32] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
+    float c[40] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
                    g.exposure, float(g.tonemap), g.contrast, g.saturation,
                    g.temperature, g.sharpen, bloom, g.bloom_threshold,
                    ao, g.ao_radius, g.vignette, g.grain,
@@ -3625,14 +3917,96 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
                    st.outline_color[0], st.outline_color[1], st.outline_color[2], st.halftone,
                    float(st.pixel) * k, levels, st.dither ? 1.0f : 0.0f, st.retro_tint,
                    depth ? 1.0f : 0.0f, float(rt.w), float(rt.h), k};
+    // reflections, when a reflective draw made this frame's mask; an assumed 60 degree vertical view
+    bool mask = depth && rt.mask.img && rt.mask_frame == presents_ + 1 && st.reflections != kReflectOff &&
+                st.mode != kStyleRetro;
+    c[32] = mask ? st.reflection_strength : 0.0f;
+    c[33] = st.reflections == kReflectHigh ? 48.0f : 20.0f;
+    c[34] = 0.5774f;
+    c[35] = float(rt.w) / float(rt.h);
+    c[36] = 0.04f;
+    c[37] = 3.0f;
+    static const int show_mask = [] {
+        const char* e = std::getenv("XBE_SSR_TEST");
+        return e && *e >= '2' && *e <= '4' ? *e - '1' : 0;
+    }();
+    c[38] = float(show_mask);
+    c[39] = scene_wbuf_ ? 1.0f : 0.0f;
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
-    VkImageView views[2] = {rt.fb.view, depth ? ds->res.view : VK_NULL_HANDLE};
-    if (!views[1] && !null_descriptor_) views[1] = dummy_.view;
-    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 32, views, 2);
+    VkImageView views[4] = {rt.fb.view, depth ? ds->res.view : VK_NULL_HANDLE, mask ? rt.mask.view : VK_NULL_HANDLE,
+                            mask ? rt.mask_ds.view : VK_NULL_HANDLE};
+    for (VkImageView& v : views)
+        if (!v && !null_descriptor_) v = dummy_.view;
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 40, views, 4);
     End();
-    Stamp(3);
-    ForgetDrawState();  // the draw that asked for it goes on with its targets
+}
+
+// SMAA's shaders and lookup textures, once
+bool VulkanBackend::EnsureSmaa() {
+    if (smaa_tried_) return smaa_ok_;
+    smaa_tried_ = true;
+    const std::string& src = SmaaHlsl();
+    smaa_ok_ = Compile(src, "vs", "vs_5_0", smaa_h_[0]) && Compile(src, "edges", "ps_5_0", smaa_h_[1]) &&
+               Compile(src, "weights", "ps_5_0", smaa_h_[2]) && Compile(src, "blend", "ps_5_0", smaa_h_[3]);
+    uint32_t aw, ah, ap, sw, sh, sp;
+    const uint8_t* area = SmaaAreaTex(aw, ah, ap);
+    const uint8_t* search = SmaaSearchTex(sw, sh, sp);
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (smaa_ok_) {
+        smaa_ok_ = MakeImage(smaa_area_, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8_UNORM, aw, ah, 1, 1, 1, u) &&
+                   MakeImage(smaa_search_, VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM, sw, sh, 1, 1, 1, u);
+    }
+    if (smaa_ok_) {
+        UploadLevel(smaa_area_, 0, 0, aw, ah, 1, area, size_t(ap) * ah);
+        UploadLevel(smaa_search_, 0, 0, sw, sh, 1, search, size_t(sp) * sh);
+    }
+    LOGR("vulkan: SMAA %s", smaa_ok_ ? "ready" : "could not be made (the log above says why); the scene is drawn without it");
+    return smaa_ok_;
+}
+
+// SMAA 1x over the scene target: its edges by luma, the blending weights along them, the scene blended by them
+void VulkanBackend::SmaaPass(Target& rt) {
+    if (!EnsureSmaa()) return;
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    for (Image* im : {&rt.smaa_edges, &rt.smaa_weights})
+        if (im->img && (im->w != rt.w || im->h != rt.h)) DropImage(*im);
+    if ((!rt.smaa_edges.img && !MakeImage(rt.smaa_edges, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1, u)) ||
+        (!rt.smaa_weights.img && !MakeImage(rt.smaa_weights, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1, u)) ||
+        (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))) {
+        LOG_FIRST(1, "vulkan: no memory for SMAA's images, the scene is drawn without it");
+        return;
+    }
+    VkPipeline edges = PassPipeline({smaa_h_[0], smaa_h_[1], kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline weights = PassPipeline({smaa_h_[0], smaa_h_[2], kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline blend = PassPipeline({smaa_h_[0], smaa_h_[3], kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!edges || !weights || !blend) return;
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    float m[4] = {1.0f / rt.w, 1.0f / rt.h, float(rt.w), float(rt.h)};
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    Attachments ea{rt.smaa_edges.att, VK_NULL_HANDLE, rt.w, rt.h};
+    Begin(ea);
+    VkClearAttachment ca{};
+    ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkClearRect cr{{{0, 0}, {rt.w, rt.h}}, 0, 1};
+    vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
+    FullScreen(edges, ea, vp, sc, m, 4, &rt.fb.view, 1);
+    End();
+    VkImageView wv[3] = {rt.smaa_edges.view, smaa_area_.view, smaa_search_.view};
+    FullScreen(weights, {rt.smaa_weights.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, m, 4, wv, 3);
+    End();
+    VkImageView bv[2] = {rt.fb.view, rt.smaa_weights.view};
+    FullScreen(blend, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, m, 4, bv, 2);
+    End();
 }
 
 // a timestamp of the frame slot being recorded: 0 frame start, 1 frame end, 2 scene pass start, 3 its end
@@ -3674,7 +4048,11 @@ void VulkanBackend::LogPerf() {
                       : Style().mode == kStyleToon ? "toon" : "retro");
     LOGR("perf: vulkan draws a frame: %.0f 2D, %.0f vertex programs, %.0f fixed function (%.0f lit)",
          perf_2d_ / n, perf_prog_ / n, perf_fixed_ / n, perf_lit_ / n);
-    perf_prog_ = perf_fixed_ = perf_lit_ = perf_2d_ = 0;
+    LOGR("perf: vulkan reflective draws a frame: %.1f (3D %.0f, stage 0 seen %.0f, rt+ds %.0f, scene size %.0f, opaque %.0f, W-buffer %.0f)",
+         perf_reflect_ / n, g_ssr_diag[0] / n, g_ssr_diag[1] / n, g_ssr_diag[2] / n, g_ssr_diag[3] / n, g_ssr_diag[4] / n,
+         g_ssr_diag[5] / n);
+    for (uint64_t& v : g_ssr_diag) v = 0;
+    perf_prog_ = perf_fixed_ = perf_lit_ = perf_2d_ = perf_reflect_ = 0;
     gpu_frame_ms_ = gpu_post_ms_ = 0;
     gpu_frames_ = gpu_posts_ = 0;
     perf_draw_ = perf_present_ = perf_acquire_ = perf_sync_ = perf_submit_ = 0;
@@ -3720,7 +4098,7 @@ void VulkanBackend::RescaleTargets() {
         Target& old = it->second;
         if (old.depth) {
             DropImage(old.res);
-            DropImage(old.fb);
+            DropImage(old.fb), DropScene(old);
             DropImage(old.shrunk);
             it = targets_.erase(it);
             continue;
@@ -3730,14 +4108,14 @@ void VulkanBackend::RescaleTargets() {
         t.gh = old.gh;
         if (!CreateTarget(t)) {
             DropImage(old.res);
-            DropImage(old.fb);
+            DropImage(old.fb), DropScene(old);
             DropImage(old.shrunk);
             it = targets_.erase(it);
             continue;
         }
         BlitWhole(old.res.view, t.res, {.alpha = true});
         DropImage(old.res);
-        DropImage(old.fb);
+        DropImage(old.fb), DropScene(old);
         DropImage(old.shrunk);
         t.data = old.data;
         t.bytes = old.bytes;

@@ -15,6 +15,8 @@ enum Tonemap : int { kToneOff, kToneFilmic, kToneReinhard };
 // graphics quality, apart from the style: Low, Medium, High, Ultra set the values below and the settings' anisotropic
 // filtering and FXAA together; Custom is any other mix (a value changed by itself)
 enum Quality : int { kQualityLow, kQualityMedium, kQualityHigh, kQualityUltra, kQualityCustom, kQualities };
+// screen-space reflections on glass and the surfaces mods/reflections.toml lists: off, low (fewer ray steps), high
+enum Reflections : int { kReflectOff, kReflectLow, kReflectHigh, kReflectLevels };
 
 struct GraphicsStyle {
     std::string preset = "original";  // the preset the values came from ("" once edited)
@@ -50,6 +52,10 @@ struct GraphicsStyle {
     int quality = kQualityCustom;
     int quality_ao = 0;
     bool quality_bloom = false;
+    // reflections (Vulkan; every style but Retro): the quality, how strong, glass found by itself (see ReflectionOf)
+    int reflections = kReflectOff;
+    float reflection_strength = 0.5f;
+    bool reflections_auto = true;
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;
@@ -74,15 +80,22 @@ void SaveStyleIfDue();  // a changed style written once it has held for a second
 // values make, or Custom
 void ApplyQuality(int q);
 int MatchQuality();
-int MatchQuality(const GraphicsStyle& s, uint32_t aniso, bool fxaa);
-void QualityValues(int q, uint32_t& aniso, bool& fxaa, int& ao, bool& bloom);  // Low to Ultra's
+int MatchQuality(const GraphicsStyle& s, uint32_t aniso, bool fxaa, bool smaa);
+// Low to Ultra's; High and Ultra take SMAA under the Vulkan renderer, FXAA under the others (which have no SMAA)
+void QualityValues(int q, uint32_t& aniso, bool& fxaa, bool& smaa, int& ao, bool& bloom);
 
 // from another thread (the game's own menus): the style as of the last frame, and one to take at the next frame
 GraphicsStyle StyleSnapshot();
 void RequestStyle(const GraphicsStyle& s);
 void TakeRequestedStyle();  // the render thread, once a frame (SaveStyleIfDue does it)
-// the scene pass is drawn: a style other than Original, or quality's AO or bloom
+// the scene pass is drawn: a style other than Original, quality's AO or bloom, reflections or SMAA
 bool ScenePassWanted();
+// the style's own full screen pass is drawn (all of the above but SMAA alone)
+bool StylePassWanted();
+// mods/reflections.toml (read again when it changes): a texture's strength by its pack key (as mods/textures names
+// it), 0 never; -1 when it is not listed
+float ReflectionOf(uint64_t texture_key);
+void CheckReflectionList();  // the render thread, once a frame (SaveStyleIfDue does it)
 // what the scene pass draws for each style's values with quality's AO and bloom over them
 float QualityAo(const GraphicsStyle& s);
 float QualityBloom(const GraphicsStyle& s);

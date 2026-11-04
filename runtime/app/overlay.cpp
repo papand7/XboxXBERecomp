@@ -141,6 +141,7 @@ void Graphics(Settings& s) {
         Save();
     }
     if (ImGui::Checkbox("FXAA (smooths the finished frame, HUD included; a little softer)", &s.fxaa)) Save();
+    if (ImGui::Checkbox("SMAA (smooths the 3D scene's edges, the HUD stays sharp; Vulkan)", &s.smaa)) Save();
     int sharp = int(s.sharpen);
     if (ImGui::SliderInt("Sharpening (%)", &sharp, 0, 100)) {
         s.sharpen = uint32_t(sharp);
