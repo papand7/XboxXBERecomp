@@ -439,6 +439,11 @@ struct Target {
     // frame's first soft particle
     Image soft_depth;
     uint64_t soft_frame = 0;
+    // effect lights: what added (glowing) draws give off this frame (RGBA16F: their colour, a their brightness by
+    // distance), cleared at the frame's first; the lights it makes, a tile each (RGBA32F: colour and brightness;
+    // where, as the screen's fractions and the distance)
+    Image glow, light_a, light_b, light_list;
+    uint64_t glow_frame = 0;
 };
 
 // a texture from guest memory
@@ -844,6 +849,120 @@ float4 main(VOut i, bool front : SV_IsFrontFace, out float depth : SV_Depth) : S
     return float4(style.z * cover, ddx_fine(vz) / vz, ddy_fine(vz) / vz, vz);
 }
 )";
+// effect lights (VulkanBackend::DrawGlow, RGBA16F, added): the draw's own pixel shader (renamed game_main), what it
+// gives off (its colour, by its alpha when the game adds it so), a its brightness times its distance (as the scene
+// pass's viewz reads a depth); depth tested against the scene, not written
+const char* kGlowMain = R"(
+float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
+    float4 c = game_main(i, front%s);
+    float3 e = %s;
+    float l = dot(e, float3(0.3, 0.59, 0.11));
+    if (l < 0.01) discard;
+    return float4(e, l * %s);
+}
+)";
+// effect lights' passes (VulkanBackend::LightPass). tilea / tileb: a tile of the glow image each (every second pixel
+// each way): a its mean colour and brightness; b where its light is, the brightness' centre (the screen's fractions)
+// and its mean distance. light: each lit tile a point light at that place, a little nearer than what glows; a
+// pixel's position and slope from the scene's depth (an assumed view of p[1].y, as the reflections take it). A tile's
+// light grows with its distance squared (what covers a tile far away is larger), falls off with the square of the
+// distance to the surface; the scene's own colour is what it lights. p[0] the glow's size, the lights listed (w); p[1] strength,
+// tan of half the vertical view, width / height, W-buffer; p[2] the tiles across and down, the least brightness, the
+// test view; p[3] 1 / width, 1 / height, the lights' power. t0 the scene (or the glow), t1 its depth, t2 t3 the tiles.
+const char* kLightsHlsl = R"(
+cbuffer P : register(b1) { float4 p[4]; };
+Texture2D t0 : register(t0);
+Texture2D<float> t1 : register(t1);
+Texture2D t2 : register(t2);
+Texture2D t3 : register(t3);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+void sums(float2 tpos, out float4 a, out float4 b) {
+    int2 t = int2(tpos);
+    float2 tile = p[0].xy / p[2].xy;
+    int2 o = int2(t * tile), e = int2(min((t + 1) * tile, p[0].xy));
+    float3 rgb = 0;
+    float l = 0, lu = 0, lv = 0, lz = 0, n = 0;
+    [loop] for (int y = o.y; y < e.y; y += 2)
+        [loop] for (int x = o.x; x < e.x; x += 2) {
+            float4 g = t0.Load(int3(x, y, 0));
+            float w = dot(g.rgb, float3(0.3, 0.59, 0.11));
+            rgb += g.rgb;
+            l += w;
+            lu += w * (x + 0.5);
+            lv += w * (y + 0.5);
+            lz += g.a;
+            n += 1;
+        }
+    a = float4(rgb, l) / max(n, 1);
+    b = l > 1e-5 ? float4(lu / l / p[0].x, lv / l / p[0].y, lz / l, 0) : 0;
+}
+float4 tilea(O i) : SV_Target { float4 a, b; sums(i.pos.xy, a, b); return a; }
+float4 tileb(O i) : SV_Target { float4 a, b; sums(i.pos.xy, a, b); return b; }
+// pick: the brightest tiles listed, brightest first: pixel 2n the n-th's a, 2n + 1 its b (t2 t3 the tiles); the light
+// pass reads the list from t2 and goes through p[0].w of them
+float4 pick(O i) : SV_Target {
+    int px = int(i.pos.x), want = px >> 1, tx = int(p[2].x), n = tx * int(p[2].y);
+    [loop] for (int j = 0; j < n; j++) {
+        float lj = t2.Load(int3(j % tx, j / tx, 0)).w;
+        int rank = 0;
+        [loop] for (int k = 0; k < n; k++) {
+            float lk = t2.Load(int3(k % tx, k / tx, 0)).w;
+            rank += lk > lj || (lk == lj && k < j) ? 1 : 0;
+        }
+        if (rank == want) return (px & 1) ? t3.Load(int3(j % tx, j / tx, 0)) : t2.Load(int3(j % tx, j / tx, 0));
+    }
+    return 0;
+}
+float viewz(float d) { return p[1].w != 0 ? d * 4096 : 1.0 / max(1.0 - d, 1e-6); }
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[1].z, -1) * p[1].y * z, z); }
+float3 at(float2 uv) { return viewpos(uv, viewz(t1.SampleLevel(pt, uv, 0))); }
+float4 light(O i) : SV_Target {
+    float2 uv = i.uv, px = p[3].xy;
+    float3 c = t0.SampleLevel(pt, uv, 0).rgb;
+    float d = t1.SampleLevel(pt, uv, 0);
+    if (p[2].w == 2) {  // XBE_LIGHT_TEST=2: the listed lights as dots where they are
+        float3 m = 0;
+        [loop] for (int n = 0; n < int(p[0].w); n++) {
+            float4 a = t2.Load(int3(2 * n, 0, 0)), b = t2.Load(int3(2 * n + 1, 0, 0));
+            if (a.w < p[2].z) break;
+            if (length((uv - b.xy) * float2(p[1].z, 1)) < 0.012) m = saturate(a.rgb / a.w);
+        }
+        return float4(m + c * 0.25, 1);
+    }
+    if (d >= 0.99999) return float4(p[2].w == 1 ? 0 : c, 1);
+    float3 P = at(uv);
+    // the slope from the nearer neighbour each way (an edge's other side is not the surface)
+    float3 r = at(uv + float2(px.x, 0)) - P, l = P - at(uv - float2(px.x, 0));
+    float3 dn = at(uv + float2(0, px.y)) - P, up = P - at(uv - float2(0, px.y));
+    float3 dx = abs(r.z) < abs(l.z) ? r : l, dy = abs(dn.z) < abs(up.z) ? dn : up;
+    float3 N = normalize(cross(dx, dy));
+    if (any(isnan(N))) N = normalize(-P);
+    if (dot(N, P) > 0) N = -N;
+    float omega = 4 * p[1].y * p[1].y * p[1].z / (p[2].x * p[2].y);
+    float3 E = 0;
+    [loop] for (int n = 0; n < int(p[0].w); n++) {
+            float4 a = t2.Load(int3(2 * n, 0, 0));
+            if (a.w < p[2].z) break;  // brightest first
+            float4 b = t2.Load(int3(2 * n + 1, 0, 0));
+            float zl = b.z * 0.97;
+            float3 D = viewpos(b.xy, zl) - P;
+            float d2 = dot(D, D) + zl * zl * 0.004;
+            float ndl = saturate((dot(N, D * rsqrt(d2)) + 0.15) / 1.15);
+            E += a.rgb * (omega * zl * zl / d2 * ndl);
+        }
+    E = min(E * p[3].z * p[1].x, 1.5);
+    if (p[2].w == 1) return float4(E / (1 + E), 1);  // XBE_LIGHT_TEST=1: the light alone
+    return float4(c * (1 + E) + E * 0.03, 1);
+}
+)";
 // soft particles (VulkanBackend::SoftParticle): the draw's own pixel shader (renamed game_main), its output faded
 // where the scene behind is near: tex%d the scene depth's copy (a stage the draw does not use), style z 1 fades
 // alpha (alpha blended), 2 colour and alpha (added), style w the fade's depth in parts of the particle's distance
@@ -925,6 +1044,8 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
 constexpr uint64_t kMatKeySalt = 0x6D6174657269616Cull;  // "material"
 constexpr uint64_t kSoftKeySalt = 0x736F667470617274ull;  // "softpart"
 constexpr uint64_t kMaskKeySalt = 0x6D61736B6D61736Cull;
+constexpr uint64_t kGlowKeySalt = 0x676C6F776C696768ull;  // "glowligh"
+constexpr uint32_t kLightTilesX = 16, kLightTilesY = 9, kLights = 32;
 constexpr VkFormat kMaskFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr uint32_t kMaskRtFmt = 0x4D41534Bu;  // PsoKey::rtfmt of the mask's pipelines  // "maskmask": the mask's pixel shaders apart from the game's
 
@@ -1244,11 +1365,17 @@ private:
     VkImageView MaterialView(uint64_t key);
     uint64_t MaterialShader(const DrawShaders& sh, const PixelKey& pk, int slot);
     bool EnsureMask(Target& t);
+    int Emitter(const PsoKey& k);
+    void DrawGlow(const Assembled& a, PsoKey k, const DrawShaders& sh, const PixelKey& pk, const DrawTextures& stages,
+                  const VkSampler smp[4], const float bf[4], uint32_t sref, const VkViewport& vp, const VkRect2D& sc,
+                  int mode);
+    void LightPass(Target& rt, Target* ds);
     void DrawMask(const Assembled& a, PsoKey k, const DrawShaders& sh, const PixelKey& pk, const DrawTextures& stages,
                   const VkSampler smp[4], const float bf[4], uint32_t sref, const VkViewport& vp, const VkRect2D& sc);
     void DropScene(Target& t) {
         DropImage(t.smaa_edges), DropImage(t.smaa_weights), DropImage(t.mask), DropImage(t.mask_ds);
         DropImage(t.soft_depth);
+        DropImage(t.glow), DropImage(t.light_a), DropImage(t.light_b), DropImage(t.light_list);
     }
     // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
     // mod, read again when it changes), else the built-in kScenePostHlsl
@@ -1274,6 +1401,7 @@ private:
         ~PerfScope() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
     };
     uint64_t perf_frames_ = 0, perf_submits_ = 0, perf_draws_ = 0;
+    uint64_t perf_glow_ = 0;
     uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0, perf_reflect_ = 0, perf_soft_ = 0,
              perf_mat_ = 0;  // draws by kind
     std::chrono::steady_clock::time_point perf_t_ = std::chrono::steady_clock::now();
@@ -3552,6 +3680,147 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         counted_.push_back({q, serial_ + 1, SamplesPerPixel()});
     }
     if (refl > 0) DrawMask(a, k, sh, pk, stages, smp, bf, sref, vp, sc), perf_reflect_++;
+    if (int em = Emitter(k)) DrawGlow(a, k, sh, pk, stages, smp, bf, sref, vp, sc, em);
+}
+
+// a glowing effect, what lights its surroundings: added over the 3D scene (its colour, 2, or by its alpha, 1), depth
+// tested, not written; 0 not one
+int VulkanBackend::Emitter(const PsoKey& k) {
+    const GraphicsStyle& st = Style();
+    if (!st.effect_lights || st.mode == kStyleRetro || draw_2d_ || !bound_rt_ || !bound_ds_ ||
+        bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_ || bound_ds_->w != bound_rt_->w ||
+        bound_ds_->h != bound_rt_->h || !k.blend || !k.zen || k.zwrite || k.topo == uint32_t(Topology::Points))
+        return 0;
+    constexpr uint32_t kOne = 1, kSrcAlpha = 0x302;  // GL values
+    if (k.dst != kOne) return 0;
+    return k.src == kOne ? 2 : k.src == kSrcAlpha ? 1 : 0;
+}
+
+// the draw again into the glow image, over the scene's depth
+void VulkanBackend::DrawGlow(const Assembled& a, PsoKey k, const DrawShaders& sh, const PixelKey& pk,
+                             const DrawTextures& stages, const VkSampler smp[4], const float bf[4], uint32_t sref,
+                             const VkViewport& vp, const VkRect2D& sc, int mode) {
+    Target& t = *bound_rt_;
+    Target& d = *bound_ds_;
+    if (t.glow.img && (t.glow.w != t.w || t.glow.h != t.h)) DropImage(t.glow);
+    if (!t.glow.img && !MakeImage(t.glow, VK_IMAGE_TYPE_2D, kMaskFormat, t.w, t.h, 1, 1, 1,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+        LOG_FIRST(1, "vulkan: no memory for the effect lights' image, effects light nothing");
+        return;
+    }
+    uint64_t key = sh.pkey ^ kGlowKeySalt ^ uint64_t(mode) << 56;
+    uint64_t gh = 0;
+    if (auto it = shader_src_.find(key); it != shader_src_.end()) {
+        gh = it->second;
+    } else {
+        std::string src = PixelHlsl(pk);
+        size_t at = src.find("float4 main(");
+        if (at != std::string::npos) {
+            src.replace(at, 12, "float4 game_main(");
+            char tail[1024];
+            std::snprintf(tail, sizeof(tail), kGlowMain, pk.wbuf ? ", out float depth : SV_Depth" : "",
+                          pk.wbuf ? ", depth" : "", mode == 2 ? "c.rgb" : "c.rgb * c.a",
+                          pk.wbuf ? "(i.wlin * wdepth.w * wdepth.z * 4096)" : "(1 / max(1 - i.pos.z, 1e-6))");
+            src += tail;
+            if (!Compile(src, "main", "ps_5_0", gh)) gh = 0;
+        }
+        if (!gh) LOG_FIRST(4, "vulkan: an effect's light shader could not be made, it lights nothing");
+        shader_src_[key] = gh;
+    }
+    if (!gh) return;
+    k.ps = gh;
+    k.blend = 1;
+    k.src = k.dst = 1;  // GL ONE: summed
+    k.wmask = 0xF;
+    k.zen = 1, k.zwrite = 0;
+    k.zfunc = 0x203;  // GL_LEQUAL
+    k.sten = k.sfunc = k.smask = k.swmask = k.sfail = k.szfail = k.spass = 0;
+    k.has_rt = k.has_ds = 1;
+    k.rtfmt = kMaskRtFmt;
+    VkPipeline p = EnsurePipeline(k);
+    if (!p) return;
+    Begin({t.glow.att, d.res.att, t.w, t.h});
+    if (t.glow_frame != presents_ + 1) {
+        t.glow_frame = presents_ + 1;
+        VkClearAttachment ca{};
+        ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        VkClearRect cr{{{0, 0}, {t.w, t.h}}, 0, 1};
+        vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
+    }
+    VkCommandBuffer cb = cmd_;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ds_.pipeline = p);
+    PushDescriptors(last_vsc_, last_dc_, stages, smp);
+    vkCmdSetBlendConstants(cb, bf);
+    std::memcpy(ds_.bf, bf, sizeof(ds_.bf));
+    vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, ds_.sref = sref);
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    ds_.vp = vp;
+    ds_.sc = sc;
+    ds_.vp_ok = true;
+    DrawGeometry(a);
+    perf_glow_++;
+}
+
+// effect lights: the glow image made into a light a tile, the scene lit by them (before the style's pass grades it)
+void VulkanBackend::LightPass(Target& rt, Target* ds) {
+    const GraphicsStyle& st = Style();
+    if (!ds || ds->w != rt.w || ds->h != rt.h || !rt.glow.img || rt.glow_frame != presents_ + 1) return;
+    uint64_t vh, ah, bh, kh, lh;
+    if (!Compile(kLightsHlsl, "vs", "vs_5_0", vh) || !Compile(kLightsHlsl, "tilea", "ps_5_0", ah) ||
+        !Compile(kLightsHlsl, "pick", "ps_5_0", kh) ||
+        !Compile(kLightsHlsl, "tileb", "ps_5_0", bh) || !Compile(kLightsHlsl, "light", "ps_5_0", lh)) {
+        LOG_FIRST(1, "vulkan: the effect lights' passes did not compile; effects light nothing");
+        return;
+    }
+    constexpr VkFormat kTileFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkPipeline pa = PassPipeline({vh, ah, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pb = PassPipeline({vh, bh, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pk = PassPipeline({vh, kh, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pl = PassPipeline({vh, lh, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pa || !pb || !pk || !pl) return;
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if ((!rt.light_a.img && !MakeImage(rt.light_a, VK_IMAGE_TYPE_2D, kTileFormat, kLightTilesX, kLightTilesY, 1, 1, 1, u)) ||
+        (!rt.light_b.img && !MakeImage(rt.light_b, VK_IMAGE_TYPE_2D, kTileFormat, kLightTilesX, kLightTilesY, 1, 1, 1, u)) ||
+        (!rt.light_list.img && !MakeImage(rt.light_list, VK_IMAGE_TYPE_2D, kTileFormat, kLights * 2, 1, 1, 1, 1, u)) ||
+        (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
+        return;
+    static const int test = [] {
+        const char* e = std::getenv("XBE_LIGHT_TEST");
+        return e && *e >= '1' && *e <= '9' ? *e - '0' : 0;
+    }();
+    float c[16] = {float(rt.w), float(rt.h), 0, float(kLights),
+                   st.light_strength, 0.5774f, float(rt.w) / float(rt.h), scene_wbuf_ ? 1.0f : 0.0f,
+                   float(kLightTilesX), float(kLightTilesY), 0.002f, float(test),
+                   1.0f / rt.w, 1.0f / rt.h, 3000.0f, 0};
+    End();
+    if (dirty_) Barrier();
+    VkViewport tv{0, 0, float(kLightTilesX), float(kLightTilesY), 0, 1};
+    VkRect2D ts{{0, 0}, {kLightTilesX, kLightTilesY}};
+    FullScreen(pa, {rt.light_a.att, VK_NULL_HANDLE, kLightTilesX, kLightTilesY}, tv, ts, c, 16, &rt.glow.view, 1);
+    End();
+    FullScreen(pb, {rt.light_b.att, VK_NULL_HANDLE, kLightTilesX, kLightTilesY}, tv, ts, c, 16, &rt.glow.view, 1);
+    End();
+    Barrier();
+    VkViewport lv{0, 0, float(kLights * 2), 1, 0, 1};
+    VkRect2D ls{{0, 0}, {kLights * 2, 1}};
+    VkImageView tiles[4] = {rt.glow.view, VK_NULL_HANDLE, rt.light_a.view, rt.light_b.view};
+    FullScreen(pk, {rt.light_list.att, VK_NULL_HANDLE, kLights * 2, 1}, lv, ls, c, 16, tiles, 4);
+    End();
+    Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[4] = {rt.fb.view, ds->res.view, rt.light_list.view, VK_NULL_HANDLE};
+    FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4);
+    End();
 }
 
 // a particle: blended over the 3D scene (alpha blended, or added), depth tested but not written, no reflective
@@ -4105,6 +4374,7 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     post_done_ = true;
     End();
     Stamp(2);
+    if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds);
     if (StylePassWanted()) StylePass(rt, ds);
     if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt);
     End();
@@ -4292,8 +4562,9 @@ void VulkanBackend::LogPerf() {
                       : Style().mode == kStyleToon ? "toon" : "retro");
     LOGR("perf: vulkan draws a frame: %.0f 2D, %.0f vertex programs, %.0f fixed function (%.0f lit)",
          perf_2d_ / n, perf_prog_ / n, perf_fixed_ / n, perf_lit_ / n);
-    LOGR("perf: vulkan soft particles a frame: %.1f, material draws %.1f", perf_soft_ / n, perf_mat_ / n);
-    perf_soft_ = perf_mat_ = 0;
+    LOGR("perf: vulkan soft particles a frame: %.1f, material draws %.1f, glowing draws %.1f", perf_soft_ / n,
+         perf_mat_ / n, perf_glow_ / n);
+    perf_soft_ = perf_mat_ = perf_glow_ = 0;
     LOGR("perf: vulkan reflective draws a frame: %.1f (3D %.0f, stage 0 seen %.0f, rt+ds %.0f, scene size %.0f, opaque %.0f, W-buffer %.0f)",
          perf_reflect_ / n, g_ssr_diag[0] / n, g_ssr_diag[1] / n, g_ssr_diag[2] / n, g_ssr_diag[3] / n, g_ssr_diag[4] / n,
          g_ssr_diag[5] / n);

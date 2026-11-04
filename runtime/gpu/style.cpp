@@ -68,6 +68,7 @@ void Clamp(GraphicsStyle& s) {
     s.reflections = std::clamp(s.reflections, 0, int(kReflectLevels) - 1);
     s.reflection_strength = std::clamp(s.reflection_strength, 0.0f, 1.0f);
     s.particle_fade = std::clamp(s.particle_fade, 0.005f, 0.2f);
+    s.light_strength = std::clamp(s.light_strength, 0.0f, 3.0f);
     s.material_strength = std::clamp(s.material_strength, 0.0f, 1.5f);
     s.surface_depth = std::clamp(s.surface_depth, 0.0f, 2.0f);
 }
@@ -87,6 +88,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "retro_tint", "vertex_snap", "texture_pack", "dump_textures", "quality",
                                   "quality_ao", "quality_bloom", "reflections", "reflection_strength",
                                   "reflections_auto", "soft_particles", "particle_fade",
+                                  "effect_lights", "light_strength",
                                   "materials", "material_strength", "surface_depth"};
     for (auto&& [k, v] : t) {
         bool ok = false;
@@ -150,6 +152,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("reflections_auto", s.reflections_auto);
     flag("soft_particles", s.soft_particles);
     num("particle_fade", s.particle_fade);
+    flag("effect_lights", s.effect_lights);
+    num("light_strength", s.light_strength);
     flag("materials", s.materials);
     num("material_strength", s.material_strength);
     num("surface_depth", s.surface_depth);
@@ -194,6 +198,8 @@ toml::table Write(const GraphicsStyle& s) {
                        {"reflections_auto", s.reflections_auto},
                        {"soft_particles", s.soft_particles},
                        {"particle_fade", double(s.particle_fade)},
+                       {"effect_lights", s.effect_lights},
+                       {"light_strength", double(s.light_strength)},
                        {"materials", s.materials},
                        {"material_strength", double(s.material_strength)},
                        {"surface_depth", double(s.surface_depth)}};
@@ -392,6 +398,8 @@ void ApplyPreset(const StylePreset& p) {
     g_style.reflections_auto = keep.reflections_auto;
     g_style.soft_particles = keep.soft_particles;
     g_style.particle_fade = keep.particle_fade;
+    g_style.effect_lights = keep.effect_lights;
+    g_style.light_strength = keep.light_strength;
     g_style.materials = keep.materials;
     g_style.material_strength = keep.material_strength;
     g_style.surface_depth = keep.surface_depth;
@@ -460,7 +468,9 @@ bool StylePassWanted() {
     return g_style.mode != kStyleOriginal || g_style.quality_ao > 0 || g_style.quality_bloom ||
            (g_style.reflections != kReflectOff && g_style.mode != kStyleRetro);
 }
-bool ScenePassWanted() { return StylePassWanted() || (app::Get().smaa && g_style.mode != kStyleRetro); }
+bool ScenePassWanted() {
+    return StylePassWanted() || ((app::Get().smaa || g_style.effect_lights) && g_style.mode != kStyleRetro);
+}
 float QualityAo(const GraphicsStyle& s) {
     static const float levels[3] = {0.0f, 0.5f, 0.9f};
     return std::max(s.mode == kStyleEnhanced ? s.ao : 0.0f, levels[s.quality_ao]);
@@ -649,6 +659,9 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::Checkbox("Soft particles", &s.soft_particles);
         changed |= ImGui::SliderFloat("Fade depth", &s.particle_fade, 0.005f, 0.2f, "%.3f");
         ImGui::TextDisabled("Smoke, flashes and sparks fade where they meet walls and floors. Not drawn in Retro.");
+        changed |= ImGui::Checkbox("Effect lights", &s.effect_lights);
+        changed |= ImGui::SliderFloat("Light strength", &s.light_strength, 0.0f, 3.0f, "%.2f");
+        ImGui::TextDisabled("Flashes, fire and lamps' glows light walls and characters near them (Vulkan).");
     }
     if (ImGui::CollapsingHeader("Materials (PBR)", ImGuiTreeNodeFlags_DefaultOpen)) {
         changed |= ImGui::Checkbox("Normal and roughness maps", &s.materials);
