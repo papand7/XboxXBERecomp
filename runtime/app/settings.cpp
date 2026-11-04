@@ -27,6 +27,7 @@ namespace {
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
 
 std::filesystem::path File() { return ExeDir() / kGame.settings; }
+bool g_unread = false;  // the file is there but did not parse: kept as .bak before the first save
 
 const char* kAspects[] = {"auto", "4:3", "16:9", "screen"};
 constexpr uint32_t kAspectCount = 4;
@@ -187,9 +188,20 @@ Settings& Get() {
 void Load() {
     Settings& s = Get();
     toml::table t;
+    std::error_code ec;
+    if (!std::filesystem::exists(File(), ec)) return;  // the first run: the defaults
     try {
         t = toml::parse_file(File().string());
+    } catch (const toml::parse_error& e) {
+        // the defaults kept; the player's file is kept as .bak before the first save writes over it
+        const auto& at = e.source().begin;
+        LOGR("settings: %s not read (line %u, column %u: %.*s), the defaults used; it is kept as %s.bak at the first save",
+             File().string().c_str(), unsigned(at.line), unsigned(at.column), int(e.description().size()),
+             e.description().data(), kGame.settings);
+        g_unread = true;
+        return;
     } catch (...) {
+        LOGR("settings: %s not read, the defaults used", File().string().c_str());
         return;
     }
     std::string mode = t["display_mode"].value_or(std::string(kModes[uint32_t(s.display_mode)]));
@@ -197,7 +209,14 @@ void Load() {
         if (mode == kModes[i]) s.display_mode = DisplayMode(i);
     s.width = t["width"].value_or(s.width);
     s.height = t["height"].value_or(s.height);
-    s.render_percent = t["render_percent"].value_or(s.render_percent);
+    // a hand edited size kept sane: 0 is the desktop's, else 320 x 240 to 16384 x 16384 (both or neither)
+    if (s.width || s.height) {
+        if (s.width < 320 || s.height < 240 || s.width > 16384 || s.height > 16384) {
+            LOGR("settings: width %u, height %u out of range, the desktop's size used", s.width, s.height);
+            s.width = s.height = 0;
+        }
+    }
+    s.render_percent = std::clamp<uint32_t>(t["render_percent"].value_or(s.render_percent), 25, 200);
     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
@@ -213,7 +232,12 @@ void Load() {
     s.pause_unfocused = t["pause_unfocused"].value_or(s.pause_unfocused);
     s.show_fps = t["show_fps"].value_or(s.show_fps);
     s.sharp_2d = t["sharp_2d"].value_or(s.sharp_2d);
-    s.language = t["language"].value_or(s.language);
+    // only a language the title has (GameInfo::languages): the console's setting goes to the guest as it is
+    if (uint32_t l = t["language"].value_or(s.language); !kGame.languages.empty()) {
+        const auto& ls = kGame.languages;
+        if (std::find(ls.begin(), ls.end(), l) != ls.end()) s.language = l;
+        else if (std::find(ls.begin(), ls.end(), s.language) == ls.end()) s.language = ls.front();
+    }
     // a settings file from when these were one choice: "antialiasing" off, fxaa, msaa2, msaa4 or msaa8
     std::string aa = t["antialiasing"].value_or(std::string());
     if (aa == "fxaa") s.fxaa = true;
@@ -353,8 +377,32 @@ toml::table Table() {
 }  // namespace
 
 void Save() {
-    std::ofstream f(File());
-    f << Table() << "\n";
+    const std::filesystem::path file = File();
+    // a file that did not parse is the player's: kept once beside it before it is written over
+    if (g_unread) {
+        g_unread = false;
+        std::filesystem::path bak = file;
+        bak += ".bak";
+        if (!CopyFileW(file.c_str(), bak.c_str(), FALSE))
+            LOGR("settings: %s not kept as .bak (%lu)", file.string().c_str(), GetLastError());
+    }
+    // written beside it and moved over it: a failed write leaves the old file
+    std::filesystem::path tmp = file;
+    tmp += ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        f << Table() << "\n";
+        f.close();
+        if (!f) {
+            LOGR("settings: %s could not be written", tmp.string().c_str());
+            DeleteFileW(tmp.c_str());
+            return;
+        }
+    }
+    if (!MoveFileExW(tmp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        LOGR("settings: %s could not be replaced (%lu)", file.string().c_str(), GetLastError());
+        DeleteFileW(tmp.c_str());
+    }
 }
 
 void LogSettings() {
@@ -432,7 +480,7 @@ float FrameAspect() {
 }
 
 float RenderScale(uint32_t guest_height) {
-    float h = Output().height * (Get().render_percent / 100.0f);
+    float h = Output().height * (std::clamp<uint32_t>(Get().render_percent, 25, 200) / 100.0f);
     return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
 }
 

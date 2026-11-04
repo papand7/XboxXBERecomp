@@ -42,6 +42,7 @@ namespace {
 HWND g_hwnd = nullptr;
 constexpr UINT kApplyDisplay = WM_APP + 1, kOpenWindow = WM_APP + 2;
 bool g_mode_changed = false;
+wchar_t g_mode_device[32] = {};  // the display whose mode was changed (MONITORINFOEXW::szDevice), restored by name
 bool g_apply_posted = false;  // a display apply is waiting in the queue or running
 std::atomic<bool> g_active{true};  // the game window is in front (WM_ACTIVATE)
 
@@ -125,8 +126,9 @@ void ApplyNow() {
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
+    // the display the mode was changed on, which need not be the monitor setting's now
     if (g_mode_changed) {
-        ChangeDisplaySettingsExW(mi.szDevice, nullptr, nullptr, 0, nullptr);
+        ChangeDisplaySettingsExW(g_mode_device, nullptr, nullptr, 0, nullptr);
         g_mode_changed = false;
     }
     Mode out = Output();
@@ -142,7 +144,10 @@ void ApplyNow() {
         dm.dmPelsWidth = s.width;
         dm.dmPelsHeight = s.height;
         dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
-        g_mode_changed = ChangeDisplaySettingsExW(mi.szDevice, &dm, nullptr, CDS_FULLSCREEN, nullptr) == DISP_CHANGE_SUCCESSFUL;
+        LONG r = ChangeDisplaySettingsExW(mi.szDevice, &dm, nullptr, CDS_FULLSCREEN, nullptr);
+        g_mode_changed = r == DISP_CHANGE_SUCCESSFUL;
+        if (g_mode_changed) wcsncpy_s(g_mode_device, mi.szDevice, _TRUNCATE);
+        else LOGR("display: %ux%u on %ls not set (%ld), the desktop's mode kept", s.width, s.height, mi.szDevice, r);
         GetMonitorInfoW(mon, &mi);
     }
     if (s.display_mode == DisplayMode::Windowed) {
@@ -190,7 +195,9 @@ HCURSOR MenuCursor(HWND hwnd) {
     ReleaseDC(nullptr, dc);
     if (!color) return made;
     std::memcpy(bits, px.data(), px.size() * 4);
-    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
+    // the alpha does the masking, the mask all zero (a monochrome bitmap's rows are WORD aligned)
+    std::vector<uint8_t> zeros(size_t((size + 15) / 16 * 2) * size);
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, zeros.data());
     ICONINFO ii{FALSE, DWORD(hx), DWORD(hy), mask, color};
     HCURSOR c = CreateIconIndirect(&ii);
     DeleteObject(color);
@@ -280,10 +287,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // a changed display mode steps aside for the desktop, minimized, and comes back on return; not while
                 // handing over to the next instance, which runs in the same mode
                 if (g_mode_changed && !kernel::g_relaunching) {
-                    MONITORINFOEXW mi{};
-                    mi.cbSize = sizeof(mi);
-                    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
-                    ChangeDisplaySettingsExW(mi.szDevice, nullptr, nullptr, 0, nullptr);
+                    ChangeDisplaySettingsExW(g_mode_device, nullptr, nullptr, 0, nullptr);
                     g_mode_changed = false;
                     ShowWindow(hwnd, SW_MINIMIZE);
                 }

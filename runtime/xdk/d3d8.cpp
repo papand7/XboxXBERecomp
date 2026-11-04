@@ -22,6 +22,11 @@
 #include "xdk/layout.h"
 #include "xdk/state_numbering.h"
 
+#ifdef _WIN32
+// user32's, as windows.h declares it (not included here: its macros meet this file's names)
+extern "C" __declspec(dllimport) int __stdcall MessageBoxW(struct HWND__*, const wchar_t*, const wchar_t*, unsigned int);
+#endif
+
 using namespace kernel;
 
 // configs written before the SDK knew the name
@@ -565,16 +570,34 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
 
     if (!g_backend) {
         g_backend = gpu::CreateBackend();
-        if (!g_backend->Init(w, h)) {
-            // the failed one goes first: it may hold the window's swap chain
+        if (!g_backend || !g_backend->Init(w, h)) {
+            // the others in turn (Direct3D 12, Vulkan, Direct3D 11), each made by CreateBackend under its setting, which
+            // is put back after: the chosen one stays the player's for the next start. The failed one goes first: it
+            // may hold the window's swap chain
+            static const char* kNames[] = {"Direct3D 12", "Direct3D 11", "Vulkan"};
+            app::Settings& s = app::Get();
+            const uint32_t chosen = s.renderer;
             g_backend.reset();
-            g_backend = gpu::CreateFallbackBackend();
-            if (g_backend && g_backend->Init(w, h)) {
-                LOGR("d3d: the chosen renderer could not start, running on the fallback (%s)",
-                     app::Get().renderer == 2 ? "Direct3D 12" : "Direct3D 11");
-            } else {
-                LOGE("d3d: renderer init failed");
-                if (!g_backend) g_backend = gpu::CreateBackend();
+            for (uint32_t r : {0u, 2u, 1u}) {
+                if (r == chosen % 3) continue;
+                s.renderer = r;
+                g_backend = gpu::CreateBackend();
+                if (g_backend && g_backend->Init(w, h)) {
+                    LOGR("d3d: the chosen renderer (%s) could not start, running on %s", kNames[chosen % 3], kNames[r]);
+                    break;
+                }
+                g_backend.reset();
+            }
+            s.renderer = chosen;
+            if (!g_backend) {
+                // nothing to draw with: say so and leave, rather than run on a renderer that never started
+                LOGE("d3d: no renderer could start (Direct3D 12, Direct3D 11 and Vulkan all failed)");
+#ifdef _WIN32
+                MessageBoxW(nullptr, L"No renderer could start (Direct3D 12, Direct3D 11 and Vulkan all failed). "
+                            L"Update the graphics driver, see the log in the logs folder.", app::kGame.short_title,
+                            0x10 /*MB_ICONERROR*/);
+#endif
+                kernel::Shutdown(1);
             }
         }
         if (RenderThread()) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));

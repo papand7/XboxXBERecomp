@@ -144,7 +144,12 @@ void TexturePackSeen(const TextureDesc& d, const uint8_t* guest, const uint32_t*
         std::vector<uint32_t> px;
         if (!std::filesystem::exists(dir / name, ec) && DecodeBgra(d, 0, guest, px) &&
             px.size() >= size_t(d.width) * d.height) {
-            if (WritePng(dir / name, px, d.width, d.height)) PACK_LOG(4, "texture pack: dumping to %s", dir.string().c_str());
+            // through a temporary file: a half-written picture would stop every later dump of it
+            std::filesystem::path tmp = dir / (std::string(name) + ".tmp");
+            bool ok = WritePng(tmp, px, d.width, d.height);
+            if (ok) std::filesystem::rename(tmp, dir / name, ec);
+            if (ok && !ec) PACK_LOG(4, "texture pack: dumping to %s", dir.string().c_str());
+            else std::filesystem::remove(tmp, ec);
         }
     }
     if (st.texture_pack && g_files.count(key) && !FindReplacement(d.data)) {

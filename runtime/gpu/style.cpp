@@ -225,6 +225,30 @@ std::mutex g_handoff;
 GraphicsStyle g_snapshot;   // the style as the last frame drew it
 GraphicsStyle g_requested;  // a menu's, taken at the next frame
 bool g_has_request = false;
+
+// graphics.toml through a temporary file: a failed write leaves the old one and is not counted as saved
+bool WriteStyleFile(const GraphicsStyle& s, const char* header) {
+    std::filesystem::path f = StyleFile(), tmp = f;
+    tmp += ".tmp";
+    std::error_code ec;
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        out << header << Write(s) << "\n";
+        out.close();
+        if (!out) {
+            std::filesystem::remove(tmp, ec);
+            LOG_FIRST(4, "graphics: graphics.toml could not be written");
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp, f, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        LOG_FIRST(4, "graphics: graphics.toml could not be replaced");
+        return false;
+    }
+    return true;
+}
 }  // namespace
 
 // without the Vulkan renderer nothing draws from the style: the menu's thread reads and writes it at once
@@ -246,9 +270,8 @@ void RequestStyle(const GraphicsStyle& s) {
         return;
     }
     // (outside the render thread's frame loop: written here)
-    std::ofstream out(StyleFile());
-    out << "# graphics styles (docs/graphics_styles.md); written by the game's settings\n" << Write(g_style) << "\n";
-    g_saved = g_version.load();
+    if (WriteStyleFile(g_style, "# graphics styles (docs/graphics_styles.md); written by the game's settings\n"))
+        g_saved = g_version.load();
 }
 void TakeRequestedStyle() {
     std::lock_guard lock(g_handoff);
@@ -269,10 +292,8 @@ const std::vector<StylePreset>& StylePresets() { return g_presets; }
 bool StyleRendererActive() { return g_vulkan.load(); }
 void SetStyleRendererActive(bool on) { g_vulkan = on; }
 
-void LoadStyle() {
-    static bool loaded = false;
-    if (loaded) return;
-    loaded = true;
+namespace {
+void LoadStyleOnce() {
     g_presets = BuiltIn();
     // mods/presets/*.toml: a name, a base preset, then any of graphics.toml's keys; no code runs from them
     std::error_code ec;
@@ -321,9 +342,17 @@ void LoadStyle() {
     LOGR("graphics: style %s (%s), %zu presets", kModes[g_style.mode], g_style.preset.empty() ? "custom" : g_style.preset.c_str(),
          g_presets.size());
 }
+}  // namespace
+
+void LoadStyle() {
+    // the menu's thread (StyleSnapshot) and the render thread both ask: one loads, the other waits for it
+    static std::once_flag loaded;
+    std::call_once(loaded, LoadStyleOnce);
+}
 
 void ApplyPreset(const StylePreset& p) {
     // texture settings and quality are not a look: kept
+    std::lock_guard lock(g_handoff);
     GraphicsStyle keep = g_style;
     g_style = p.values;
     g_style.preset = p.name;
@@ -348,6 +377,7 @@ constexpr QualitySet kQuality[4] = {{0, false, 0, false}, {4, true, 0, true}, {8
 
 void ApplyQuality(int q) {
     if (q < 0 || q >= kQualityCustom) {
+        std::lock_guard lock(g_handoff);
         g_style.quality = kQualityCustom;
         StyleChanged();
         return;
@@ -360,6 +390,7 @@ void ApplyQuality(int q) {
         s.fxaa = v.fxaa;
         app::Save();
     }
+    std::lock_guard lock(g_handoff);
     g_style.quality = q;
     g_style.quality_ao = v.ao;
     g_style.quality_bloom = v.bloom;
@@ -403,6 +434,7 @@ void SaveStyleIfDue() {
                 toml::table tb = toml::parse_file(StyleFile().string());
                 Read(tb, s, "graphics.toml");
                 s.preset = tb["preset"].value_or(std::string());
+                std::lock_guard lock(g_handoff);
                 g_style = s;
                 g_version++;
                 g_saved = g_version.load();
@@ -414,10 +446,17 @@ void SaveStyleIfDue() {
     }
     if (g_version.load() == g_saved) return;
     if (std::chrono::steady_clock::now() - g_changed < std::chrono::seconds(1)) return;
-    g_saved = g_version.load();
-    std::ofstream out(StyleFile());
-    out << "# graphics styles (docs/graphics_styles.md); written by the game's settings window\n" << Write(g_style) << "\n";
-    out.close();
+    uint64_t version = g_version.load();
+    GraphicsStyle s;
+    {
+        std::lock_guard lock(g_handoff);
+        s = g_style;
+    }
+    if (!WriteStyleFile(s, "# graphics styles (docs/graphics_styles.md); written by the game's settings window\n")) {
+        g_changed = std::chrono::steady_clock::now();  // tried again in a second
+        return;
+    }
+    g_saved = version;
     std::error_code ec;
     g_file_time = std::filesystem::last_write_time(StyleFile(), ec);
 }
@@ -426,7 +465,14 @@ void SaveStyleIfDue() {
 
 void DrawStyleSettings(bool vulkan) {
     LoadStyle();
-    GraphicsStyle& s = g_style;
+    // edited as a copy and stored under the handoff lock: the menu's thread reads and writes the style too
+    GraphicsStyle s;
+    {
+        std::lock_guard lock(g_handoff);
+        s = g_style;
+    }
+    const StylePreset* picked = nullptr;
+    bool reset = false;
     bool changed = false;
     if (!vulkan)
         ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1),
@@ -439,7 +485,7 @@ void DrawStyleSettings(bool vulkan) {
         for (auto& p : g_presets) {
             bool sel = p.name == s.preset;
             std::string label = p.file.empty() ? p.label : p.label + " (mod)";
-            if (ImGui::Selectable(label.c_str(), sel)) ApplyPreset(p);
+            if (ImGui::Selectable(label.c_str(), sel)) picked = &p;
             if (sel) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
@@ -449,7 +495,7 @@ void DrawStyleSettings(bool vulkan) {
         bool pack = s.texture_pack;
         s = GraphicsStyle{};
         s.texture_pack = pack;
-        StyleChanged();
+        reset = true;
     }
     ImGui::TextDisabled("Switches at once, in play. Original is the console's picture; the others add a scene pass\n"
                         "drawn before the HUD, so menus' and HUD's pixels keep the game's look.");
@@ -508,8 +554,12 @@ void DrawStyleSettings(bool vulkan) {
         ImGui::TextDisabled("Need the scene's normals, lights and positions, which the console's vertex programs do\n"
                             "not hand the renderer yet (docs/graphics_styles.md).");
     }
-    if (changed) {
-        s.preset.clear();
+    if (picked) {
+        ApplyPreset(*picked);
+    } else if (changed || reset) {
+        if (changed) s.preset.clear();
+        std::lock_guard lock(g_handoff);
+        g_style = s;
         StyleChanged();
     }
 }

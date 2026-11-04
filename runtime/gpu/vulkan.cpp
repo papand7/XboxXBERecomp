@@ -757,7 +757,7 @@ public:
         std::memcpy(ramp_, ramp, sizeof(ramp_));
         ramp_dirty_ = true;
     }
-    void ClearReport() override { counted_.clear(); }
+    void ClearReport() override;
     void GetReport(uint32_t report) override { reports_.push_back({report, counted_}); }
 
 private:
@@ -938,6 +938,7 @@ private:
     bool host_reset_ = false;
     bool fill_lines_ = false;
     bool aniso_ok_ = false;
+    bool gs_ok_ = false;  // geometry shaders, which points are drawn with
     bool open_ = false;  // a rendering instance is open
     Attachments cur_;
     bool dirty_ = false;  // writes since the last barrier
@@ -965,6 +966,7 @@ private:
     std::atomic<uint64_t> presents_seen_{0};  // presents_ for DeliverLate
     std::vector<uint32_t> free_queries_;
     std::vector<Query> counted_;  // since the last ClearReport
+    std::vector<Query> dropped_;  // counts no report took, free once their submission is done
     std::deque<Report> reports_;
     Stretch last_vsc_, last_dc_;  // the constants last streamed, in submission last_serial_
     uint64_t last_serial_ = 0;
@@ -1227,6 +1229,7 @@ bool VulkanBackend::CreateDevice() {
     on.features.depthBiasClamp = f2.features.depthBiasClamp;
     fill_lines_ = f2.features.fillModeNonSolid;
     aniso_ok_ = f2.features.samplerAnisotropy;
+    gs_ok_ = f2.features.geometryShader;
     if (!f2.features.geometryShader) LOGW("vulkan: no geometry shaders, points are not drawn");
     if (!f2.features.textureCompressionBC) LOGW("vulkan: no BC texture compression, DXT textures are not drawn");
     if (robust2 && robust_f.nullDescriptor) {
@@ -1633,7 +1636,7 @@ void VulkanBackend::Submit(VkSemaphore wait, VkSemaphore signal) {
     }
     if (r != VK_SUCCESS) LOG_FIRST(8, "vulkan: vkQueueSubmit failed: %s", VkResultName(r));
     cmd_ = VK_NULL_HANDLE;
-    dirty_ = false;
+    dirty_ = true;  // the next command buffer has no memory dependency on this one's writes without a barrier
     perf_submits_++;
 }
 
@@ -2126,6 +2129,7 @@ void VulkanBackend::CopyToBuffer(const Image& src, uint32_t w, uint32_t h, VkBuf
     di.memoryBarrierCount = 1;
     di.pMemoryBarriers = &mb;
     vkCmdPipelineBarrier2(cmd_, &di);
+    dirty_ = true;  // a later draw into the image waits for the copy's read
 }
 
 // a BGRA image to the CPU, rows packed; waits for the GPU
@@ -2168,7 +2172,9 @@ void VulkanBackend::Sync(uint32_t data, uint32_t) {
     } else {
         for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * pitch, &px[size_t(y) * t.gw * 4], t.gw * 4);
     }
-    t.read = std::move(px);
+    // compared against guest memory row by row, so only a linear surface keeps its pixels
+    if (t.swizzled32) t.read.clear();
+    else t.read = std::move(px);
     t.drawn = false;
     t.sig = SurfaceSig(t.data, t.bytes);
 }
@@ -2580,7 +2586,8 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
         return;
     }
     Target* dst_t = EnsureTarget(dst, false);
-    if (!dst_t || src_t == dst_t) return;
+    src_t = FindTarget(src, false);  // the same address at another size: EnsureTarget let the source go
+    if (!dst_t || !src_t || src_t == dst_t) return;
     bool same_scale = src_t->w * dst_t->gw == dst_t->w * src_t->gw && src_t->h * dst_t->gh == dst_t->h * src_t->gh;
     if (!same_scale) CopyByDraw(*src_t, *dst_t, count, src_rects, dst_points);
     else CopyByRegion(*src_t, *dst_t, count, src_rects, dst_points);
@@ -2873,6 +2880,7 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k) {
     auto it = pipelines_.find(h);
     if (it != pipelines_.end()) return it->second;
     bool points = k.topo == uint32_t(Topology::Points);
+    if (points && !gs_ok_) return pipelines_[h] = VK_NULL_HANDLE;  // not drawn, see the log
     if (points && !point_gs_) Compile(PointHlsl(), "main", "gs_5_0", point_gs_);
     VkPipelineShaderStageCreateInfo st[3]{};
     uint32_t n_st = 0;
@@ -3151,14 +3159,20 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     last_serial_ = serial_ + 1;
     if (fresh || vsc_last_.size() != sizeof(s.vsc) || std::memcmp(vsc_last_.data(), s.vsc.data(), sizeof(s.vsc))) {
         last_vsc_ = Stream(sizeof(s.vsc));
-        if (!last_vsc_.p) return;
+        if (!last_vsc_.p) {
+            vsc_last_.clear();  // streamed again by the next draw
+            return;
+        }
         std::memcpy(last_vsc_.p, s.vsc.data(), sizeof(s.vsc));
         const uint8_t* b = reinterpret_cast<const uint8_t*>(s.vsc.data());
         vsc_last_.assign(b, b + sizeof(s.vsc));
     }
     if (fresh || dc_last_.size() != sizeof(c) || std::memcmp(dc_last_.data(), &c, sizeof(c))) {
         last_dc_ = Stream(sizeof(c));
-        if (!last_dc_.p) return;
+        if (!last_dc_.p) {
+            dc_last_.clear();
+            return;
+        }
         std::memcpy(last_dc_.p, &c, sizeof(c));
         const uint8_t* b = reinterpret_cast<const uint8_t*>(&c);
         dc_last_.assign(b, b + sizeof(c));
@@ -3238,8 +3252,34 @@ float VulkanBackend::SamplesPerPixel() const {
     return float(t->w) * float(t->h) / (float(t->gw) * float(t->gh));
 }
 
+// counts no report holds go back to the pool, or they leak once counted_ forgets them
+void VulkanBackend::ClearReport() {
+    for (const Query& c : counted_) {
+        bool held = false;
+        for (size_t i = 0; i < reports_.size() && !held; i++)
+            for (const Query& o : reports_[i].queries) held |= o.index == c.index;
+        if (!held) dropped_.push_back(c);
+    }
+    counted_.clear();
+}
+
 void VulkanBackend::DeliverReports(bool wait) {
     constexpr uint32_t kTime = 0, kTimeHigh = 4, kCount = 8, kStatus = 12;
+    // dropped counts are reset once the GPU is done with them
+    uint64_t done = dropped_.empty() ? 0 : Completed();
+    for (size_t i = 0; i < dropped_.size();) {
+        if (dropped_[i].serial > done) {
+            i++;
+            continue;
+        }
+        uint32_t q = dropped_[i].index;
+        if (std::find(free_queries_.begin(), free_queries_.end(), q) == free_queries_.end()) {
+            vkResetQueryPool(dev_, queries_, q, 1);
+            free_queries_.push_back(q);
+        }
+        dropped_[i] = dropped_.back();
+        dropped_.pop_back();
+    }
     while (!reports_.empty()) {
         Report& r = reports_.front();
         double pixels = 0;
@@ -3493,6 +3533,7 @@ void VulkanBackend::Present(const Surface& front) {
         frame_slot_ = (frame_slot_ + 1) % kFramesInFlight;
     } else {
         Submit();
+        frame_serial_[frame_slot_] = serial_;  // the slot is not advanced: its stamps and the throttle are this frame's
     }
     // at most kFramesInFlight frames ahead of the GPU; the slot's timings read before it is used again
     Wait(frame_serial_[frame_slot_]);
@@ -3690,6 +3731,7 @@ void VulkanBackend::RescaleTargets() {
         if (!CreateTarget(t)) {
             DropImage(old.res);
             DropImage(old.fb);
+            DropImage(old.shrunk);
             it = targets_.erase(it);
             continue;
         }

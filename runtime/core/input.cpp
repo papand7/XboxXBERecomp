@@ -202,12 +202,25 @@ int TakeWheel() {
     return notches;
 }
 
-uint32_t g_script_mouse = 0;  // XBE_PAD_CMD's CLICKL and CLICKR, held while their press is
+std::atomic<uint32_t> g_script_mouse{0};  // XBE_PAD_CMD's CLICKL and CLICKR, held while their press is
+
+namespace {
+// the primary and secondary buttons: GetAsyncKeyState reads the physical ones, swapped for a left handed mouse
+uint16_t PrimaryButton() { return GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON; }
+uint16_t SecondaryButton() { return GetSystemMetrics(SM_SWAPBUTTON) ? VK_LBUTTON : VK_RBUTTON; }
+
+// a key binding's mouse_left / mouse_right are the primary and secondary buttons, as the window's messages have them
+uint16_t PhysicalKey(uint16_t vk) {
+    if (vk == VK_LBUTTON) return PrimaryButton();
+    if (vk == VK_RBUTTON) return SecondaryButton();
+    return vk;
+}
+}  // namespace
 
 uint32_t MouseButtons() {
     if (!MouseLooking() && !MousePointing()) return g_script_mouse;
-    return g_script_mouse | uint32_t((GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0) |
-           ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) ? 2 : 0) | ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) ? 4 : 0);
+    return g_script_mouse | uint32_t((GetAsyncKeyState(PrimaryButton()) & 0x8000) ? 1 : 0) |
+           ((GetAsyncKeyState(SecondaryButton()) & 0x8000) ? 2 : 0) | ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) ? 4 : 0);
 }
 
 std::array<uint16_t, 2> ControlKeys(int c) {
@@ -260,7 +273,7 @@ struct ScriptedPress {
     double len;
 };
 
-void PressNamed(const std::string& names, float out[kControls]) {
+void PressNamed(const std::string& names, float out[kControls], uint32_t& mouse) {
     static const std::pair<const char*, int> kNames[] = {
         {"UP", kUp}, {"DOWN", kDown}, {"LEFT", kLeft}, {"RIGHT", kRight}, {"START", kStart}, {"BACK", kBack},
         {"A", kA}, {"B", kB}, {"X", kX}, {"Y", kY}, {"BLACK", kBlack}, {"WHITE", kWhite}, {"LT", kLT}, {"RT", kRT},
@@ -274,8 +287,8 @@ void PressNamed(const std::string& names, float out[kControls]) {
         at = e + 1;
         for (auto& [n, c] : kNames)
             if (b == n) out[c] = 1.0f;
-        if (b == "CLICKL") g_script_mouse |= 1;
-        if (b == "CLICKR") g_script_mouse |= 2;
+        if (b == "CLICKL") mouse |= 1;
+        if (b == "CLICKR") mouse |= 2;
     }
 }
 
@@ -301,7 +314,10 @@ bool Scripted(float out[kControls]) {
     }();
     if (script.empty() && !cmd_on) return false;
     static const auto start = std::chrono::steady_clock::now();
+    // the cmd file's press, read and replaced by whichever thread polls controller 1
+    static std::mutex live_lock;
     static ScriptedPress live{-1, "", 0};
+    std::lock_guard lock(live_lock);
     double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() * 60.0;
     if (cmd_on) {
         std::string cmd = (app::ExeDir() / "cmd").string();
@@ -310,7 +326,7 @@ bool Scripted(float out[kControls]) {
             double len = 8, y = 0;
             int got = std::fscanf(f, "%63s %lf %lf", b, &len, &y);
             std::fclose(f);
-            std::remove(cmd.c_str());
+            if (got >= 1) std::remove(cmd.c_str());  // still being written: read again at the next poll
             if (got == 3 && std::string(b) == "PTR") {  // the pointer at x, y of the title's 640 x 480 2D
                 app::SetFramePointOverride(float(len) / 640.0f, float(y) / 480.0f);
                 LOGR("input: cmd pointer at %.0f, %.0f", len, y);
@@ -320,10 +336,11 @@ bool Scripted(float out[kControls]) {
             }
         }
     }
-    g_script_mouse = 0;
+    uint32_t mouse = 0;
     for (const ScriptedPress& p : script)
-        if (t >= p.at && t <= p.at + p.len) PressNamed(p.buttons, out);
-    if (live.at >= 0 && t >= live.at && t <= live.at + live.len) PressNamed(live.buttons, out);
+        if (t >= p.at && t <= p.at + p.len) PressNamed(p.buttons, out, mouse);
+    if (live.at >= 0 && t >= live.at && t <= live.at + live.len) PressNamed(live.buttons, out, mouse);
+    g_script_mouse = mouse;
     return true;
 }
 
@@ -368,7 +385,7 @@ Pad Poll(int port) {
             for (int c = 0; c < kControls; c++) {
                 std::array<uint16_t, 2> keys = c < int(s.keys.size()) ? s.keys[c] : app::DefaultKeys(c);
                 for (uint16_t k : keys)
-                    if (k && (GetAsyncKeyState(k) & 0x8000)) out[c] = 1.0f, key_used = true;
+                    if (k && (GetAsyncKeyState(PhysicalKey(k)) & 0x8000)) out[c] = 1.0f, key_used = true;
             }
         }
         if (pad_used) {
