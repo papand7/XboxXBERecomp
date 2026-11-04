@@ -858,6 +858,47 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
     return c;
 }
 )";
+// materials (VulkanBackend::MaterialShader): the draw's own pixel shader (renamed game_main), its colour shaded by the
+// pack picture's material (tex%d: normal xy, roughness, height) over the game's lighting. The surface's frame is made
+// from the screen derivatives of its position (the view taken as pbr.z wide) and of its texture coordinates (a
+// cotangent frame); light from above the view and from the camera: the ratio of the bumped normal's light to the flat
+// one's scales the game's colour, and a GGX highlight of the roughness adds a sheen, kept in proportion to it
+const char* kMatMain = R"(
+float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
+    float4 c = game_main(i, front%s);
+    float2 uv = %s;
+    float4 m = tex%d.Sample(smp%d, uv);
+    float w = max(abs(i.wlin * wdepth.w), 1e-4);
+    float aspect = pbr.y / pbr.x;
+    float3 P = float3((i.pos.x * pbr.x * 2 - 1) * aspect * pbr.z * w, -(i.pos.y * pbr.y * 2 - 1) * pbr.z * w, w);
+    float3 dpx = ddx(P), dpy = ddy(P);
+    float2 dux = ddx(uv), duy = ddy(uv);
+    float3 Ng = normalize(cross(dpx, dpy));
+    if (dot(Ng, P) > 0) Ng = -Ng;
+    float3 t1 = cross(dpy, Ng), t2 = cross(Ng, dpx);
+    float3 T = t1 * dux.x + t2 * duy.x, B = t1 * dux.y + t2 * duy.y;
+    float inv = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-20));
+    float3 nt = float3(m.rg * 2 - 1, 0);
+    nt.z = sqrt(saturate(1 - dot(nt.xy, nt.xy)));
+    float3 N = normalize(T * inv * nt.x + B * inv * nt.y + Ng * nt.z);
+    if (any(isnan(N))) N = Ng;
+    float3 V = normalize(-P);
+    float3 L = normalize(float3(0.3, 0.8, -0.5));
+    float flat = 0.55 * saturate(dot(Ng, L)) + 0.45 * saturate(dot(Ng, V)) + 0.15;
+    float bump = 0.55 * saturate(dot(N, L)) + 0.45 * saturate(dot(N, V)) + 0.15;
+    float shade = clamp(lerp(1, bump / max(flat, 0.05), pbr.w), 0.4, 1.8);
+    float r = max(m.b, 0.06), a2 = r * r * r * r;
+    float3 H = normalize(L + V);
+    float nh = saturate(dot(N, H)), dn = nh * nh * (a2 - 1) + 1;
+    float D = a2 / (3.14159 * dn * dn);
+    float F = 0.04 + 0.96 * pow(1 - saturate(dot(H, V)), 5);
+    float spec = min(D * F * saturate(dot(N, L)) * 0.25, 4);
+    float lum = dot(c.rgb, float3(0.299, 0.587, 0.114));
+    c.rgb = c.rgb * shade + spec * pbr.w * saturate(lum * 1.5) * 0.5;
+    return c;
+}
+)";
+constexpr uint64_t kMatKeySalt = 0x6D6174657269616Cull;  // "material"
 constexpr uint64_t kSoftKeySalt = 0x736F667470617274ull;  // "softpart"
 constexpr uint64_t kMaskKeySalt = 0x6D61736B6D61736Cull;
 constexpr VkFormat kMaskFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -1174,6 +1215,10 @@ private:
     int SoftParticle(const PsoKey& k, const PixelKey& pk, float refl);
     uint64_t SoftShader(const DrawShaders& sh, const PixelKey& pk, int slot);
     VkImageView SoftDepth(Target& ds);
+    // materials: the pack picture's material image (made once from texture_pack's), the variant's pixel shader
+    std::unordered_map<uint64_t, Image> materials_;
+    VkImageView MaterialView(uint64_t key);
+    uint64_t MaterialShader(const DrawShaders& sh, const PixelKey& pk, int slot);
     bool EnsureMask(Target& t);
     void DrawMask(const Assembled& a, PsoKey k, const DrawShaders& sh, const PixelKey& pk, const DrawTextures& stages,
                   const VkSampler smp[4], const float bf[4], uint32_t sref, const VkViewport& vp, const VkRect2D& sc);
@@ -1205,7 +1250,8 @@ private:
         ~PerfScope() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
     };
     uint64_t perf_frames_ = 0, perf_submits_ = 0, perf_draws_ = 0;
-    uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0, perf_reflect_ = 0, perf_soft_ = 0;  // draws by kind
+    uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0, perf_reflect_ = 0, perf_soft_ = 0,
+             perf_mat_ = 0;  // draws by kind
     std::chrono::steady_clock::time_point perf_t_ = std::chrono::steady_clock::now();
     void LogPerf();
     friend VkBool32 VKAPI_PTR DebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -1720,6 +1766,7 @@ VulkanBackend::~VulkanBackend() {
     textures_.clear();
     DropImage(lut_);
     DropImage(smaa_area_);
+    for (auto& [k, m] : materials_) DropImage(m);
     DropImage(smaa_search_);
     DropImage(dummy_);
     for (Chunk& c : chunks_) DropBuffer(c.b);
@@ -3335,8 +3382,32 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     const float refl = Reflectivity(k);
     c.style[2] = refl;
     c.style[3] = Opaque(k) || stage_solid_ ? 1.0f : 0.0f;
+    // materials: a pack picture's normal and roughness, read from a stage the draw leaves free
+    int mat_slot = -1;
+    if (st.materials && st.mode != kStyleRetro && !draw_2d_ && stage_seen_ && stage_key_ && stages.replaced[0] &&
+        bound_rt_ && k.zen && (Opaque(k) || stage_solid_)) {
+        int slot = -1;
+        for (int i = 3; i >= 1 && slot < 0; i--)
+            if (!stages.view[i] && pk.tex[i].kind == kTexNone) slot = i;
+        VkImageView mv = slot >= 0 ? MaterialView(stage_key_) : VK_NULL_HANDLE;
+        uint64_t mh = mv ? MaterialShader(sh, pk, slot) : 0;
+        if (mh) {
+            PsoKey mk = k;
+            mk.ps = mh;
+            if (VkPipeline mp = EnsurePipeline(mk)) {
+                p = mp;
+                stages.view[slot] = mv;
+                mat_slot = slot;
+                c.pbr[0] = 1.0f / float(bound_rt_->w);
+                c.pbr[1] = 1.0f / float(bound_rt_->h);
+                c.pbr[2] = 0.5774f;  // an assumed 60 degree vertical view, as the reflections take it
+                c.pbr[3] = st.material_strength;
+                perf_mat_++;
+            }
+        }
+    }
     // soft particles: the variant shader reads the scene depth's copy from a stage the draw leaves free
-    if (int soft = SoftParticle(k, pk, refl)) {
+    if (int soft = mat_slot < 0 ? SoftParticle(k, pk, refl) : 0) {
         int slot = -1;
         for (int i = 3; i >= 0 && slot < 0; i--)
             if (!stages.view[i] && pk.tex[i].kind == kTexNone) slot = i;
@@ -3372,6 +3443,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         }
         smp[i] = Sampler(sd);
     }
+    if (mat_slot >= 0) smp[mat_slot] = smp[0];  // the material repeats and filters as the picture it goes with
 
     // the rendering instance, then everything recorded inside it
     Begin(TargetAttachments(bound_rt_, bound_ds_));
@@ -3490,6 +3562,45 @@ uint64_t VulkanBackend::SoftShader(const DrawShaders& sh, const PixelKey& pk, in
         if (!Compile(src, "main", "ps_5_0", h)) h = 0;
     }
     if (!h) LOG_FIRST(4, "vulkan: a soft particle shader could not be made, the particle is drawn as the game's");
+    shader_src_[key] = h;
+    return h;
+}
+
+VkImageView VulkanBackend::MaterialView(uint64_t key) {
+    auto it = materials_.find(key);
+    if (it != materials_.end()) return it->second.view;  // null: the picture has none
+    Image& im = materials_[key];
+    std::vector<std::vector<uint32_t>> levels;
+    uint32_t w = 0, h = 0;
+    if (!TakePackMaterial(key, levels, w, h) || levels.empty()) return VK_NULL_HANDLE;
+    if (!MakeImage(im, VK_IMAGE_TYPE_2D, kBgra, w, h, 1, uint32_t(levels.size()), 1,
+                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        im = Image{};
+        return VK_NULL_HANDLE;
+    }
+    for (uint32_t l = 0; l < levels.size(); l++)
+        UploadLevel(im, l, 0, std::max(1u, w >> l), std::max(1u, h >> l), 1, levels[l].data(), levels[l].size() * 4);
+    return im.view;
+}
+
+uint64_t VulkanBackend::MaterialShader(const DrawShaders& sh, const PixelKey& pk, int slot) {
+    uint64_t key = sh.pkey ^ kMatKeySalt ^ uint64_t(slot) << 56;
+    if (auto it = shader_src_.find(key); it != shader_src_.end()) return it->second;
+    uint64_t h = 0;
+    std::string src = PixelHlsl(pk);
+    size_t at = src.find("float4 main(");
+    if (at != std::string::npos) {
+        src.replace(at, 12, "float4 game_main(");
+        // stage 0's coordinates as its fetch takes them (projected for a combiner's or a projected stage)
+        std::string uv = pk.programmable || (pk.proj & 1) ? "i.tc0.xy / i.tc0.w" : "i.tc0.xy";
+        uv = "(" + uv + ")" + (pk.tex[0].rect ? " / texsize[0].xy" : "") + " + texsize[0].zw";
+        char tail[4096];
+        std::snprintf(tail, sizeof(tail), kMatMain, pk.wbuf ? ", out float depth : SV_Depth" : "",
+                      pk.wbuf ? ", depth" : "", uv.c_str(), slot, slot);
+        src += tail;
+        if (!Compile(src, "main", "ps_5_0", h)) h = 0;
+    }
+    if (!h) LOG_FIRST(4, "vulkan: a material shader could not be made, the surface is drawn as the game's");
     shader_src_[key] = h;
     return h;
 }
@@ -4154,8 +4265,8 @@ void VulkanBackend::LogPerf() {
                       : Style().mode == kStyleToon ? "toon" : "retro");
     LOGR("perf: vulkan draws a frame: %.0f 2D, %.0f vertex programs, %.0f fixed function (%.0f lit)",
          perf_2d_ / n, perf_prog_ / n, perf_fixed_ / n, perf_lit_ / n);
-    LOGR("perf: vulkan soft particles a frame: %.1f", perf_soft_ / n);
-    perf_soft_ = 0;
+    LOGR("perf: vulkan soft particles a frame: %.1f, material draws %.1f", perf_soft_ / n, perf_mat_ / n);
+    perf_soft_ = perf_mat_ = 0;
     LOGR("perf: vulkan reflective draws a frame: %.1f (3D %.0f, stage 0 seen %.0f, rt+ds %.0f, scene size %.0f, opaque %.0f, W-buffer %.0f)",
          perf_reflect_ / n, g_ssr_diag[0] / n, g_ssr_diag[1] / n, g_ssr_diag[2] / n, g_ssr_diag[3] / n, g_ssr_diag[4] / n,
          g_ssr_diag[5] / n);

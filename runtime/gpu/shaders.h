@@ -137,6 +137,7 @@ struct DrawConstants {
                          // [2] depth tested; [3] W-buffered: z kept within w (no far plane clipping)
     float pts[4];        // point sprites on, size min, size max, D3DRS_POINTSIZE (console pixels)
     float style[4];      // graphics styles (style.h): xy the vertex snapping grid in clip units per half screen, 0 off
+    float pbr[4];        // materials (Vulkan): 1 / target width and height, tan of half the vertical view, strength
 };
 
 }  // namespace gpu

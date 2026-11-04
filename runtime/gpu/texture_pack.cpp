@@ -101,7 +101,33 @@ bool WritePng(const std::filesystem::path& path, const std::vector<uint32_t>& px
 std::mutex g_lock;
 std::unordered_set<uint64_t> g_files;   // keys with a picture in the pack
 std::unordered_set<uint64_t> g_dumped;  // keys written this run
-std::unordered_map<uint64_t, float> g_rough;  // a pack picture's mean roughness, from its <key>_r.png (hd_pack --pbr)
+std::unordered_map<uint64_t, float> g_rough;
+// pictures' materials read at load, taken by the renderer (TakePackMaterial): R normal x, G normal y, B roughness,
+// A height, level 0 first
+struct Material {
+    uint32_t w, h;
+    std::vector<std::vector<uint32_t>> levels;
+};
+std::unordered_map<uint64_t, Material> g_materials;
+
+// a level half the size, each texel the average of four
+std::vector<uint32_t> Halve(const std::vector<uint32_t>& px, uint32_t w, uint32_t h) {
+    uint32_t hw = std::max(1u, w / 2), hh = std::max(1u, h / 2);
+    std::vector<uint32_t> o(size_t(hw) * hh);
+    for (uint32_t y = 0; y < hh; y++)
+        for (uint32_t x = 0; x < hw; x++) {
+            uint32_t sum[4] = {};
+            for (uint32_t dy = 0; dy < 2; dy++)
+                for (uint32_t dx = 0; dx < 2; dx++) {
+                    uint32_t c = px[size_t(std::min(y * 2 + dy, h - 1)) * w + std::min(x * 2 + dx, w - 1)];
+                    for (int k = 0; k < 4; k++) sum[k] += c >> (k * 8) & 0xFF;
+                }
+            uint32_t c = 0;
+            for (int k = 0; k < 4; k++) c |= ((sum[k] + 2) / 4) << (k * 8);
+            o[size_t(y) * hw + x] = c;
+        }
+    return o;
+}  // a pack picture's mean roughness, from its <key>_r.png (hd_pack --pbr)
 // pictures by where they sit: one whose contents change again within a second (a movie's frames, an animated
 // screen) is no texture to repaint and is not dumped; a level's textures loaded where another's were are
 struct Seen {
@@ -127,6 +153,16 @@ void Scan() {
 }
 
 }  // namespace
+
+bool TakePackMaterial(uint64_t key, std::vector<std::vector<uint32_t>>& levels, uint32_t& w, uint32_t& h) {
+    std::lock_guard lock(g_lock);
+    auto it = g_materials.find(key);
+    if (it == g_materials.end()) return false;
+    w = it->second.w, h = it->second.h;
+    levels = std::move(it->second.levels);
+    g_materials.erase(it);
+    return true;
+}
 
 float PackRoughness(uint64_t key) {
     std::lock_guard lock(g_lock);
@@ -192,6 +228,24 @@ void TexturePackSeen(const TextureDesc& d, const uint8_t* guest, const uint32_t*
                 double sum = 0;
                 for (uint32_t c : rp) sum += (c >> 8 & 0xFF) / 255.0;
                 g_rough[key] = float(sum / double(rp.size()));
+            }
+            // the material: the normal map with the roughness in its blue (its z is made again from x and y)
+            char nname[40];
+            std::snprintf(nname, sizeof(nname), "%016llx_n.png", (unsigned long long)key);
+            std::vector<uint32_t> np;
+            uint32_t nw = 0, nh = 0;
+            if (Style().materials && std::filesystem::exists(PackDir() / nname, ec) &&
+                ReadPng(PackDir() / nname, np, nw, nh) && !np.empty()) {
+                bool rough = rw == nw && rh == nh && rp.size() == np.size();
+                for (size_t i = 0; i < np.size(); i++)
+                    np[i] = (np[i] & 0xFFFFFF00u) | (rough ? rp[i] & 0xFF : 0x80u);
+                Material m{nw, nh, {}};
+                m.levels.push_back(std::move(np));
+                for (uint32_t lw = nw, lh = nh; lw > 1 || lh > 1;) {
+                    m.levels.push_back(Halve(m.levels.back(), lw, lh));
+                    lw = std::max(1u, lw / 2), lh = std::max(1u, lh / 2);
+                }
+                g_materials[key] = std::move(m);
             }
             PACK_LOG(32, "texture pack: %s in place of %08X (%ux%u, %ux%u)", name, d.data, d.width, d.height, w, h);
         }

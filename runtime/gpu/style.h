@@ -60,6 +60,10 @@ struct GraphicsStyle {
     // instead of cutting through it; the fade's depth in parts of the particle's distance
     bool soft_particles = false;
     float particle_fade = 0.03f;
+    // materials (Vulkan; every style but Retro): a texture pack's normal and roughness maps (hd_pack --pbr) drawn over
+    // the game's own lighting: bumps and a specular sheen; at the next start (the maps are read with the pack)
+    bool materials = false;
+    float material_strength = 0.7f;
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;

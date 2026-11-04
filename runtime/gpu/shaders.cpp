@@ -64,6 +64,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 hud;
     float4 pts;  // point sprites on, size min, size max, D3DRS_POINTSIZE
     float4 style;  // graphics styles: xy the vertex snapping grid, 0 off
+    float4 pbr;  // materials: 1 / target width and height, tan of half the vertical view, strength
 };
 )";
 

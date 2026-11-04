@@ -16,6 +16,9 @@ bool WritePngFile(const std::wstring& path, const std::vector<uint32_t>& px, uin
 // (the next bind draws it)
 // a pack picture's mean roughness (0 polished to 1 rough) from its <key>_r.png, -1 when it has none
 float PackRoughness(uint64_t key);
+// a pack picture's material, read with it when materials are on (hd_pack --pbr's _n and _r maps): B8G8R8A8 levels,
+// R and G the normal's x and y, B roughness, A height; handed over once (the renderer keeps it)
+bool TakePackMaterial(uint64_t key, std::vector<std::vector<uint32_t>>& levels, uint32_t& w, uint32_t& h);
 void TexturePackSeen(const TextureDesc& d, const uint8_t* guest, const uint32_t* palette, uint64_t palette_hash);
 
 }  // namespace gpu
