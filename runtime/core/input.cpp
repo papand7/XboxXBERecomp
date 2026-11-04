@@ -1,4 +1,5 @@
 // controllers through SDL: Xbox, PlayStation and Switch pads read into the console controller's report
+#include "core/netplay.h"
 #include "core/input.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -189,7 +190,9 @@ void MouseMoved(int dx, int dy) {
     if ((g_mouse_travel += std::abs(dx) + std::abs(dy)) > kMouseTravel) g_keyboard = true;
 }
 
-bool UsingKeyboard() { return g_keyboard; }
+// LAN play: the game's own keyboard and mouse handling is controller 1's on one copy only, so off; the mouse plays the
+// right stick, which travels with the controller
+bool UsingKeyboard() { return g_keyboard && !netplay::Active(); }
 
 std::atomic<int> g_wheel{0};  // WHEEL_DELTA units
 
@@ -336,7 +339,7 @@ bool Scripted(int port, float out[kControls]) {
     std::lock_guard lock(live_lock);
     double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() * 60.0;
     if (cmd_on) {
-        std::string cmd = (app::ExeDir() / "cmd").string();
+        std::string cmd = (app::ExeDir() / (app::Instance() > 1 ? "cmd" + std::to_string(app::Instance()) : "cmd")).string();
         if (FILE* f = std::fopen(cmd.c_str(), "r")) {
             char b[64] = {};
             double len = 8, y = 0;
@@ -450,7 +453,7 @@ Pad Poll(int port) {
     p.rx = Stick(out[kRSLeft], out[kRSRight]);
     p.ry = Stick(out[kRSDown], out[kRSUp]);
     if (port == 0 && MouseLooking()) {
-        if (!app::kGame.mouse_direct) MouseStick(s, p.rx, p.ry);
+        if (!app::kGame.mouse_direct || netplay::Active()) MouseStick(s, p.rx, p.ry);
     } else if (port == 0) {  // nothing kept from before (the settings window, another window in front)
         g_mouse_dx = 0;
         g_mouse_dy = 0;

@@ -4,6 +4,7 @@
 #include <chrono>
 
 #include "core/input.h"
+#include "core/netplay.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
 
@@ -29,11 +30,14 @@ std::mutex g_ports_lock;
 bool g_poller = false;
 uint32_t g_wheels = 0;  // ports a steering wheel steers, as XInputGetCapabilities last told
 
+// LAN play (core/netplay.h): every copy's players on their ports, the same on each copy
+input::Pad PadOn(int port) { return netplay::Active() ? netplay::Pad(port) : input::Poll(port); }
+
 void UpdatePorts() {
     std::lock_guard<std::mutex> lock(g_ports_lock);
     uint32_t cur = 0, wheels = 0;
     for (int p = 0; p < 4; p++) {
-        input::Pad pad = input::Poll(p);
+        input::Pad pad = PadOn(p);
         if (pad.connected) cur |= 1u << p;
         if (pad.connected && pad.wheel) wheels |= 1u << p;
     }
@@ -110,7 +114,7 @@ HLE_STDCALL(XInputGetState, 2) {
         if (it == g_handles.end()) return 6;  // ERROR_INVALID_HANDLE
         port = it->second.port;
     }
-    input::Pad p = input::Poll(int(port));
+    input::Pad p = PadOn(int(port));
     if (!p.connected) return 1167;  // ERROR_DEVICE_NOT_CONNECTED
     std::lock_guard<std::mutex> lock(g_ports_lock);
     Handle& h = g_handles[a[0]];
@@ -137,7 +141,7 @@ HLE_STDCALL(XInputGetCapabilities, 2) {
         if (it == g_handles.end()) return 6;
         port = it->second.port;
     }
-    input::Pad p = input::Poll(int(port));
+    input::Pad p = PadOn(int(port));
     if (!p.connected) return 1167;
     uint32_t c = a[1];
     std::memset(HostPtr(c), 0, 24);

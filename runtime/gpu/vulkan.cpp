@@ -4217,7 +4217,7 @@ void VulkanBackend::Present(const Surface& front) {
     }();
     std::wstring shot_path;
     if (shots && presents_ % 15 == 0) {
-        std::filesystem::path req = app::ExeDir() / "shot";
+        std::filesystem::path req = app::ExeDir() / (app::Instance() > 1 ? "shot" + std::to_string(app::Instance()) : "shot");
         std::error_code ec;
         if (std::filesystem::exists(req, ec)) {
             if (std::wifstream in{req}) std::getline(in, shot_path);

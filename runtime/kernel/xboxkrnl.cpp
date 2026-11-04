@@ -5,6 +5,7 @@
 #include <ctime>
 
 #include "app/app.h"
+#include "core/netplay.h"
 #include "kernel/crypto.h"
 #include "kernel/exports.h"
 #include "xbe/xbe.h"
@@ -68,6 +69,7 @@ void PutSystemTime(uint32_t va, uint64_t t) {
 }
 
 uint64_t InterruptTime() {
+    if (netplay::Active()) return netplay::Clock(10000000);  // LAN play: frames, the same on every copy
     using namespace std::chrono;
     static const auto start = steady_clock::now();
     return uint64_t(duration_cast<nanoseconds>(steady_clock::now() - start).count() / 100);
@@ -223,7 +225,8 @@ KERNEL_EXPORT(125, KeQueryInterruptTime, 0) {
 }
 
 KERNEL_EXPORT(128, KeQuerySystemTime, 1) {
-    W64(a[0], uint64_t(Now100ns()));
+    // LAN play: the same date on every copy, 1 January 2003 plus the frames played
+    W64(a[0], netplay::Active() ? 126866880000000000ull + netplay::Clock(10000000) : uint64_t(Now100ns()));
     return 0;
 }
 
@@ -236,6 +239,11 @@ KERNEL_EXPORT(228, NtSetSystemTime, 2) {
 constexpr uint64_t kPerfFrequency = 3375000;
 
 KERNEL_EXPORT(126, KeQueryPerformanceCounter, 0) {
+    if (netplay::Active()) {
+        uint64_t v = netplay::Clock(kPerfFrequency);
+        ctx.edx = uint32_t(v >> 32);
+        return uint32_t(v);
+    }
     using namespace std::chrono;
     static const auto start = steady_clock::now();
     uint64_t ns = uint64_t(duration_cast<nanoseconds>(steady_clock::now() - start).count());

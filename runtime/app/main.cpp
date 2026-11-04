@@ -25,6 +25,7 @@
 #include <backends/imgui_impl_win32.h>
 
 #include "app/app.h"
+#include "core/netplay.h"
 #include "core/diag.h"
 #include "core/input.h"
 #include "core/log.h"
@@ -382,7 +383,7 @@ void Quit() {
 }
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
 
-bool Paused() { return Get().pause_unfocused && !g_active && g_hwnd && IsWindowVisible(g_hwnd); }
+bool Paused() { return !netplay::Active() && Get().pause_unfocused && !g_active && g_hwnd && IsWindowVisible(g_hwnd); }
 
 void Pace(uint32_t vblanks) {
     using clock = std::chrono::steady_clock;
@@ -426,6 +427,7 @@ void Pace(uint32_t vblanks) {
     if (next < now - period) next = now;
     while (clock::now() + std::chrono::milliseconds(2) < next) Sleep(1);
     while (clock::now() < next) std::this_thread::yield();
+    netplay::Frame();  // LAN play: the next frame's controllers of every player
 }
 
 }  // namespace app
