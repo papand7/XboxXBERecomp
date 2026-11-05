@@ -463,7 +463,7 @@ struct Tex {
     uint64_t key = 0;      // its texture pack name (TextureKey), what mods/reflections.toml lists
     float glass = 0;       // how much its alpha looks like window glass, 0 to 1 (GlassScore)
     bool solid = false;    // its alpha is all 1 (or it has none): drawn blended, it still covers
-    uint8_t detail = 0;    // its ground detail's kind (gpu::TextureDetail), 0 none
+    uint8_t detail = 0;    // its ground detail's kind (gpu::TextureDetail), 0 none, kDetailUnknown not found yet
 };
 
 // a draw's four texture stages
@@ -1206,8 +1206,9 @@ const char* kDetailMain = R"(
 float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
     float2 uv0 = %s;
     float4 c = game_main(i, front%s);
-    float w = max(abs(i.wlin * wdepth.w), 1e-4);
-    float fade = saturate((pbr.z - w) / (pbr.z * 0.65));
+    // the view depth in metres (as the mask pass's); none nearer than a metre (the gun and hands in front)
+    float w = max(abs(i.wlin * wdepth.w * wdepth.z * 4096), 1e-4);
+    float fade = saturate((pbr.z - w) / (pbr.z * 0.65)) * saturate((w - 0.8) / 0.6);
     if (fade <= 0) return c;
     float aspect = pbr.y / pbr.x, tanv = 0.5774;
     float3 P = float3((i.pos.x * pbr.x * 2 - 1) * aspect * tanv * w, -(i.pos.y * pbr.y * 2 - 1) * tanv * w, w);
@@ -1672,6 +1673,7 @@ private:
     uint64_t perf_glow_ = 0;
     uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0, perf_reflect_ = 0, perf_soft_ = 0,
              perf_mat_ = 0;  // draws by kind
+    uint64_t perf_det_[4] = {};  // ground detail: tagged 3D draws, not opaque, no free stage, drawn
     std::chrono::steady_clock::time_point perf_t_ = std::chrono::steady_clock::now();
     void LogPerf();
     friend VkBool32 VKAPI_PTR DebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -3399,13 +3401,13 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
             tx.sig = sig;
             UploadTexture(tx, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr);
             tx.key = TextureKey(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.hash);
-            tx.detail = Style().ground_detail && !draw_2d_
-                            ? TextureDetail(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0)
-                            : 0;
+            tx.detail = kDetailUnknown;  // its kind found when first drawn with ground detail on
             TexturePackSeen(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr,
                             palette.hash);
         }
     }
+    if (tx.detail == kDetailUnknown && Style().ground_detail && !draw_2d_)
+        tx.detail = TextureDetail(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0);
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
     stages.levels[stage] = tx.levels;
     if (fi.depth) stages.info[stage].shadow = ShadowDepthKind(d.format);
@@ -3832,11 +3834,16 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         }
     }
     // ground detail: a tagged texture's kind, read from a stage the draw leaves free (not over a pack's material)
+    if (mat_slot < 0 && st.ground_detail && !draw_2d_ && stage_seen_ && stage_detail_ && stage_detail_ < kDetailKinds && bound_rt_ && k.zen) {
+        perf_det_[0]++;
+        if (!(Opaque(k) || stage_solid_)) perf_det_[1]++;
+    }
     if (mat_slot < 0 && st.ground_detail && st.mode != kStyleRetro && !draw_2d_ && stage_seen_ && stage_detail_ &&
         stage_detail_ < kDetailKinds && bound_rt_ && k.zen && (Opaque(k) || stage_solid_)) {
         int slot = -1;
         for (int i = 3; i >= 1 && slot < 0; i--)
             if (!stages.view[i] && pk.tex[i].kind == kTexNone) slot = i;
+        if (slot < 0) perf_det_[2]++;
         VkImageView dv = slot >= 0 ? DetailView(stage_detail_) : VK_NULL_HANDLE;
         uint64_t dh = dv ? DetailShader(sh, pk, slot) : 0;
         if (dh) {
@@ -3852,7 +3859,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
                 // XBE_DETAIL_SPLIT=1 (a test): the detail on the right half of the screen only (as a negative strength)
                 static const bool split = std::getenv("XBE_DETAIL_SPLIT") != nullptr;
                 c.pbr[3] = split ? -st.detail_strength : st.detail_strength;
-                perf_mat_++;
+                perf_mat_++, perf_det_[3]++;
             }
         }
     }
@@ -5058,6 +5065,9 @@ void VulkanBackend::LogPerf() {
          perf_2d_ / n, perf_prog_ / n, perf_fixed_ / n, perf_lit_ / n);
     LOGR("perf: vulkan soft particles a frame: %.1f, material draws %.1f, glowing draws %.1f", perf_soft_ / n,
          perf_mat_ / n, perf_glow_ / n);
+    LOGR("perf: vulkan ground detail a frame: %.1f tagged, %.1f not opaque, %.1f no free stage, %.1f drawn",
+         perf_det_[0] / n, perf_det_[1] / n, perf_det_[2] / n, perf_det_[3] / n);
+    for (uint64_t& d : perf_det_) d = 0;
     perf_soft_ = perf_mat_ = perf_glow_ = 0;
     LOGR("perf: vulkan reflective draws a frame: %.1f (3D %.0f, stage 0 seen %.0f, rt+ds %.0f, scene size %.0f, opaque %.0f, W-buffer %.0f)",
          perf_reflect_ / n, g_ssr_diag[0] / n, g_ssr_diag[1] / n, g_ssr_diag[2] / n, g_ssr_diag[3] / n, g_ssr_diag[4] / n,

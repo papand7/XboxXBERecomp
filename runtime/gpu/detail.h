@@ -9,6 +9,7 @@
 namespace gpu {
 
 enum DetailKind : uint8_t { kDetailNone, kDetailGrass, kDetailSnow, kDetailRock, kDetailDirt, kDetailConcrete, kDetailKinds };
+constexpr uint8_t kDetailUnknown = 0xFF;  // a texture not looked at yet
 
 // a texture's kind, found once from its level 0 (key: its TextureKey) or as mods/details.toml lists it; none for one
 // that is not a seamless tiling, solid picture of one of the kinds
