@@ -64,9 +64,13 @@ struct GraphicsStyle {
     float light_strength = 1.0f;  // 0 to 3
     // light shafts and fog (Vulkan; every style but Retro): rays from the sky and bright openings through the air, and
     // distance fog in the sky's colour
-    bool atmosphere = false;  // off: work in progress (too faint for its cost, PROGRESS.md 2026-11-05)
-    float shaft_strength = 1.0f;  // 0 to 3
+    bool atmosphere = true;       // fog (the shafts' strength 0: they were too faint for their cost)
+    float shaft_strength = 0.0f;  // 0 to 3
     float fog_strength = 0.5f;    // 0 to 1
+    // bounced light (Vulkan; every style but Retro): screen-space, what surrounds a surface at its distance lights it
+    // in its colour: rooms take on their lights' and walls' colour
+    bool bounce_light = true;
+    float bounce_strength = 1.0f;  // 0 to 3
     // materials (Vulkan; every style but Retro): a texture pack's normal and roughness maps (hd_pack --pbr) drawn over
     // the game's own lighting: bumps and a specular sheen; at the next start (the maps are read with the pack)
     bool materials = false;

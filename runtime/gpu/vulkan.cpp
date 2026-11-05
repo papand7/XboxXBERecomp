@@ -445,6 +445,7 @@ struct Target {
     Image glow, light_a, light_b, light_list;
     Image atmo[5];  // light shafts and fog: a quarter of the scene's size, then each half the one before
     Image atmo_pick;  // their lights: each quarter's bright centre, the sky's colour
+    Image bounce;     // bounced light: the gathered light, a quarter of the scene's size
     uint64_t glow_frame = 0;
 };
 
@@ -1027,6 +1028,66 @@ float4 ps(O i) : SV_Target {
 }
 )";
 
+// bounced light (VulkanBackend::BouncePass, GraphicsStyle::bounce_light): gather, at a quarter of the scene's size,
+// averages the scene's colour over a disc about each pixel (16 golden-angle taps, about 2 m across at its distance),
+// each tap by how near its distance is to the pixel's; comp lights the scene by it in its colour (the gathered light's
+// own brightness mostly taken out, so a room takes its colour more than it brightens). b1 p: [0] 1/width, 1/height,
+// strength, W-buffer; [1] aspect, seconds, test (XBE_GI_TEST=1 the left half with it, 2 the gathered light alone).
+// t0 the scene, t1 its depth, t2 the gathered light; s0 linear, s1 point
+const char* kBounceHlsl = R"(
+cbuffer P : register(b1) { float4 p[2]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D gathered : register(t2);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float viewz(float d) { return p[0].w != 0 ? d * 4096 : 1.0 / max(1.0 - d, 1e-6); }
+float noise(float2 v) { return frac(sin(dot(v, float2(12.9898, 78.233))) * 43758.5453); }
+float4 gather(O i) : SV_Target {
+    float2 uv = i.uv;
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    if (d >= 0.99999) return 0;
+    float z = viewz(d);
+    float r = clamp(0.866 * 1.0 / max(z, 0.1), 0.015, 0.22);  // a 1 m radius on screen (60 degrees tall)
+    float j = noise(uv * 517.0 + p[1].y);
+    float3 sum = 0;
+    float wsum = 0;
+    [unroll] for (int k = 0; k < 16; k++) {
+        float a = (k + j) * 2.39996, rr = r * sqrt((k + 0.5) / 16);
+        float2 q = uv + float2(cos(a) / p[1].x, sin(a)) * rr;
+        if (any(q < 0) || any(q > 1)) continue;
+        float ds = depthtex.SampleLevel(pt, q, 0);
+        if (ds >= 0.99999) continue;
+        float w = saturate(1 - abs(viewz(ds) - z) / (z * 0.5 + 0.5));
+        sum += scene.SampleLevel(ls, q, 0).rgb * w;
+        wsum += w;
+    }
+    return float4(wsum > 0 ? sum / wsum : 0, 1);
+}
+float4 comp(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    int test = int(p[1].z);
+    float3 g = gathered.SampleLevel(ls, uv, 0).rgb;
+    if (test == 2) return float4(g, 1);
+    if (d >= 0.99999 || (test == 1 && uv.x > 0.5)) return float4(c, 1);
+    // the surroundings' light in their colour, their brightness mostly taken out: a tint, a little light
+    float3 tint = g - luma(g) * 0.7;
+    float3 lit = c * (1 + tint * 2.2 * p[0].z) + c * luma(g) * 0.25 * p[0].z;
+    return float4(saturate(lit), 1);
+}
+)";
+
 // the reflection mask (VulkanBackend::DrawMask, RGBA16F): the draw's own pixel shader (renamed game_main) for its
 // coverage, out r its strength (DrawConstants::style z; w 1 for a surface drawn opaque, all of it covered) by that,
 // g b how its distance changes a pixel across and down (in parts of it: the surface's slope, exact where the depth
@@ -1545,6 +1606,7 @@ private:
     void StylePass(Target& rt, Target* ds);  // the style's own pass (StylePassWanted)
     void AtmospherePass(Target& rt, Target* ds);  // light shafts and fog (GraphicsStyle::atmosphere)
     void FocusPass(Target& rt, Target* ds);       // focus blur as a player aims (app::FocusBlur)
+    void BouncePass(Target& rt, Target* ds);      // bounced light (GraphicsStyle::bounce_light)
     // SMAA over the scene: its shaders (vs, edges, weights, blend) and lookup textures, made at the first use
     void SmaaPass(Target& rt);
     void MenuColorPass(Target& rt);
@@ -4579,6 +4641,7 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     End();
     Stamp(2);
     if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds);
+    if (Style().bounce_light && Style().mode != kStyleRetro) BouncePass(rt, ds);
     if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds);
     if (StylePassWanted()) StylePass(rt, ds);
     if (app::FocusBlur() > 0 && Style().mode != kStyleRetro) FocusPass(rt, ds);
@@ -4660,6 +4723,57 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
         if (!v && !null_descriptor_) v = dummy_.view;
     FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 40, views, 4);
     End();
+}
+
+// bounced light over the scene (kBounceHlsl): the light about each pixel gathered at a quarter size, then the scene lit
+void VulkanBackend::BouncePass(Target& rt, Target* ds) {
+    const GraphicsStyle& st = Style();
+    if (!ds || ds->w != rt.w || ds->h != rt.h) return;
+    uint64_t vh, gh, ch;
+    if (!Compile(kBounceHlsl, "vs", "vs_5_0", vh) || !Compile(kBounceHlsl, "gather", "ps_5_0", gh) ||
+        !Compile(kBounceHlsl, "comp", "ps_5_0", ch)) {
+        LOG_FIRST(1, "vulkan: the bounced light's passes did not compile; no bounced light");
+        return;
+    }
+    constexpr VkFormat kBounceFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkPipeline pg = PassPipeline({vh, gh, kBounceFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pc = PassPipeline({vh, ch, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pg || !pc) return;
+    uint32_t gw = std::max<uint32_t>(rt.w / 4, 1), gh2 = std::max<uint32_t>(rt.h / 4, 1);
+    if (rt.bounce.img && (rt.bounce.w != gw || rt.bounce.h != gh2)) DropImage(rt.bounce);
+    if (!rt.bounce.img && !MakeImage(rt.bounce, VK_IMAGE_TYPE_2D, kBounceFormat, gw, gh2, 1, 1, 1,
+                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        return;
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    static const int test = [] {
+        const char* e = std::getenv("XBE_GI_TEST");
+        return e && *e >= '1' && *e <= '2' ? *e - '0' : 0;
+    }();
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    float c[8] = {1.0f / rt.w, 1.0f / rt.h, st.bounce_strength, scene_wbuf_ ? 1.0f : 0.0f,
+                  float(rt.w) / float(rt.h), float(presents_ % 3600) / 60.0f, float(test), 0};
+    VkImageView gv[2] = {rt.fb.view, ds->res.view};
+    VkViewport gvp{0, 0, float(gw), float(gh2), 0, 1};
+    VkRect2D gsc{{0, 0}, {gw, gh2}};
+    FullScreen(pg, {rt.bounce.att, VK_NULL_HANDLE, gw, gh2}, gvp, gsc, c, 8, gv, 2);
+    End();
+    Barrier();
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[3] = {rt.fb.view, ds->res.view, rt.bounce.view};
+    FullScreen(pc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 8, views, 3);
+    End();
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: bounced light drawn (strength %.2f)", st.bounce_strength);
 }
 
 // focus blur over the scene (kFocusHlsl): what lies behind the crosshair's point, by app::FocusBlur
