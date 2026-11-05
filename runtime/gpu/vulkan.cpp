@@ -627,49 +627,6 @@ std::string LocateInputs(std::string src) {
     return src;
 }
 
-// Settings::menu_colors: a menu's finished frame recoloured blue and silver. Strong oranges, reds and golds turn blue
-// at their brightness, pale golds and creams silver; the game's greys stay. The front end's
-// movies hold faces as orange as the menus (Bond's on the main menu): they turn blue too. t0 the frame, s1 point.
-const char* kMenuColorHlsl = R"(
-Texture2D frame : register(t0);
-SamplerState ls : register(s0);
-SamplerState pt : register(s1);
-struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-O vs(uint id : SV_VertexID) {
-    O o;
-    float2 t = float2((id << 1) & 2, id & 2);
-    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
-    o.uv = t;
-    return o;
-}
-float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
-float3 hsv(float3 c) {
-    float4 k = float4(0, -1.0 / 3, 2.0 / 3, -1);
-    float4 p = lerp(float4(c.bg, k.wz), float4(c.gb, k.xy), step(c.b, c.g));
-    float4 q = lerp(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
-    float d = q.x - min(q.w, q.y);
-    return float3(abs(q.z + (q.w - q.y) / (6 * d + 1e-6)), d / (q.x + 1e-6), q.x);
-}
-float3 rgb(float3 c) { return c.z * lerp(1, saturate(abs(frac(c.x + float3(1, 2.0 / 3, 1.0 / 3)) * 6 - 3) - 1), c.y); }
-float4 ps(O i) : SV_Target {
-    float3 c = frame.SampleLevel(pt, i.uv, 0).rgb, h = hsv(c);
-    // warm: red through gold (hue -0.06 to 0.17)
-    float hue = frac(h.x + 0.06);
-    float warm = smoothstep(0.0, 0.03, hue) * (1 - smoothstep(0.2, 0.25, hue));
-    float strong = warm * smoothstep(0.5, 0.7, h.y);
-    float pale = warm * (1 - smoothstep(0.25, 0.4, h.y)) * smoothstep(0.65, 0.85, h.z);
-    // strong: blue, a deep red a navy and a gold a light steel blue; the brightness kept
-    float gold = smoothstep(0.08, 0.16, hue);
-    float3 b = rgb(float3(0.6 - 0.03 * gold, lerp(0.85, 0.45, gold * smoothstep(0.7, 0.95, h.z)), h.z));
-    b *= lerp(1, luma(c) / max(luma(b), 0.02), 0.55);
-    // pale: silver, a hint of blue
-    float3 s = luma(c).xxx * float3(0.94, 0.98, 1.04);
-    c = lerp(c, saturate(b), strong);
-    c = lerp(c, saturate(s), pale);
-    return float4(c, 1);
-}
-)";
-
 // The graphics styles' scene pass (style.h): the 3D scene, copied, drawn back over itself before the first HUD draw.
 // b1 p[8]: [0] mode, 1/width, 1/height, seconds; [1] exposure, tone map, contrast, saturation; [2] temperature,
 // sharpen, bloom, bloom threshold; [3] AO, AO radius, vignette, grain; [4] bands, outline px, internal edges, edge
@@ -1609,7 +1566,6 @@ private:
     void BouncePass(Target& rt, Target* ds);      // bounced light (GraphicsStyle::bounce_light)
     // SMAA over the scene: its shaders (vs, edges, weights, blend) and lookup textures, made at the first use
     void SmaaPass(Target& rt);
-    void MenuColorPass(Target& rt);
     bool EnsureSmaa();
     uint64_t smaa_h_[4] = {};
     bool smaa_tried_ = false, smaa_ok_ = false;
@@ -4474,7 +4430,6 @@ void VulkanBackend::Present(const Surface& front) {
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (ramp_dirty_) UploadGammaRamp();
     if (t && ScenePassWanted() && !post_done_ && scene_rt_ == t) ScenePass(*t, scene_ds_);
-    if (t && t->res.img && app::Get().menu_colors && app::kGame.menu_up && app::kGame.menu_up()) MenuColorPass(*t);
     // XBE_PAD_CMD's diagnostic: a file named shot beside the exe holding a PNG path gets the window's picture, as
     // shown (the settings window too), there
     static const bool shots = [] {
@@ -4943,34 +4898,6 @@ void VulkanBackend::SmaaPass(Target& rt) {
     VkImageView bv[2] = {rt.fb.view, rt.smaa_weights.view};
     FullScreen(blend, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, m, 4, bv, 2);
     End();
-}
-
-// Settings::menu_colors over the frame shown, a menu up
-void VulkanBackend::MenuColorPass(Target& rt) {
-    uint64_t vh, ph;
-    if (!Compile(kMenuColorHlsl, "vs", "vs_5_0", vh) || !Compile(kMenuColorHlsl, "ps", "ps_5_0", ph)) {
-        LOG_FIRST(1, "vulkan: the menu colours' pass did not compile; the menus are drawn as the game's");
-        return;
-    }
-    VkPipeline pipe = PassPipeline({vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
-    if (!pipe) return;
-    if (rt.fb.img && (rt.fb.w != rt.w || rt.fb.h != rt.h)) DropImage(rt.fb);
-    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
-                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
-        return;
-    End();
-    if (dirty_) Barrier();
-    VkImageCopy cp{};
-    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    cp.extent = {rt.w, rt.h, 1};
-    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-    dirty_ = true;
-    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
-    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
-    float c[4] = {};
-    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 4, &rt.fb.view, 1);
-    End();
-    ForgetDrawState();
 }
 
 // a timestamp of the frame slot being recorded: 0 frame start, 1 frame end, 2 scene pass start, 3 its end

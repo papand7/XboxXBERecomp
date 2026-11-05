@@ -48,7 +48,7 @@ struct Settings {
     bool show_fps = false;           // frames a second in a corner
     uint32_t hit_feedback = 2;       // a player's shot hitting (HitMarker): 0 nothing, 1 a mark, 2 a mark and a tick
     bool sharp_2d = true;            // GameInfo::sharpen_2d: the HUD's, menus' and text's pictures enlarged sharp
-    uint32_t menu_colors = 0;        // GameInfo::menu_up's screens recoloured (Vulkan): 0 as drawn, 1 blue and silver
+    uint32_t menu_colors = 0;        // the title's menus recoloured (its own texture_bound): 0 as drawn, 1 blue and silver
     uint32_t msaa = 0;               // 0 none, 1 2 3 MSAA 2x 4x 8x on the scene
     bool fxaa = false;               // FXAA on the finished frame
     bool smaa = false;               // SMAA on the 3D scene before the HUD (the Vulkan renderer)
