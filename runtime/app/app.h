@@ -48,6 +48,7 @@ struct Settings {
     bool show_fps = false;           // frames a second in a corner
     uint32_t hit_feedback = 2;       // a player's shot hitting (HitMarker): 0 nothing, 1 a mark, 2 a mark and a tick
     bool sharp_2d = true;            // GameInfo::sharpen_2d: the HUD's, menus' and text's pictures enlarged sharp
+    uint32_t menu_colors = 0;        // GameInfo::menu_up's screens recoloured (Vulkan): 0 as drawn, 1 blue and silver
     uint32_t msaa = 0;               // 0 none, 1 2 3 MSAA 2x 4x 8x on the scene
     bool fxaa = false;               // FXAA on the finished frame
     bool smaa = false;               // SMAA on the 3D scene before the HUD (the Vulkan renderer)
@@ -107,6 +108,10 @@ void DrawHud(double fps);         // the frame counter, inside the ImGui frame (
 // hit feedback (hit_marker.cpp): a game's hook when a local player's shot hits a character, at that player's
 // crosshair (x, y the shown frame's fractions); kind 0 a hit, 1 the head, 2 a kill
 void HitMarker(float x, float y, int kind);
+// focus blur (hit_marker.cpp): a game's hook sets how much (0 to 1) what lies behind the crosshair's point is blurred
+// this frame, as a player aims down the sights (one view); the Vulkan renderer draws it over the 3D scene
+void SetFocusBlur(float amount);
+float FocusBlur();
 void DrawHitMarkers();                          // inside the ImGui frame, from DrawHud
 void MixHitSound(float* out, uint32_t frames);  // the ticks into the mixer's stereo output
 void FeedPad();                   // controllers to the settings window's navigation, before each ImGui frame

@@ -88,7 +88,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "retro_tint", "vertex_snap", "texture_pack", "dump_textures", "quality",
                                   "quality_ao", "quality_bloom", "reflections", "reflection_strength",
                                   "reflections_auto", "soft_particles", "particle_fade",
-                                  "effect_lights", "light_strength",
+                                  "effect_lights", "light_strength", "atmosphere", "shaft_strength", "fog_strength",
                                   "materials", "material_strength", "surface_depth"};
     for (auto&& [k, v] : t) {
         bool ok = false;
@@ -154,6 +154,9 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     num("particle_fade", s.particle_fade);
     flag("effect_lights", s.effect_lights);
     num("light_strength", s.light_strength);
+    flag("atmosphere", s.atmosphere);
+    num("shaft_strength", s.shaft_strength);
+    num("fog_strength", s.fog_strength);
     flag("materials", s.materials);
     num("material_strength", s.material_strength);
     num("surface_depth", s.surface_depth);
@@ -200,6 +203,9 @@ toml::table Write(const GraphicsStyle& s) {
                        {"particle_fade", double(s.particle_fade)},
                        {"effect_lights", s.effect_lights},
                        {"light_strength", double(s.light_strength)},
+                       {"atmosphere", s.atmosphere},
+                       {"shaft_strength", double(s.shaft_strength)},
+                       {"fog_strength", double(s.fog_strength)},
                        {"materials", s.materials},
                        {"material_strength", double(s.material_strength)},
                        {"surface_depth", double(s.surface_depth)}};
@@ -400,6 +406,9 @@ void ApplyPreset(const StylePreset& p) {
     g_style.particle_fade = keep.particle_fade;
     g_style.effect_lights = keep.effect_lights;
     g_style.light_strength = keep.light_strength;
+    g_style.atmosphere = keep.atmosphere;
+    g_style.shaft_strength = keep.shaft_strength;
+    g_style.fog_strength = keep.fog_strength;
     g_style.materials = keep.materials;
     g_style.material_strength = keep.material_strength;
     g_style.surface_depth = keep.surface_depth;
@@ -469,7 +478,9 @@ bool StylePassWanted() {
            (g_style.reflections != kReflectOff && g_style.mode != kStyleRetro);
 }
 bool ScenePassWanted() {
-    return StylePassWanted() || ((app::Get().smaa || g_style.effect_lights) && g_style.mode != kStyleRetro);
+    return StylePassWanted() ||
+           ((app::Get().smaa || g_style.effect_lights || g_style.atmosphere || app::FocusBlur() > 0) &&
+            g_style.mode != kStyleRetro);
 }
 float QualityAo(const GraphicsStyle& s) {
     static const float levels[3] = {0.0f, 0.5f, 0.9f};
@@ -662,6 +673,12 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::Checkbox("Effect lights", &s.effect_lights);
         changed |= ImGui::SliderFloat("Light strength", &s.light_strength, 0.0f, 3.0f, "%.2f");
         ImGui::TextDisabled("Flashes, fire and lamps' glows light walls and characters near them (Vulkan).");
+    }
+    if (ImGui::CollapsingHeader("Atmosphere", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::Checkbox("Light shafts and fog", &s.atmosphere);
+        changed |= ImGui::SliderFloat("Shafts", &s.shaft_strength, 0.0f, 3.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Fog", &s.fog_strength, 0.0f, 1.0f, "%.2f");
+        ImGui::TextDisabled("Rays from the sky and bright openings, distance fog in the sky's colour (Vulkan).");
     }
     if (ImGui::CollapsingHeader("Materials (PBR)", ImGuiTreeNodeFlags_DefaultOpen)) {
         changed |= ImGui::Checkbox("Normal and roughness maps", &s.materials);

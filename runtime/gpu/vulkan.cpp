@@ -443,6 +443,8 @@ struct Target {
     // distance), cleared at the frame's first; the lights it makes, a tile each (RGBA32F: colour and brightness;
     // where, as the screen's fractions and the distance)
     Image glow, light_a, light_b, light_list;
+    Image atmo[5];  // light shafts and fog: a quarter of the scene's size, then each half the one before
+    Image atmo_pick;  // their lights: each quarter's bright centre, the sky's colour
     uint64_t glow_frame = 0;
 };
 
@@ -623,6 +625,49 @@ std::string LocateInputs(std::string src) {
     }
     return src;
 }
+
+// Settings::menu_colors: a menu's finished frame recoloured blue and silver. Strong oranges, reds and golds turn blue
+// at their brightness, pale golds and creams silver; the game's greys stay. The front end's
+// movies hold faces as orange as the menus (Bond's on the main menu): they turn blue too. t0 the frame, s1 point.
+const char* kMenuColorHlsl = R"(
+Texture2D frame : register(t0);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float3 hsv(float3 c) {
+    float4 k = float4(0, -1.0 / 3, 2.0 / 3, -1);
+    float4 p = lerp(float4(c.bg, k.wz), float4(c.gb, k.xy), step(c.b, c.g));
+    float4 q = lerp(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    return float3(abs(q.z + (q.w - q.y) / (6 * d + 1e-6)), d / (q.x + 1e-6), q.x);
+}
+float3 rgb(float3 c) { return c.z * lerp(1, saturate(abs(frac(c.x + float3(1, 2.0 / 3, 1.0 / 3)) * 6 - 3) - 1), c.y); }
+float4 ps(O i) : SV_Target {
+    float3 c = frame.SampleLevel(pt, i.uv, 0).rgb, h = hsv(c);
+    // warm: red through gold (hue -0.06 to 0.17)
+    float hue = frac(h.x + 0.06);
+    float warm = smoothstep(0.0, 0.03, hue) * (1 - smoothstep(0.2, 0.25, hue));
+    float strong = warm * smoothstep(0.5, 0.7, h.y);
+    float pale = warm * (1 - smoothstep(0.25, 0.4, h.y)) * smoothstep(0.65, 0.85, h.z);
+    // strong: blue, a deep red a navy and a gold a light steel blue; the brightness kept
+    float gold = smoothstep(0.08, 0.16, hue);
+    float3 b = rgb(float3(0.6 - 0.03 * gold, lerp(0.85, 0.45, gold * smoothstep(0.7, 0.95, h.z)), h.z));
+    b *= lerp(1, luma(c) / max(luma(b), 0.02), 0.55);
+    // pale: silver, a hint of blue
+    float3 s = luma(c).xxx * float3(0.94, 0.98, 1.04);
+    c = lerp(c, saturate(b), strong);
+    c = lerp(c, saturate(s), pale);
+    return float4(c, 1);
+}
+)";
 
 // The graphics styles' scene pass (style.h): the 3D scene, copied, drawn back over itself before the first HUD draw.
 // b1 p[8]: [0] mode, 1/width, 1/height, seconds; [1] exposure, tone map, contrast, saturation; [2] temperature,
@@ -824,6 +869,161 @@ float4 ps(O i) : SV_Target {
     c *= 1 - p[3].z * smoothstep(0.35, 1.0, v);
     c += (noise(uv * 1000 + p[0].w) - 0.5) * p[3].w * 0.12;
     return float4(saturate(c), 1);
+}
+)";
+
+// light shafts and fog (VulkanBackend::AtmospherePass, RGBA16F images): src makes a quarter-size picture of what
+// lights the air (the sky, by its brightness, and the brightest surfaces: lamps, windows) as colour times weight, a
+// the weight; down halves it, four times, to a field whose slope points to the light; comp marches each pixel up that
+// slope through the quarter picture (the shafts: what lies between it and the light, fading) and fogs it by its
+// distance in the colour of the sky about it. b1 p: [0] 1/width, 1/height, shafts, fog; [1] W-buffer, seconds,
+// 1/field width, 1/field height; [2] fog's density, the source's sky threshold, the light's reach, aspect.
+// t0 the scene (src, comp) or the level below (down), t1 depth, t2 the quarter picture, t3 the field; s0 linear, s1 point
+const char* kAtmoHlsl = R"(
+cbuffer P : register(b1) { float4 p[4]; };
+Texture2D t0 : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D src4 : register(t2);
+Texture2D field : register(t3);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float linz(float d) { return 1.0 / max(1.0 - d, 1e-6); }
+float viewz(float d) { return p[1].x != 0 ? d * 4096 : linz(d); }
+float noise(float2 v) { return frac(sin(dot(v, float2(12.9898, 78.233))) * 43758.5453); }
+float4 src(O i) : SV_Target {
+    float2 px = p[0].xy;
+    float4 acc = 0;
+    [unroll] for (int k = 0; k < 4; k++) {
+        float2 uv = i.uv + (float2(k & 1, k >> 1) - 0.5) * 2 * px;
+        float3 c = t0.SampleLevel(ls, uv, 0).rgb;
+        float d = depthtex.SampleLevel(pt, uv, 0), l = luma(c);
+        float w = d >= 0.99999 ? smoothstep(p[2].y * 0.5, p[2].y + 0.3, l) : 0.8 * smoothstep(0.75, 0.95, l);
+        acc += float4(c * w, w);
+    }
+    return acc / 4;
+}
+float4 down(O i) : SV_Target {
+    float2 px = p[0].xy;
+    float4 s = 0;
+    [unroll] for (int k = 0; k < 4; k++) s += t0.SampleLevel(ls, i.uv + (float2(k & 1, k >> 1) - 0.5) * px, 0);
+    return s / 4;
+}
+// the lights: texel i (0-3) the bright centre of the picture's quarter i (field-weighted uv, its weight), texel 4 the
+// sky's colour over all of it; from the field (t0, p[1].zw its texel)
+float4 pick(O i) : SV_Target {
+    int k = int(i.pos.x);
+    uint fw = uint(1 / p[1].z + 0.5), fh = uint(1 / p[1].w + 0.5);
+    float4 acc = 0;
+    float2 best = 0.5;
+    float most = 0;
+    for (uint y = 0; y < fh; y++)
+        for (uint x = 0; x < fw; x++) {
+            float2 uv = (float2(x, y) + 0.5) * p[1].zw;
+            if (k < 4 && (uint(uv.x >= 0.5) != uint(k & 1) || uint(uv.y >= 0.5) != uint(k >> 1))) continue;
+            float4 s = t0.Load(int3(x, y, 0));
+            acc += s;
+            if (s.a > most) most = s.a, best = uv;
+        }
+    if (k == 4) return float4(acc.a > 1e-4 ? acc.rgb / acc.a : float3(0.45, 0.5, 0.55), acc.a);
+    return float4(best, most, 0);  // the quarter's brightest spot: its light (a lamp, an opening, the sun's sky)
+}
+float4 comp(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 c = t0.SampleLevel(pt, uv, 0).rgb;
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    bool sky = d >= 0.99999;
+    float3 skyc = field.Load(int3(4, 0, 0)).rgb;
+    // the shafts: from each quarter's light toward this pixel through the quarter picture, what lies between cutting
+    // them into rays (GPU Gems 3, 13)
+    float3 sh = 0;
+    if (p[0].z > 0) {
+        float j = noise(uv * 613.0 + p[1].y);
+        [unroll] for (int k = 0; k < 4; k++) {
+            float4 L = field.Load(int3(k, 0, 0));
+            if (L.z < 0.02) continue;
+            float2 delta = (uv - L.xy) * (0.85 / 32);
+            float2 q = uv - delta * j;
+            float3 acc = 0;
+            float decay = 1;
+            [loop] for (int s = 0; s < 32; s++) {
+                q -= delta;
+                acc += src4.SampleLevel(ls, q, 0).rgb * decay;
+                decay *= 0.965;
+            }
+            sh += acc / 32 * saturate(L.z * 4);
+        }
+        sh *= p[0].z * 1.6;
+    }
+    // the fog: by distance, the sky's colour, not over the sky itself
+    float z = sky ? 0 : viewz(d);
+    float fog = sky ? 0 : (1 - exp(-z * p[2].x)) * p[0].w;
+    float3 orig = c;
+    c = lerp(c, skyc, saturate(fog));
+    c += sh * (sky ? 0.35 : 1.0) * (1 - luma(c) * 0.8);  // into the darks more than over what is bright already
+    int test = int(p[3].x);
+    if (test == 1 && uv.x > 0.5) c = orig;              // XBE_ATMO_TEST=1: the left half with them, the right without
+    if (test == 2) c = float3(saturate(fog), saturate(z / 200), sky ? 1 : 0);  // 2: the fog (r), distance / 200 (g)
+    if (test == 3) c = sh;                               // 3: the shafts alone
+    return float4(saturate(c), 1);
+}
+)";
+
+// focus blur (VulkanBackend::FocusPass, app::FocusBlur): what lies behind the point under the crosshair (the
+// distance at the picture's middle, five taps) blurred by how far behind it is, over a disc of 24 golden-angle taps,
+// a tap nearer than the point not taken (the gun and the target stay sharp). b1 p: [0] 1/width, 1/height, amount,
+// W-buffer; [1] the widest radius in pixels, the nearest a focus may be (the gun is nearer). t0 the scene, t1 its depth; s0 linear, s1 point
+const char* kFocusHlsl = R"(
+cbuffer P : register(b1) { float4 p[2]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float viewz(float d) { return d >= 0.99999 ? 1e6 : p[0].w != 0 ? d * 4096 : 1.0 / max(1.0 - d, 1e-6); }
+float zat(float2 uv) { return viewz(depthtex.SampleLevel(pt, uv, 0)); }
+float4 ps(O i) : SV_Target {
+    float2 uv = i.uv, px = p[0].xy;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    // the point aimed at: the nearest of taps about the middle and just above it (the raised gun lies just below),
+    // not the gun itself (nearer than p[1].y)
+    float zf = 1e7;
+    [unroll] for (int t = 0; t < 7; t++) {
+        float2 q = float2(0.5 + float(t % 3 - 1) * 0.02, 0.5 - float(t / 3) * 0.025);
+        float zt = zat(q);
+        if (zt > p[1].y) zf = min(zf, zt);
+    }
+    if (zf > 1e6) return float4(c, 1);  // nothing but the gun or the sky ahead: nothing to focus on
+    zf = min(zf, 5000);
+    float z = zat(uv);
+    float coc = saturate((z - zf * 1.08) / (zf * 1.2)) * p[0].z;
+    if (coc < 0.02) return float4(c, 1);
+    float r = coc * p[1].x;
+    float3 sum = c;
+    float wsum = 1;
+    [unroll] for (int k = 1; k <= 24; k++) {
+        float a = k * 2.39996, rr = r * sqrt(k / 24.0);
+        float2 q = uv + float2(cos(a), sin(a)) * rr * px;
+        float w = zat(q) > zf * 1.04 ? 1 : 0;  // not the nearer things: no halo of the target or the gun
+        sum += scene.SampleLevel(ls, q, 0).rgb * w;
+        wsum += w;
+    }
+    return float4(sum / wsum, 1);
 }
 )";
 
@@ -1343,8 +1543,11 @@ private:
     bool post_done_ = false;
     void ScenePass(Target& rt, Target* ds);
     void StylePass(Target& rt, Target* ds);  // the style's own pass (StylePassWanted)
+    void AtmospherePass(Target& rt, Target* ds);  // light shafts and fog (GraphicsStyle::atmosphere)
+    void FocusPass(Target& rt, Target* ds);       // focus blur as a player aims (app::FocusBlur)
     // SMAA over the scene: its shaders (vs, edges, weights, blend) and lookup textures, made at the first use
     void SmaaPass(Target& rt);
+    void MenuColorPass(Target& rt);
     bool EnsureSmaa();
     uint64_t smaa_h_[4] = {};
     bool smaa_tried_ = false, smaa_ok_ = false;
@@ -4209,6 +4412,7 @@ void VulkanBackend::Present(const Surface& front) {
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (ramp_dirty_) UploadGammaRamp();
     if (t && ScenePassWanted() && !post_done_ && scene_rt_ == t) ScenePass(*t, scene_ds_);
+    if (t && t->res.img && app::Get().menu_colors && app::kGame.menu_up && app::kGame.menu_up()) MenuColorPass(*t);
     // XBE_PAD_CMD's diagnostic: a file named shot beside the exe holding a PNG path gets the window's picture, as
     // shown (the settings window too), there
     static const bool shots = [] {
@@ -4375,7 +4579,9 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     End();
     Stamp(2);
     if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds);
+    if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds);
     if (StylePassWanted()) StylePass(rt, ds);
+    if (app::FocusBlur() > 0 && Style().mode != kStyleRetro) FocusPass(rt, ds);
     if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt);
     End();
     Stamp(3);
@@ -4456,6 +4662,108 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
     End();
 }
 
+// focus blur over the scene (kFocusHlsl): what lies behind the crosshair's point, by app::FocusBlur
+void VulkanBackend::FocusPass(Target& rt, Target* ds) {
+    if (!ds || ds->w != rt.w || ds->h != rt.h) return;
+    uint64_t vh, ph;
+    if (!Compile(kFocusHlsl, "vs", "vs_5_0", vh) || !Compile(kFocusHlsl, "ps", "ps_5_0", ph)) {
+        LOG_FIRST(1, "vulkan: the focus blur's pass did not compile; no focus blur");
+        return;
+    }
+    VkPipeline pipe = PassPipeline({vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pipe) return;
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    float k = float(rt.h) / float(rt.gh);  // host pixels per console pixel
+    float c[8] = {1.0f / rt.w, 1.0f / rt.h, app::FocusBlur(), scene_wbuf_ ? 1.0f : 0.0f, 7.0f * k, 2.0f, 0, 0};
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[2] = {rt.fb.view, ds->res.view};
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 8, views, 2);
+    End();
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: focus blur drawn (aiming down the sights)");
+}
+
+// light shafts and fog over the scene: what lights the air at a quarter size, halved four times to a field that
+// points to the light, then the scene marched toward it and fogged (kAtmoHlsl)
+void VulkanBackend::AtmospherePass(Target& rt, Target* ds) {
+    const GraphicsStyle& st = Style();
+    if (!ds || ds->w != rt.w || ds->h != rt.h) return;
+    uint64_t vh, sh, dh, ch, kh;
+    if (!Compile(kAtmoHlsl, "vs", "vs_5_0", vh) || !Compile(kAtmoHlsl, "src", "ps_5_0", sh) ||
+        !Compile(kAtmoHlsl, "down", "ps_5_0", dh) || !Compile(kAtmoHlsl, "comp", "ps_5_0", ch) ||
+        !Compile(kAtmoHlsl, "pick", "ps_5_0", kh)) {
+        LOG_FIRST(1, "vulkan: the light shafts' passes did not compile; no shafts or fog");
+        return;
+    }
+    constexpr VkFormat kAtmoFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkPipeline ps = PassPipeline({vh, sh, kAtmoFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pd = PassPipeline({vh, dh, kAtmoFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pc = PassPipeline({vh, ch, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pk = PassPipeline({vh, kh, VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!ps || !pd || !pc || !pk) return;
+    if (!rt.atmo_pick.img && !MakeImage(rt.atmo_pick, VK_IMAGE_TYPE_2D, VK_FORMAT_R32G32B32A32_SFLOAT, 5, 1, 1, 1, 1,
+                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        return;
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    for (uint32_t k = 0; k < 5; k++) {
+        uint32_t w = std::max<uint32_t>(rt.w >> (2 + k), 1), h = std::max<uint32_t>(rt.h >> (2 + k), 1);
+        Image& im = rt.atmo[k];
+        if (im.img && (im.w != w || im.h != h)) DropImage(im);
+        if (!im.img && !MakeImage(im, VK_IMAGE_TYPE_2D, kAtmoFormat, w, h, 1, 1, 1, u)) return;
+    }
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    const Image& field = rt.atmo[4];
+    static const int test = [] {
+        const char* e = std::getenv("XBE_ATMO_TEST");
+        return e && *e >= '1' && *e <= '3' ? *e - '0' : 0;
+    }();
+    float c[16] = {1.0f / rt.w, 1.0f / rt.h, st.shaft_strength, st.fog_strength,
+                   scene_wbuf_ ? 1.0f : 0.0f, float(presents_ % 3600) / 60.0f, 1.0f / field.w, 1.0f / field.h,
+                   0.006f, 0.35f, 0.55f, float(rt.w) / float(rt.h), float(test), 0, 0, 0};
+    auto pass = [&](VkPipeline p, const Image& dst, const VkImageView* views, uint32_t n, float pxw, float pxh) {
+        float cc[16];
+        std::memcpy(cc, c, sizeof cc);
+        cc[0] = pxw, cc[1] = pxh;
+        VkViewport vp{0, 0, float(dst.w), float(dst.h), 0, 1};
+        VkRect2D sc{{0, 0}, {dst.w, dst.h}};
+        FullScreen(p, {dst.att, VK_NULL_HANDLE, dst.w, dst.h}, vp, sc, cc, 16, views, n);
+        End();
+        Barrier();
+    };
+    VkImageView sv[2] = {rt.fb.view, ds->res.view};
+    pass(ps, rt.atmo[0], sv, 2, 1.0f / rt.w, 1.0f / rt.h);
+    for (int k = 1; k < 5; k++) pass(pd, rt.atmo[k], &rt.atmo[k - 1].view, 1, 1.0f / rt.atmo[k - 1].w, 1.0f / rt.atmo[k - 1].h);
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    pass(pk, rt.atmo_pick, &field.view, 1, 1.0f / field.w, 1.0f / field.h);
+    VkImageView views[4] = {rt.fb.view, ds->res.view, rt.atmo[0].view, rt.atmo_pick.view};
+    FullScreen(pc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4);
+    End();
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: light shafts and fog drawn (shafts %.2f, fog %.2f)", st.shaft_strength, st.fog_strength);
+}
+
 // SMAA's shaders and lookup textures, once
 bool VulkanBackend::EnsureSmaa() {
     if (smaa_tried_) return smaa_ok_;
@@ -4521,6 +4829,34 @@ void VulkanBackend::SmaaPass(Target& rt) {
     VkImageView bv[2] = {rt.fb.view, rt.smaa_weights.view};
     FullScreen(blend, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, m, 4, bv, 2);
     End();
+}
+
+// Settings::menu_colors over the frame shown, a menu up
+void VulkanBackend::MenuColorPass(Target& rt) {
+    uint64_t vh, ph;
+    if (!Compile(kMenuColorHlsl, "vs", "vs_5_0", vh) || !Compile(kMenuColorHlsl, "ps", "ps_5_0", ph)) {
+        LOG_FIRST(1, "vulkan: the menu colours' pass did not compile; the menus are drawn as the game's");
+        return;
+    }
+    VkPipeline pipe = PassPipeline({vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pipe) return;
+    if (rt.fb.img && (rt.fb.w != rt.w || rt.fb.h != rt.h)) DropImage(rt.fb);
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    float c[4] = {};
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 4, &rt.fb.view, 1);
+    End();
+    ForgetDrawState();
 }
 
 // a timestamp of the frame slot being recorded: 0 frame start, 1 frame end, 2 scene pass start, 3 its end

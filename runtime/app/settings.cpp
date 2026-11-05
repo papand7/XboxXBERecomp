@@ -234,6 +234,7 @@ void Load() {
     s.show_fps = t["show_fps"].value_or(s.show_fps);
     s.hit_feedback = std::min<uint32_t>(t["hit_feedback"].value_or(s.hit_feedback), 2);
     s.sharp_2d = t["sharp_2d"].value_or(s.sharp_2d);
+    s.menu_colors = std::min<uint32_t>(t["menu_colors"].value_or(s.menu_colors), 1);
     // only a language the title has (GameInfo::languages): the console's setting goes to the guest as it is
     if (uint32_t l = t["language"].value_or(s.language); !kGame.languages.empty()) {
         const auto& ls = kGame.languages;
@@ -336,6 +337,7 @@ toml::table Table() {
                   {"show_fps", s.show_fps},
                   {"hit_feedback", int64_t(s.hit_feedback)},
                   {"sharp_2d", s.sharp_2d},
+                  {"menu_colors", int64_t(s.menu_colors)},
                   {"language", int64_t(s.language)},
                   {"msaa", kMsaa[s.msaa % kMsaaCount]},
                   {"fxaa", s.fxaa},

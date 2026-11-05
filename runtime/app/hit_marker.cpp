@@ -2,6 +2,7 @@
 // A mark of four strokes around that player's crosshair, drawn over the HUD in the ImGui frame (white a hit, amber
 // the head, red a kill), and a short tick made here (no sample of the game's), mixed into the sound the mixer hands
 // the output.
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -63,6 +64,12 @@ const std::vector<float>& Sound(int kind) {
 }
 
 }  // namespace
+
+namespace {
+std::atomic<float> g_focus_blur{0};
+}
+void SetFocusBlur(float amount) { g_focus_blur.store(std::clamp(amount, 0.0f, 1.0f), std::memory_order_relaxed); }
+float FocusBlur() { return g_focus_blur.load(std::memory_order_relaxed); }
 
 void HitMarker(float x, float y, int kind) {
     uint32_t mode = Get().hit_feedback;

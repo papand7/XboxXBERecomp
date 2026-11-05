@@ -62,6 +62,11 @@ struct GraphicsStyle {
     float particle_fade = 0.03f;
     bool effect_lights = false;   // glowing effects (flashes, fire, lamps' glows) light what is near them (Vulkan)
     float light_strength = 1.0f;  // 0 to 3
+    // light shafts and fog (Vulkan; every style but Retro): rays from the sky and bright openings through the air, and
+    // distance fog in the sky's colour
+    bool atmosphere = false;  // off: work in progress (too faint for its cost, PROGRESS.md 2026-11-05)
+    float shaft_strength = 1.0f;  // 0 to 3
+    float fog_strength = 0.5f;    // 0 to 1
     // materials (Vulkan; every style but Retro): a texture pack's normal and roughness maps (hd_pack --pbr) drawn over
     // the game's own lighting: bumps and a specular sheen; at the next start (the maps are read with the pack)
     bool materials = false;
