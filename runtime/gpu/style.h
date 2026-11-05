@@ -76,6 +76,11 @@ struct GraphicsStyle {
     bool materials = false;
     float material_strength = 0.7f;
     float surface_depth = 0.0f;  // relief: parallax occlusion mapping of the height map, 0 off to 2
+    // ground detail (Vulkan; every style but Retro): the scenery's tiling textures get fine detail and bumps up close
+    // by their kind (grass, snow, rock, dirt, concrete: gpu/detail.h), fading out by detail_distance metres
+    bool ground_detail = false;  // off until it is checked on screen
+    float detail_strength = 0.6f;   // 0 to 1
+    float detail_distance = 14.0f;  // metres
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;

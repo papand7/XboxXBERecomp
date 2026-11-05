@@ -53,6 +53,7 @@
 #include "gpu/style.h"
 #include "gpu/texture.h"
 #include "gpu/texture_pack.h"
+#include "gpu/detail.h"
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 
@@ -462,6 +463,7 @@ struct Tex {
     uint64_t key = 0;      // its texture pack name (TextureKey), what mods/reflections.toml lists
     float glass = 0;       // how much its alpha looks like window glass, 0 to 1 (GlassScore)
     bool solid = false;    // its alpha is all 1 (or it has none): drawn blended, it still covers
+    uint8_t detail = 0;    // its ground detail's kind (gpu::TextureDetail), 0 none
 };
 
 // a draw's four texture stages
@@ -1195,6 +1197,45 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
     return c;
 }
 )";
+// ground detail (VulkanBackend::DetailShader): the draw's own pixel shader (renamed game_main), then its texture's
+// kind of detail (tex%d: normal xy, brightness, height) at four times the texture's own tiling: the bumped normal's
+// light from above the view and from the camera against the flat one's scales the colour (the material shader's
+// frame and light), and the detail's brightness too, both fading out from the camera to pbr.z (metres); pbr.w how
+// strong. The colour is the game's, so the detail takes each texture's own tint
+const char* kDetailMain = R"(
+float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
+    float2 uv0 = %s;
+    float4 c = game_main(i, front%s);
+    float w = max(abs(i.wlin * wdepth.w), 1e-4);
+    float fade = saturate((pbr.z - w) / (pbr.z * 0.65));
+    if (fade <= 0) return c;
+    float aspect = pbr.y / pbr.x, tanv = 0.5774;
+    float3 P = float3((i.pos.x * pbr.x * 2 - 1) * aspect * tanv * w, -(i.pos.y * pbr.y * 2 - 1) * tanv * w, w);
+    float3 dpx = ddx(P), dpy = ddy(P);
+    float2 dux = ddx(uv0), duy = ddy(uv0);
+    float3 Ng = normalize(cross(dpx, dpy));
+    if (dot(Ng, P) > 0) Ng = -Ng;
+    float3 t1 = cross(dpy, Ng), t2 = cross(Ng, dpx);
+    float3 T = t1 * dux.x + t2 * duy.x, B = t1 * dux.y + t2 * duy.y;
+    float inv = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-20));
+    T *= inv, B *= inv;
+    float2 duv = uv0 * 4;
+    float4 m = tex%d.SampleGrad(smp%d, frac(duv), dux * 4, duy * 4);
+    float3 nt = float3(m.rg * 2 - 1, 0);
+    nt.z = sqrt(saturate(1 - dot(nt.xy, nt.xy)));
+    float3 N = normalize(T * nt.x + B * nt.y + Ng * nt.z);
+    if (any(isnan(N))) N = Ng;
+    float3 V = normalize(-P), L = normalize(float3(0.3, 0.8, -0.5));
+    float flat = 0.6 * saturate(dot(Ng, L)) + 0.4 * saturate(dot(Ng, V)) + 0.15;
+    float bump = 0.6 * saturate(dot(N, L)) + 0.4 * saturate(dot(N, V)) + 0.15;
+    if (pbr.w < 0 && i.pos.x * pbr.x < 0.5) return c;
+    float k = abs(pbr.w) * fade;
+    float shade = clamp(lerp(1, bump / max(flat, 0.05), k), 0.5, 1.6);
+    float bright = 1 + (m.b - 0.5) * 1.6 * k;
+    c.rgb *= shade * bright;
+    return c;
+}
+)";
 // materials (VulkanBackend::MaterialShader): the draw's own pixel shader (renamed game_main) with the pack picture's
 // material (tex%d: normal xy, roughness, height). The surface's frame is made from the screen derivatives of its
 // position (the view taken as 60 degrees) and of its texture coordinates (a cotangent frame). Relief (pbr.z above 0):
@@ -1260,6 +1301,7 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
 }
 )";
 constexpr uint64_t kMatKeySalt = 0x6D6174657269616Cull;  // "material"
+constexpr uint64_t kDetailKeySalt = 0x64657461696C7321ull;  // "details!"
 constexpr uint64_t kSoftKeySalt = 0x736F667470617274ull;  // "softpart"
 constexpr uint64_t kMaskKeySalt = 0x6D61736B6D61736Cull;
 constexpr uint64_t kGlowKeySalt = 0x676C6F776C696768ull;  // "glowligh"
@@ -1572,6 +1614,7 @@ private:
     Image smaa_area_, smaa_search_;
     // reflections: the draw's stage 0 texture as BindGuestTexture saw it (none for a target or a replacement)
     uint64_t stage_key_ = 0;
+    uint8_t stage_detail_ = 0;
     float stage_glass_ = 0;
     bool stage_solid_ = false, stage_seen_ = false;
     bool draw_env_ = false;
@@ -1583,6 +1626,10 @@ private:
     VkImageView SoftDepth(Target& ds);
     // materials: the pack picture's material image (made once from texture_pack's), the variant's pixel shader
     std::unordered_map<uint64_t, Image> materials_;
+    // ground detail: each kind's picture (made once), the variant's pixel shader
+    Image details_[kDetailKinds];
+    VkImageView DetailView(uint8_t kind);
+    uint64_t DetailShader(const DrawShaders& sh, const PixelKey& pk, int slot);
     VkImageView MaterialView(uint64_t key);
     uint64_t MaterialShader(const DrawShaders& sh, const PixelKey& pk, int slot);
     bool EnsureMask(Target& t);
@@ -2140,6 +2187,7 @@ VulkanBackend::~VulkanBackend() {
     DropImage(lut_);
     DropImage(smaa_area_);
     for (auto& [k, m] : materials_) DropImage(m);
+    for (Image& d : details_) DropImage(d);
     DropImage(smaa_search_);
     DropImage(dummy_);
     for (Chunk& c : chunks_) DropBuffer(c.b);
@@ -3328,7 +3376,7 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
             // the game's picture it stands for (uploaded before the pack's was set): what reflections know it by
             if (auto it = textures_.find(d.data); stage == 0 && it != textures_.end())
                 stage_key_ = it->second.key, stage_glass_ = it->second.glass, stage_solid_ = it->second.solid,
-                stage_seen_ = true;
+                stage_detail_ = it->second.detail, stage_seen_ = true;
             return v;
         }
     }
@@ -3351,6 +3399,9 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
             tx.sig = sig;
             UploadTexture(tx, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr);
             tx.key = TextureKey(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.hash);
+            tx.detail = Style().ground_detail && !draw_2d_
+                            ? TextureDetail(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0)
+                            : 0;
             TexturePackSeen(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr,
                             palette.hash);
         }
@@ -3358,7 +3409,8 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
     stages.levels[stage] = tx.levels;
     if (fi.depth) stages.info[stage].shadow = ShadowDepthKind(d.format);
-    if (stage == 0) stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_seen_ = true;
+    if (stage == 0)
+        stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_detail_ = tx.detail, stage_seen_ = true;
     return tx.img.view;
 }
 
@@ -3779,6 +3831,31 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             }
         }
     }
+    // ground detail: a tagged texture's kind, read from a stage the draw leaves free (not over a pack's material)
+    if (mat_slot < 0 && st.ground_detail && st.mode != kStyleRetro && !draw_2d_ && stage_seen_ && stage_detail_ &&
+        stage_detail_ < kDetailKinds && bound_rt_ && k.zen && (Opaque(k) || stage_solid_)) {
+        int slot = -1;
+        for (int i = 3; i >= 1 && slot < 0; i--)
+            if (!stages.view[i] && pk.tex[i].kind == kTexNone) slot = i;
+        VkImageView dv = slot >= 0 ? DetailView(stage_detail_) : VK_NULL_HANDLE;
+        uint64_t dh = dv ? DetailShader(sh, pk, slot) : 0;
+        if (dh) {
+            PsoKey dk = k;
+            dk.ps = dh;
+            if (VkPipeline dp = EnsurePipeline(dk)) {
+                p = dp;
+                stages.view[slot] = dv;
+                mat_slot = slot;
+                c.pbr[0] = 1.0f / float(bound_rt_->w);
+                c.pbr[1] = 1.0f / float(bound_rt_->h);
+                c.pbr[2] = st.detail_distance;
+                // XBE_DETAIL_SPLIT=1 (a test): the detail on the right half of the screen only (as a negative strength)
+                static const bool split = std::getenv("XBE_DETAIL_SPLIT") != nullptr;
+                c.pbr[3] = split ? -st.detail_strength : st.detail_strength;
+                perf_mat_++;
+            }
+        }
+    }
     // soft particles: the variant shader reads the scene depth's copy from a stage the draw leaves free
     if (int soft = mat_slot < 0 ? SoftParticle(k, pk, refl) : 0) {
         int slot = -1;
@@ -4095,6 +4172,46 @@ VkImageView VulkanBackend::MaterialView(uint64_t key) {
     for (uint32_t l = 0; l < levels.size(); l++)
         UploadLevel(im, l, 0, std::max(1u, w >> l), std::max(1u, h >> l), 1, levels[l].data(), levels[l].size() * 4);
     return im.view;
+}
+
+VkImageView VulkanBackend::DetailView(uint8_t kind) {
+    Image& im = details_[kind];
+    if (im.img) return im.view;
+    std::vector<std::vector<uint32_t>> levels;
+    DetailPicture(kind, levels);
+    if (levels.empty() || !MakeImage(im, VK_IMAGE_TYPE_2D, kBgra, kDetailSize, kDetailSize, 1, uint32_t(levels.size()), 1,
+                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        im = Image{};
+        return VK_NULL_HANDLE;
+    }
+    for (uint32_t l = 0; l < levels.size(); l++) {
+        uint32_t size = std::max(1u, kDetailSize >> l);
+        UploadLevel(im, l, 0, size, size, 1, levels[l].data(), levels[l].size() * 4);
+    }
+    LOGR("vulkan: ground detail: the %s picture made", DetailName(kind));
+    return im.view;
+}
+
+uint64_t VulkanBackend::DetailShader(const DrawShaders& sh, const PixelKey& pk, int slot) {
+    uint64_t key = sh.pkey ^ kDetailKeySalt ^ uint64_t(slot) << 56;
+    if (auto it = shader_src_.find(key); it != shader_src_.end()) return it->second;
+    uint64_t h = 0;
+    std::string src = PixelHlsl(pk);
+    size_t at = src.find("float4 main(");
+    if (at != std::string::npos) {
+        src.replace(at, 12, "float4 game_main(");
+        bool proj = pk.programmable || (pk.proj & 1);
+        std::string uv = proj ? "i.tc0.xy / i.tc0.w" : "i.tc0.xy";
+        uv = "(" + uv + ")" + (pk.tex[0].rect ? " / texsize[0].xy" : "") + " + texsize[0].zw";
+        char tail[8192];
+        std::snprintf(tail, sizeof(tail), kDetailMain, pk.wbuf ? ", out float depth : SV_Depth" : "", uv.c_str(),
+                      pk.wbuf ? ", depth" : "", slot, slot);
+        src += tail;
+        if (!Compile(src, "main", "ps_5_0", h)) h = 0;
+    }
+    if (!h) LOG_FIRST(4, "vulkan: a ground detail shader could not be made, the surface is drawn as the game's");
+    shader_src_[key] = h;
+    return h;
 }
 
 uint64_t VulkanBackend::MaterialShader(const DrawShaders& sh, const PixelKey& pk, int slot) {

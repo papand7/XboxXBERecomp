@@ -71,6 +71,8 @@ void Clamp(GraphicsStyle& s) {
     s.light_strength = std::clamp(s.light_strength, 0.0f, 3.0f);
     s.material_strength = std::clamp(s.material_strength, 0.0f, 1.5f);
     s.surface_depth = std::clamp(s.surface_depth, 0.0f, 2.0f);
+    s.detail_strength = std::clamp(s.detail_strength, 0.0f, 1.0f);
+    s.detail_distance = std::clamp(s.detail_distance, 2.0f, 60.0f);
 }
 
 int Index(const std::string& v, const char* const* names, int n, int fallback) {
@@ -89,7 +91,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "quality_ao", "quality_bloom", "reflections", "reflection_strength",
                                   "reflections_auto", "soft_particles", "particle_fade",
                                   "effect_lights", "light_strength", "atmosphere", "shaft_strength", "fog_strength", "bounce_light", "bounce_strength",
-                                  "materials", "material_strength", "surface_depth"};
+                                  "materials", "material_strength", "surface_depth",
+                                  "ground_detail", "detail_strength", "detail_distance"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -162,6 +165,9 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("materials", s.materials);
     num("material_strength", s.material_strength);
     num("surface_depth", s.surface_depth);
+    flag("ground_detail", s.ground_detail);
+    num("detail_strength", s.detail_strength);
+    num("detail_distance", s.detail_distance);
     Clamp(s);
 }
 
@@ -212,7 +218,10 @@ toml::table Write(const GraphicsStyle& s) {
                        {"bounce_strength", double(s.bounce_strength)},
                        {"materials", s.materials},
                        {"material_strength", double(s.material_strength)},
-                       {"surface_depth", double(s.surface_depth)}};
+                       {"surface_depth", double(s.surface_depth)},
+                       {"ground_detail", s.ground_detail},
+                       {"detail_strength", double(s.detail_strength)},
+                       {"detail_distance", double(s.detail_distance)}};
 }
 
 // the built-in presets
@@ -418,6 +427,9 @@ void ApplyPreset(const StylePreset& p) {
     g_style.materials = keep.materials;
     g_style.material_strength = keep.material_strength;
     g_style.surface_depth = keep.surface_depth;
+    g_style.ground_detail = keep.ground_detail;
+    g_style.detail_strength = keep.detail_strength;
+    g_style.detail_distance = keep.detail_distance;
     StyleChanged();
 }
 
