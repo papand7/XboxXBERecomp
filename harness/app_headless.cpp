@@ -68,6 +68,11 @@ void FinishHandover() {}
 
 // no settings window without a window: never open, opening it does nothing
 bool OverlayOpen() { return false; }
+void BeginKeyCapture() {}
+void EndKeyCapture() {}
+bool TakeCapturedKey(uint16_t&) { return false; }
+bool KeyCaptureBusy() { return false; }
+bool CaptureKey(uint16_t) { return false; }
 void ToggleOverlay() { LOGI("settings window: none headless"); }
 
 std::recursive_mutex& UiLock() {

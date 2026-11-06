@@ -227,7 +227,7 @@ uint16_t PhysicalKey(uint16_t vk) {
 }  // namespace
 
 uint32_t MouseButtons() {
-    if (!MouseLooking() && !MousePointing()) return g_script_mouse;
+    if ((!MouseLooking() && !MousePointing()) || app::KeyCaptureBusy()) return g_script_mouse;
     return g_script_mouse | uint32_t((GetAsyncKeyState(PrimaryButton()) & 0x8000) ? 1 : 0) |
            ((GetAsyncKeyState(SecondaryButton()) & 0x8000) ? 2 : 0) | ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) ? 4 : 0);
 }
@@ -406,7 +406,7 @@ Pad Poll(int port) {
         for (int c = 0; c < kControls; c++) pad_used |= in[c] >= 0.5f;
         if (s.keyboard && !p.connected) key_used = true;  // nothing else to play with
         if (s.keyboard) p.connected = true;
-        if (s.keyboard && hwnd && GetForegroundWindow() == hwnd) {
+        if (s.keyboard && hwnd && GetForegroundWindow() == hwnd && !app::KeyCaptureBusy()) {
             for (int c = 0; c < kControls; c++) {
                 std::array<uint16_t, 2> keys = c < int(s.keys.size()) ? s.keys[c] : app::DefaultKeys(c);
                 for (uint16_t k : keys)

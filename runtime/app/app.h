@@ -90,6 +90,13 @@ void ToggleOverlay();
 void DrawOverlay();
 // a key pressed while the overlay waits for one to bind (window thread); true takes it
 bool OverlayKey(uint16_t vk);
+// a title's own key binding (its menus, any thread): the next key or mouse button pressed is taken for it, and the
+// keyboard and mouse reach neither the controllers nor the menu pointer while it waits, nor until that key is let go
+void BeginKeyCapture();
+void EndKeyCapture();
+bool TakeCapturedKey(uint16_t& vk);  // the key taken (VK_ESCAPE: the player cleared it), once
+bool KeyCaptureBusy();
+bool CaptureKey(uint16_t vk);  // window thread, a new press (not a repeat): true when the capture takes it
 
 Settings& Get();
 void Load();

@@ -556,6 +556,37 @@ void ToggleOverlay() {
     LOGR("settings window %s", g_open ? "opened" : "closed");
 }
 
+namespace {
+std::atomic<int> g_capture{0};  // 0 none, 1 waiting, 2 a key taken
+std::atomic<uint16_t> g_captured{0}, g_capture_held{0};
+}  // namespace
+void BeginKeyCapture() {
+    g_captured = 0;
+    g_capture = 1;
+}
+void EndKeyCapture() { g_capture = 0; }
+bool TakeCapturedKey(uint16_t& vk) {
+    int taken = 2;
+    if (!g_capture.compare_exchange_strong(taken, 0)) return false;
+    vk = g_captured;
+    return true;
+}
+bool KeyCaptureBusy() {
+    if (g_capture) return true;
+    uint16_t held = g_capture_held;
+    if (!held) return false;
+    if (GetAsyncKeyState(held) & 0x8000) return true;
+    g_capture_held = 0;
+    return false;
+}
+bool CaptureKey(uint16_t vk) {
+    if (g_capture != 1) return false;
+    g_captured = vk;
+    g_capture_held = vk;
+    g_capture = 2;
+    return true;
+}
+
 bool OverlayKey(uint16_t vk) {
     int c = g_bind_control;
     if (!g_open || c < 0) return false;
