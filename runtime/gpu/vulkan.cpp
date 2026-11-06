@@ -2940,7 +2940,14 @@ private:
     uint64_t scene_src_hash_ = 0;
     // GPU timestamps a frame slot: frame start, frame end, scene pass start, end
     VkQueryPool stamps_ = VK_NULL_HANDLE;
-    uint32_t stamp_written_[kFramesInFlight] = {};  // bits of the four written
+    uint32_t stamp_written_[kFramesInFlight] = {};  // bits of those written
+    // the scene pass's passes timed (XBE_PERF's log): stamp 4 + k after pass k, its time from the stamp before
+    static constexpr uint32_t kStamps = 4 + 16;
+    static constexpr const char* kPassNames[16] = {"relight", "rt ao", "rt reflect", "gtao", "lights", "bounce",
+                                                   "atmosphere", "weather", "tone", "style", "smaa", "dof",
+                                                   nullptr, nullptr, nullptr, nullptr};
+    double pass_ms_[16] = {};
+    uint32_t pass_n_[16] = {};
     bool frame_stamp_due_ = true;
     double gpu_frame_ms_ = 0, gpu_post_ms_ = 0;
     uint32_t gpu_frames_ = 0, gpu_posts_ = 0;
@@ -3568,9 +3575,9 @@ bool VulkanBackend::CreateFixed() {
         vkGetPhysicalDeviceQueueFamilyProperties(pd_, &qn, qf.data());
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qi.queryCount = 4 * kFramesInFlight;
+        qi.queryCount = kStamps * kFramesInFlight;
         if (host_reset_ && qf[family_].timestampValidBits && vkCreateQueryPool(dev_, &qi, nullptr, &stamps_) == VK_SUCCESS)
-            vkResetQueryPool(dev_, stamps_, 0, 4 * kFramesInFlight);
+            vkResetQueryPool(dev_, stamps_, 0, kStamps * kFramesInFlight);
     }
     // the gamma lookup: one BGRA texel per ramp entry; the stand-in texture
     const VkImageUsageFlags sampled = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -5358,6 +5365,11 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
                        .samples = 1};
     BuildPipelineKey(s, a, sh.vh, sh.ph, pt, k);
     if (!adjust.depth_test) k.zen = k.zwrite = 0;
+    // the sky (SkyDraw) leaves the depth as it was cleared, so the scene pass's effects see sky there rather than a
+    // wall a few hundred metres off: lit and fogged by its faces' slopes and distances, a sky box's edges showed
+    // (most toward the sun). Not after the scene's mid-frame clear (NightFire's gun and hands)
+    if (k.zwrite && !draw_2d_ && ScenePassWanted() && scene_cleared_ != presents_ + 1 && SkyDraw(s, a, sh).sky)
+        k.zwrite = 0;
     k.zbias += adjust.depth_bias;
     float wdepth[4] = {float(k.zbias) * s.zscale / kDepth24Max, k.zslope, 1.0f / (s.zscale + 1.0f),
                        sh.prog ? 1.0f : s.zscale * s.inv_wfar};
@@ -7265,19 +7277,20 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     rt_built_ = RtWanted() && ds && ds->w == rt.w && ds->h == rt.h && RtBuild(float(rt.w) / float(rt.h));
     rt_gi_drawn_ = false;
     tone_drawn_ = Style().hdr_tonemap && Style().mode != kStyleRetro && ToneBegin(rt);
-    if (rt_built_ && Style().rt_lighting) RtRelightPass(rt, ds);
-    if (rt_built_ && Style().rt_ao > 0) RtPass(rt, ds);
-    if (rt_built_) RtReflectPass(rt, ds);
+    auto timed = [&](uint32_t k) { End(), Stamp(4 + k); };
+    if (rt_built_ && Style().rt_lighting) RtRelightPass(rt, ds), timed(0);
+    if (rt_built_ && Style().rt_ao > 0) RtPass(rt, ds), timed(1);
+    if (rt_built_) RtReflectPass(rt, ds), timed(2);
     gtao_drawn_ = false;
-    if (!rt_drawn_ && QualityAo(Style()) > 0 && Style().mode != kStyleRetro && scene_wbuf_) GtaoPass(rt, ds);
-    if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds);
-    if (Style().bounce_light && Style().mode != kStyleRetro && !rt_gi_drawn_) BouncePass(rt, ds);
-    if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds);
-    if (WeatherWanted()) WeatherPass(rt, ds);
-    if (tone_drawn_) ToneResolve(rt);
-    if (StylePassWanted()) StylePass(rt, ds);
-    if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt);
-    if (DofWanted()) DofPass(rt, ds);
+    if (!rt_drawn_ && QualityAo(Style()) > 0 && Style().mode != kStyleRetro && scene_wbuf_) GtaoPass(rt, ds), timed(3);
+    if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds), timed(4);
+    if (Style().bounce_light && Style().mode != kStyleRetro && !rt_gi_drawn_) BouncePass(rt, ds), timed(5);
+    if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds), timed(6);
+    if (WeatherWanted()) WeatherPass(rt, ds), timed(7);
+    if (tone_drawn_) ToneResolve(rt), timed(8);
+    if (StylePassWanted()) StylePass(rt, ds), timed(9);
+    if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt), timed(10);
+    if (DofWanted()) DofPass(rt, ds), timed(11);
     End();
     // HDR: the finished scene before the HUD, which HdrOut compares the presented frame with
     if (swap_hdr_ && (rt.hdr_scene.w == rt.w && rt.hdr_scene.h == rt.h ||
@@ -7923,7 +7936,7 @@ void VulkanBackend::SmaaPass(Target& rt) {
 // a timestamp of the frame slot being recorded: 0 frame start, 1 frame end, 2 scene pass start, 3 its end
 void VulkanBackend::Stamp(uint32_t which) {
     if (!stamps_ || (stamp_written_[frame_slot_] >> which & 1)) return;
-    vkCmdWriteTimestamp2(Cmd(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, stamps_, frame_slot_ * 4 + which);
+    vkCmdWriteTimestamp2(Cmd(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, stamps_, frame_slot_ * kStamps + which);
     stamp_written_[frame_slot_] |= 1u << which;
 }
 
@@ -7931,13 +7944,20 @@ void VulkanBackend::Stamp(uint32_t which) {
 void VulkanBackend::ReadStamps(uint32_t slot) {
     if (!stamps_) return;
     uint32_t w = stamp_written_[slot];
-    uint64_t t[4] = {};
-    for (uint32_t i = 0; i < 4; i++)
-        if (w >> i & 1) vkGetQueryPoolResults(dev_, stamps_, slot * 4 + i, 1, 8, &t[i], 8, VK_QUERY_RESULT_64_BIT);
+    uint64_t t[kStamps] = {};
+    for (uint32_t i = 0; i < kStamps; i++)
+        if (w >> i & 1) vkGetQueryPoolResults(dev_, stamps_, slot * kStamps + i, 1, 8, &t[i], 8, VK_QUERY_RESULT_64_BIT);
     double ns = props_.limits.timestampPeriod;
     if ((w & 3) == 3 && t[1] > t[0]) gpu_frame_ms_ += double(t[1] - t[0]) * ns / 1e6, gpu_frames_++;
     if ((w & 12) == 12 && t[3] > t[2]) gpu_post_ms_ += double(t[3] - t[2]) * ns / 1e6, gpu_posts_++;
-    vkResetQueryPool(dev_, stamps_, slot * 4, 4);
+    // each pass: from the stamp before it (the scene pass's start, 2, or the pass before's)
+    if (w & 4)
+        for (uint32_t k = 0, before = 2; k < 16; k++)
+            if (w >> (4 + k) & 1) {
+                if (t[4 + k] >= t[before]) pass_ms_[k] += double(t[4 + k] - t[before]) * ns / 1e6, pass_n_[k]++;
+                before = 4 + k;
+            }
+    vkResetQueryPool(dev_, stamps_, slot * kStamps, kStamps);
     stamp_written_[slot] = 0;
 }
 
@@ -7957,6 +7977,15 @@ void VulkanBackend::LogPerf() {
          gpu_frames_ ? gpu_frame_ms_ / gpu_frames_ : 0.0, gpu_posts_ ? gpu_post_ms_ / gpu_posts_ : 0.0, gpu_posts_,
          gpu_frames_, Style().mode == kStyleOriginal ? "original" : Style().mode == kStyleEnhanced ? "enhanced"
                       : Style().mode == kStyleToon ? "toon" : Style().mode == kStyleNoir ? "noir" : "retro");
+    {
+        std::string passes;
+        char one[48];
+        for (uint32_t k = 0; k < 16; k++)
+            if (pass_n_[k] && kPassNames[k])
+                std::snprintf(one, sizeof(one), " %s %.2f", kPassNames[k], pass_ms_[k] / pass_n_[k]), passes += one;
+        if (!passes.empty()) LOGR("perf: vulkan scene passes (GPU ms):%s", passes.c_str());
+        for (uint32_t k = 0; k < 16; k++) pass_ms_[k] = 0, pass_n_[k] = 0;
+    }
     LOGR("perf: vulkan draws a frame: %.0f 2D, %.0f vertex programs, %.0f fixed function (%.0f lit)",
          perf_2d_ / n, perf_prog_ / n, perf_fixed_ / n, perf_lit_ / n);
     LOGR("perf: vulkan soft particles a frame: %.1f, material draws %.1f, glowing draws %.1f", perf_soft_ / n,
