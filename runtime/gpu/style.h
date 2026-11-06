@@ -137,6 +137,10 @@ struct GraphicsStyle {
     // each pixel since the last frame (from the depth), the gun, hands and HUD sharp
     bool motion_blur = false;
     float motion_blur_strength = 1.0f;  // 0 to 2
+    // smooth turning (Vulkan, a screen of 100 Hz or more, SDR): between two of the title's frames one of the
+    // renderer's, the last frame turned by the mouse the title has not read yet (GameInfo::view_turn), the HUD and the
+    // gun where they were: turning the view looks twice as smooth, the world still moves at the title's rate
+    bool smooth_turn = false;
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;

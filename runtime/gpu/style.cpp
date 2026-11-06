@@ -112,7 +112,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "ground_detail", "detail_strength", "detail_distance",
                                   "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "snow_sparkle", "blood",
                                   "depth_of_field", "dof_strength", "hdr_tonemap", "auto_exposure",
-                                  "motion_blur", "motion_blur_strength"};
+                                  "motion_blur", "motion_blur_strength",
+                                  "smooth_turn"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -213,6 +214,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("auto_exposure", s.auto_exposure);
     flag("motion_blur", s.motion_blur);
     num("motion_blur_strength", s.motion_blur_strength);
+    flag("smooth_turn", s.smooth_turn);
     Clamp(s);
 }
 
@@ -291,7 +293,8 @@ toml::table Write(const GraphicsStyle& s) {
                        {"hdr_tonemap", kHdrToneNames[s.hdr_tonemap]},
                        {"auto_exposure", s.auto_exposure},
                        {"motion_blur", s.motion_blur},
-                       {"motion_blur_strength", double(s.motion_blur_strength)}};
+                       {"motion_blur_strength", double(s.motion_blur_strength)},
+                       {"smooth_turn", s.smooth_turn}};
 }
 
 // the built-in presets
@@ -579,6 +582,7 @@ void ApplyPreset(const StylePreset& p) {
     g_style.auto_exposure = keep.auto_exposure;
     g_style.motion_blur = keep.motion_blur;
     g_style.motion_blur_strength = keep.motion_blur_strength;
+    g_style.smooth_turn = keep.smooth_turn;
     StyleChanged();
 }
 
@@ -647,7 +651,7 @@ bool StylePassWanted() {
 bool ScenePassWanted() {
     return StylePassWanted() ||
            ((app::Get().smaa || g_style.effect_lights || g_style.atmosphere || g_style.bounce_light || g_style.dof ||
-             g_style.weather || g_style.hdr_tonemap || g_style.motion_blur ||
+             g_style.weather || g_style.hdr_tonemap || g_style.motion_blur || g_style.smooth_turn ||
              (g_style.ray_tracing && g_ray_tracing.load())) &&
             g_style.mode != kStyleRetro);
 }
@@ -863,6 +867,8 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::SliderFloat("Amount##mb", &s.motion_blur_strength, 0.0f, 2.0f, "%.2f");
         ImGui::TextDisabled("A little blur as the camera turns and moves; the gun and HUD stay sharp (Vulkan; not in Retro).");
     }
+    changed |= ImGui::Checkbox("Smooth turning (a frame in between, turned by the mouse; 100 Hz screens and up)",
+                               &s.smooth_turn);
     if (ImGui::CollapsingHeader("HDR tone mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
         int h = s.hdr_tonemap;
         if (ImGui::Combo("Tone mapping (HDR)", &h, "Off\0AgX\0ACES\0")) s.hdr_tonemap = h, changed = true;

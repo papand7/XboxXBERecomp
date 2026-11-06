@@ -569,6 +569,9 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     ScratchPush();
 
     if (!g_backend) {
+        app::SetMidFrame([] {
+            if (g_backend) g_backend->MidFrame();
+        });
         g_backend = gpu::CreateBackend();
         if (!g_backend || !g_backend->Init(w, h)) {
             // the others in turn (Direct3D 12, Vulkan, Direct3D 11), each made by CreateBackend under its setting, which

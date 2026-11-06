@@ -387,6 +387,9 @@ void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
 
 bool Paused() { return !netplay::Active() && Get().pause_unfocused && !g_active && g_hwnd && IsWindowVisible(g_hwnd); }
 
+static void (*g_mid_frame)() = nullptr;
+void SetMidFrame(void (*fn)()) { g_mid_frame = fn; }
+
 void Pace(uint32_t vblanks) {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
@@ -427,6 +430,8 @@ void Pace(uint32_t vblanks) {
     }
     next += period;
     if (next < now - period) next = now;
+    // the renderer's frame in between (smooth turning): asked for now, drawn by it half way to the next present
+    if (g_mid_frame) g_mid_frame();
     while (clock::now() + std::chrono::milliseconds(2) < next) Sleep(1);
     while (clock::now() < next) std::this_thread::yield();
     netplay::Frame();  // LAN play: the next frame's controllers of every player

@@ -251,6 +251,16 @@ bool TakeMouse(float& x, float& y) {
     return true;
 }
 
+bool PeekMouse(float& x, float& y) {
+    x = y = 0;
+    if (!MouseLooking()) return false;
+    const app::Settings& s = app::Get();
+    float k = s.mouse_sensitivity / 100.0f;
+    x = float(g_mouse_dx.load()) * k;
+    y = -float(g_mouse_dy.load()) * k * (s.mouse_invert_y ? -1.0f : 1.0f);
+    return true;
+}
+
 bool MousePointing() {
     HWND hwnd = static_cast<HWND>(app::Window());
     return app::kGame.menu_up && app::kGame.menu_up() && hwnd && GetForegroundWindow() == hwnd && !app::OverlayOpen();

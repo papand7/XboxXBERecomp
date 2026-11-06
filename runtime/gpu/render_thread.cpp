@@ -41,7 +41,7 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
-enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport };
+enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport, Mid };
 
 struct Cmd {
     Op op;
@@ -210,6 +210,12 @@ public:
     }
     void Kick() override {
         cur_->cmds.push_back(Cmd{Op::Flush});
+        Submit();
+    }
+
+    // the in-between frame: run on the render thread after the present before it (it waits for its time there)
+    void MidFrame() override {
+        cur_->cmds.push_back(Cmd{Op::Mid});
         Submit();
     }
 
@@ -455,6 +461,7 @@ private:
             case Op::Gamma: inner_->SetGamma(data); break;
             case Op::ClearReport: inner_->ClearReport(); break;
             case Op::GetReport: inner_->GetReport(c.a); break;
+            case Op::Mid: inner_->MidFrame(); break;
         }
     }
 
@@ -522,6 +529,7 @@ public:
     void Flush() override { t_->Flush(); }
     void Kick() override { t_->Kick(); }
     void SetGamma(const uint8_t* ramp) override { t_->SetGamma(ramp); }
+    void MidFrame() override { t_->MidFrame(); }
     void ClearReport() override { t_->ClearReport(); }
     void GetReport(uint32_t report) override { t_->GetReport(report); }
     uint32_t Fence() override { return t_->Fence(); }

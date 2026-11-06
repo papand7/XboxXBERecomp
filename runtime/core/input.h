@@ -39,6 +39,9 @@ bool MousePointing();
 // stick deflections (2400 counts a second at 100% sensitivity is 1), up positive, the settings' sensitivity and invert
 // applied; false and nothing taken while the mouse is not looking
 bool TakeMouse(float& x, float& y);
+// the counts moved since the title last took them (times the sensitivity, y up), left for it: false when the mouse
+// does not look (GameInfo::view_turn's smooth turning between the title's frames)
+bool PeekMouse(float& x, float& y);
 // what controller 1 was last played with: true for the keyboard and mouse (a bound key or mouse button pressed, the
 // mouse moved while it looks; the keyboard alone when no controller is plugged in), false for a controller or wheel
 // (a button pressed, a stick pushed half way); a title's button pictures may follow it

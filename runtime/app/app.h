@@ -258,12 +258,18 @@ struct GameInfo {
     // Vulkan always (Settings::renderer held at 2, the settings window's Renderer choice not shown): a title whose
     // look is Vulkan's. Direct3D 12 still starts in its place on a PC where Vulkan cannot
     bool vulkan_only = false;
+    // smooth turning (GraphicsStyle::smooth_turn): how far the view will turn by the mouse the title has not read yet,
+    // radians (yaw right, pitch up), and the tangent of half its vertical field of view; false when it does not
+    // (menus, cutscenes, a controller)
+    bool (*view_turn)(float& yaw, float& pitch, float& tan_half_fov) = nullptr;
 };
 extern const GameInfo kGame;
 
 // sleeps out the rest of the frame: the title's present interval (vertical blanks a frame at 60 Hz, 0 unpaced)
 // within the fps cap
 void Pace(uint32_t vblanks = 1);
+// called by Pace after each present: the renderer's in-between frame (smooth turning), drawn half way to the next
+void SetMidFrame(void (*fn)());
 // frames a second for a title asking for vblanks within cap (0 unlimited); 0 unpaced
 inline uint32_t PaceRate(uint32_t cap, uint32_t vblanks) {
     if (!vblanks) return cap;

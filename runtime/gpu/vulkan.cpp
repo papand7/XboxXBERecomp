@@ -1604,6 +1604,48 @@ float4 ps(O i) : SV_Target {
 }
 )";
 
+// smooth turning (VulkanBackend::MidFrame): pack, at the scene pass's end, the scene's copy with the gun marked in its
+// alpha (nearer than the depth kept at the mid-frame clear); warp, between two presents, the presented frame's scene
+// turned by the mouse since (yaw right, pitch up), the HUD (where the presented frame is not its scene) and the gun
+// where they were. b1 p: [0] the kept depth is there; [1] yaw, pitch, tan of half the vertical view, width / height;
+// [2] 1 / width, 1 / height. t0 the frame (or the scene, pack), t1 the scene's copy (or the depth), t2 the kept depth
+const char* kWarpHlsl = R"(
+cbuffer P : register(b1) { float4 p[3]; };
+Texture2D frame : register(t0);
+Texture2D copyt : register(t1);
+Texture2D<float> keptz : register(t2);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float4 pack(O i) : SV_Target {
+    bool gun = p[0].x != 0 && copyt.SampleLevel(pt, i.uv, 0).r < keptz.SampleLevel(pt, i.uv, 0) - 1e-6;
+    return float4(frame.SampleLevel(pt, i.uv, 0).rgb, gun ? 1 : 0);
+}
+float4 warp(O i) : SV_Target {
+    float2 uv = i.uv;
+    float4 g = frame.SampleLevel(pt, uv, 0), s = copyt.SampleLevel(pt, uv, 0);
+    if (any(abs(g.rgb - s.rgb) > 1.5 / 255) || s.a > 0.5) return float4(g.rgb, 1);
+    // this pixel's direction now, in the presented frame's view: pitched up, then turned right
+    float ty = p[1].z, as = p[1].w;
+    float3 d = float3((uv.x * 2 - 1) * as * ty, (1 - uv.y * 2) * ty, 1);
+    float cy = cos(p[1].x), sy = sin(p[1].x), cp = cos(p[1].y), sp = sin(p[1].y);
+    d = float3(d.x, d.y * cp + d.z * sp, -d.y * sp + d.z * cp);
+    d = float3(d.x * cy + d.z * sy, d.y, -d.x * sy + d.z * cy);
+    float2 q = float2(d.x / (d.z * as * ty), -d.y / (d.z * ty)) * 0.5 + 0.5;
+    q = clamp(q, 0.5 * p[2].xy, 1 - 0.5 * p[2].xy);  // past the edge: the edge's
+    float4 w = copyt.SampleLevel(ls, q, 0);
+    if (w.a > 0.5) w = s;  // what the gun hid in the frame is not known: this pixel's own
+    return float4(w.rgb, 1);
+}
+)";
+
 const char* kDofHlsl = R"(
 cbuffer P : register(b1) { float4 p[4]; };
 Texture2D scene : register(t0);
@@ -2991,6 +3033,16 @@ private:
     void BouncePass(Target& rt, Target* ds);      // bounced light (GraphicsStyle::bounce_light)
     void DofPass(Target& rt, Target* ds);         // depth of field (GraphicsStyle::dof)
     void MotionBlurPass(Target& rt, Target* ds);  // motion blur (GraphicsStyle::motion_blur)
+    // smooth turning (GraphicsStyle::smooth_turn): the frame last presented, a frame turned from it between presents
+    void MidFrame() override;
+    bool WarpWanted() const { return Style().smooth_turn && !swap_hdr_ && refresh_hz_ >= 100; }
+    Target* warp_t_ = nullptr;
+    uint64_t warp_frames_ = 0;  // in-between frames presented (the perf log)
+    std::chrono::steady_clock::time_point last_present_{};  // the last real present, the interval between them eased
+    double present_interval_ = 1.0 / 60;
+    Image warp_img_;
+    VkSemaphore warp_sem_[kFramesInFlight] = {};
+    uint32_t refresh_hz_ = 60;  // the window's screen's (CreateSwapchain)
     float mb_last_[3][4] = {};                    // the last frame's world to view (MotionBlurPass)
     uint64_t mb_frame_ = 0;                       // the frame (presents_ + 1) it was kept for
     bool DofWanted() const { return Style().dof != kDofOff && Style().mode != kStyleRetro; }
@@ -2999,7 +3051,7 @@ private:
         const GraphicsStyle& st = Style();
         return DofWanted() || st.mode == kStyleNoir ||
                (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light || QualityAo(st) > 0 || st.weather ||
-                                           st.motion_blur));
+                                           st.motion_blur || st.smooth_turn));
     }
     float dof_aim_ = 0;          // aiming down the sights, eased 0 to 1
     uint32_t scene_zwrites_ = 0;  // the frame's 3D draws that wrote the scene's depth
@@ -3609,6 +3661,17 @@ bool VulkanBackend::CreateSwapchain() {
                 break;
             }
     }
+    {
+        // the screen's refresh rate (smooth turning wants 100 Hz or more)
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        HMONITOR mon = MonitorFromWindow(static_cast<HWND>(app::Window()), MONITOR_DEFAULTTONEAREST);
+        if (GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) &&
+            dm.dmDisplayFrequency > 1)
+            refresh_hz_ = dm.dmDisplayFrequency;
+    }
     uint32_t images = std::max(caps.minImageCount, 2u);
     if (caps.maxImageCount) images = std::min(images, caps.maxImageCount);
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -3681,6 +3744,7 @@ bool VulkanBackend::CreateFixed() {
     if (vkCreateSemaphore(dev_, &sci, nullptr, &timeline_) != VK_SUCCESS) return false;
     VkSemaphoreCreateInfo bci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (auto& s : acquire_sem_) vkCreateSemaphore(dev_, &bci, nullptr, &s);
+    for (auto& s : warp_sem_) vkCreateSemaphore(dev_, &bci, nullptr, &s);
 
     // one layout for every draw and pass: two constant buffers, four textures, four samplers, pushed per draw
     VkDescriptorSetLayoutBinding b[kBindCapture + 1]{};
@@ -3916,6 +3980,7 @@ VulkanBackend::~VulkanBackend() {
     if (rt_sampler_) vkDestroySampler(dev_, rt_sampler_, nullptr);
     if (swap_) DestroySwapchain();
     for (VkSemaphore s : acquire_sem_) vkDestroySemaphore(dev_, s, nullptr);
+    for (VkSemaphore s : warp_sem_) vkDestroySemaphore(dev_, s, nullptr);
     vkDestroySemaphore(dev_, timeline_, nullptr);
     vkDestroyCommandPool(dev_, pool_, nullptr);
     vkDestroyDevice(dev_, nullptr);
@@ -4338,6 +4403,7 @@ bool VulkanBackend::CreateTarget(Target& t) {
 }
 
 void VulkanBackend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
+    if (warp_t_ == &it->second) warp_t_ = nullptr;
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) Unbind();
     if (scene_rt_ == &it->second || scene_ds_ == &it->second) scene_rt_ = scene_ds_ = nullptr;
     DropImage(it->second.res);
@@ -7510,6 +7576,12 @@ void VulkanBackend::Present(const Surface& front) {
         VkResult r = vkQueuePresentKHR(queue_, &pi);
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR)
             LOG_FIRST(8, "vulkan: vkQueuePresentKHR failed: %s", VkResultName(r));
+        {
+            auto pnow = std::chrono::steady_clock::now();
+            double gap = std::chrono::duration<double>(pnow - last_present_).count();
+            if (gap > 0.004 && gap < 0.1) present_interval_ += (gap - present_interval_) * 0.1;
+            last_present_ = pnow;
+        }
         frame_serial_[frame_slot_] = serial_;
         frame_slot_ = (frame_slot_ + 1) % kFramesInFlight;
     } else {
@@ -7526,11 +7598,134 @@ void VulkanBackend::Present(const Surface& front) {
     Collect();
     presents_++;
     presents_seen_.store(presents_);
+    warp_t_ = t;
     ReleaseOldTextures();
     CountFps();
     ApplySettings();
     if (presents_ == 600 || presents_ % 18000 == 0) SavePipelineCache();
     if (diag::Perf()) LogPerf();
+}
+
+// smooth turning: half way between two presents (app::Pace), the frame last presented turned by the mouse the title
+// has not read yet (kWarpHlsl), through the same blit (gamma, sharpening) and overlay as a frame of the title's
+void VulkanBackend::MidFrame() {
+    if (!WarpWanted() || !warp_t_ || !swap_ || !app::kGame.view_turn) return;
+    Target& t = *warp_t_;
+    if (t.hdr_frame != presents_ || t.hdr_scene.w != t.w || t.hdr_scene.h != t.h) return;
+    // half way between the last present and the next (the presents' interval, eased): waited for here, on the render
+    // thread; too late for it (the next present near), none
+    using clock = std::chrono::steady_clock;
+    const auto at = last_present_ + std::chrono::duration_cast<clock::duration>(
+                                        std::chrono::duration<double>(present_interval_ * 0.5));
+    if (clock::now() > at + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(present_interval_ * 0.25)))
+        return;
+    while (clock::now() + std::chrono::milliseconds(2) < at) Sleep(1);
+    while (clock::now() < at) std::this_thread::yield();
+    float yaw = 0, pitch = 0, ty = 0.5774f;
+    // XBE_WARP_TEST=<degrees>: every in-between frame turned that far right, one of them written to warp_test.png
+    static const float test = [] {
+        const char* e = std::getenv("XBE_WARP_TEST");
+        return e && *e ? float(std::atof(e)) : 0.0f;
+    }();
+    if (test != 0) yaw = test * 0.0174533f;
+    else if (!app::kGame.view_turn(yaw, pitch, ty) || (std::abs(yaw) + std::abs(pitch) < 1e-5f)) return;
+    uint64_t vh, wh;
+    VkPipeline pw = Compile(kWarpHlsl, "vs", "vs_5_0", vh) && Compile(kWarpHlsl, "warp", "ps_5_0", wh)
+                        ? PassPipeline({vh, wh, kBgra, VK_FORMAT_UNDEFINED, 0, 0})
+                        : VK_NULL_HANDLE;
+    if (!pw) return;
+    if (warp_img_.img && (warp_img_.w != t.w || warp_img_.h != t.h)) DropImage(warp_img_);
+    if (!warp_img_.img && !MakeImage(warp_img_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1,
+                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    End();
+    if (dirty_) Barrier();
+    VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
+    VkRect2D sc{{0, 0}, {t.w, t.h}};
+    const float c[12] = {0, 0, 0, 0, yaw, pitch, ty, float(t.w) / float(t.h), 1.0f / t.w, 1.0f / t.h, 0, 0};
+    VkImageView wv[2] = {t.res.view, t.hdr_scene.view};
+    FullScreen(pw, {warp_img_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, c, 12, wv, 2);
+    End();
+    Barrier();
+    static bool test_shot = false;
+    if (test != 0 && presents_ >= 7400 && !test_shot) {  // the test's picture: an in-between frame as drawn
+        test_shot = true;
+        VkDeviceSize bytes = VkDeviceSize(t.w) * t.h * 4;
+        if (readback_.size < bytes) DropBuffer(readback_), MakeBuffer(readback_, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        if (readback_.size >= bytes) {
+            VkBufferImageCopy r{};
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            r.imageExtent = {t.w, t.h, 1};
+            vkCmdCopyImageToBuffer(Cmd(), warp_img_.img, VK_IMAGE_LAYOUT_GENERAL, readback_.buf, 1, &r);
+            Submit();
+            Wait(serial_);
+            std::vector<uint32_t> px(size_t(t.w) * t.h);
+            std::memcpy(px.data(), readback_.mem.map, px.size() * 4);
+            for (uint32_t& p : px) p |= 0xFF000000u;
+            LOGR("vulkan: warp test %s", WritePngFile((app::ExeDir() / "warp_test.png").wstring(), px, t.w, t.h) ? "written" : "failed");
+        }
+    }
+    uint32_t index = 0;
+    VkResult ar = vkAcquireNextImageKHR(dev_, swap_, UINT64_MAX, warp_sem_[frame_slot_], VK_NULL_HANDLE, &index);
+    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) return;
+    VkCommandBuffer cb = Cmd();
+    VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    ib.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    ib.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ib.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib.image = swap_images_[index];
+    ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &ib;
+    vkCmdPipelineBarrier2(cb, &di);
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = swap_views_[index];
+    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.clearValue.color = {{0, 0, 0, 1}};
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {bb_w_, bb_h_}};
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &color;
+    vkCmdBeginRendering(cb, &ri);
+    std::swap(t.res, warp_img_);  // the blit takes the target's picture
+    BlitFrame(t, swap_views_[index], swap_fmt_);
+    std::swap(t.res, warp_img_);
+    VkViewport bvp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
+    vkCmdSetViewport(cb, 0, 1, &bvp);
+    if (ui_) RenderUi();
+    vkCmdEndRendering(cb);
+    open_ = false;
+    cur_ = {};
+    ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    ib.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    ib.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ib.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+    ib.dstAccessMask = 0;
+    ib.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier2(cb, &di);
+    Submit(warp_sem_[frame_slot_], present_sem_[index]);
+    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &present_sem_[index];
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &swap_;
+    pi.pImageIndices = &index;
+    VkResult r = vkQueuePresentKHR(queue_, &pi);
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR)
+        LOG_FIRST(8, "vulkan: the in-between frame's present failed: %s", VkResultName(r));
+    warp_frames_++;
+    Unbind();
+    ForgetDrawState();  // the title's next draw binds its own again
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: smooth turning: a frame in between (screen %u Hz)", refresh_hz_);
 }
 
 const std::string& VulkanBackend::ScenePassSource() {
@@ -7580,6 +7775,29 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     if (Style().motion_blur && Style().mode != kStyleRetro) MotionBlurPass(rt, ds), timed(19);
     End();
     // HDR: the finished scene before the HUD, which HdrOut compares the presented frame with
+    // smooth turning: the copy with the gun marked (no HDR chain then)
+    if (WarpWanted() && (rt.hdr_scene.w == rt.w && rt.hdr_scene.h == rt.h ||
+                         (DropImage(rt.hdr_scene),
+                          MakeImage(rt.hdr_scene, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)))) {
+        uint64_t vh, kh;
+        VkPipeline pk = Compile(kWarpHlsl, "vs", "vs_5_0", vh) && Compile(kWarpHlsl, "pack", "ps_5_0", kh)
+                            ? PassPipeline({vh, kh, kBgra, VK_FORMAT_UNDEFINED, 0, 0})
+                            : VK_NULL_HANDLE;
+        const bool kept = ds && ds->w == rt.w && ds->h == rt.h && ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+        if (pk && ds && ds->w == rt.w && ds->h == rt.h) {
+            if (dirty_) Barrier();
+            VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+            VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+            VkImageView kv[3] = {rt.res.view, ds->res.view, kept ? ds->rt_depth.view : ds->res.view};
+            float kc[12] = {kept ? 1.0f : 0.0f};
+            FullScreen(pk, {rt.hdr_scene.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, kc, 12, kv, 3);
+            End();
+            dirty_ = true;
+            rt.hdr_frame = presents_ + 1;
+        }
+    }
     if (swap_hdr_ && (rt.hdr_scene.w == rt.w && rt.hdr_scene.h == rt.h ||
                       (DropImage(rt.hdr_scene), MakeImage(rt.hdr_scene, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
                                                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -8401,6 +8619,8 @@ void VulkanBackend::LogPerf() {
          "submissions a frame, %zu pipelines, %zu textures, %zu targets",
          perf_frames_ / el, el * 1000 / perf_frames_, perf_wait_ / perf_frames_, double(perf_draws_) / perf_frames_,
          double(perf_submits_) / perf_frames_, pipelines_.size(), textures_.size(), targets_.size());
+    if (warp_frames_) LOGR("perf: vulkan smooth turning: %.1f in-between frames a second (screen %u Hz)",
+                           double(warp_frames_) / el, refresh_hz_), warp_frames_ = 0;
     double n = double(perf_frames_);
     LOGR("perf: vulkan per frame: draw %.2f ms, present %.2f (acquire %.2f), sync %.2f, queue submits %.2f | GPU frame "
          "%.2f ms, scene pass %.3f ms (%u of %u frames), style %s",
