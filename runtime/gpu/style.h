@@ -132,6 +132,10 @@ struct GraphicsStyle {
     // brightness, as an eye adapts (only partly: a night stays darker than a day)
     int hdr_tonemap = kHdrToneOff;
     bool auto_exposure = false;
+    // motion blur (Vulkan; every style but Retro): a little blur along the way the camera's turn and movement carried
+    // each pixel since the last frame (from the depth), the gun, hands and HUD sharp
+    bool motion_blur = false;
+    float motion_blur_strength = 1.0f;  // 0 to 2
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;

@@ -89,6 +89,7 @@ void Clamp(GraphicsStyle& s) {
     s.dof = std::clamp(s.dof, 0, int(kDofModes) - 1);
     s.dof_strength = std::clamp(s.dof_strength, 0.0f, 2.0f);
     s.hdr_tonemap = std::clamp(s.hdr_tonemap, 0, int(kHdrTones) - 1);
+    s.motion_blur_strength = std::clamp(s.motion_blur_strength, 0.0f, 2.0f);
 }
 
 int Index(const std::string& v, const char* const* names, int n, int fallback) {
@@ -110,7 +111,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "materials", "material_strength", "surface_depth", "relief_high", "displacement", "displace_depth",
                                   "ground_detail", "detail_strength", "detail_distance",
                                   "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "blood",
-                                  "depth_of_field", "dof_strength", "hdr_tonemap", "auto_exposure"};
+                                  "depth_of_field", "dof_strength", "hdr_tonemap", "auto_exposure",
+                                  "motion_blur", "motion_blur_strength"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -208,6 +210,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     num("dof_strength", s.dof_strength);
     named("hdr_tonemap", s.hdr_tonemap, kHdrToneNames, 3);
     flag("auto_exposure", s.auto_exposure);
+    flag("motion_blur", s.motion_blur);
+    num("motion_blur_strength", s.motion_blur_strength);
     Clamp(s);
 }
 
@@ -283,7 +287,9 @@ toml::table Write(const GraphicsStyle& s) {
                        {"depth_of_field", kDofNames[s.dof]},
                        {"dof_strength", double(s.dof_strength)},
                        {"hdr_tonemap", kHdrToneNames[s.hdr_tonemap]},
-                       {"auto_exposure", s.auto_exposure}};
+                       {"auto_exposure", s.auto_exposure},
+                       {"motion_blur", s.motion_blur},
+                       {"motion_blur_strength", double(s.motion_blur_strength)}};
 }
 
 // the built-in presets
@@ -568,6 +574,8 @@ void ApplyPreset(const StylePreset& p) {
     g_style.dof_strength = keep.dof_strength;
     g_style.hdr_tonemap = keep.hdr_tonemap;
     g_style.auto_exposure = keep.auto_exposure;
+    g_style.motion_blur = keep.motion_blur;
+    g_style.motion_blur_strength = keep.motion_blur_strength;
     StyleChanged();
 }
 
@@ -636,7 +644,7 @@ bool StylePassWanted() {
 bool ScenePassWanted() {
     return StylePassWanted() ||
            ((app::Get().smaa || g_style.effect_lights || g_style.atmosphere || g_style.bounce_light || g_style.dof ||
-             g_style.weather || g_style.hdr_tonemap ||
+             g_style.weather || g_style.hdr_tonemap || g_style.motion_blur ||
              (g_style.ray_tracing && g_ray_tracing.load())) &&
             g_style.mode != kStyleRetro);
 }
@@ -846,6 +854,11 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::SliderFloat("Blur", &s.dof_strength, 0.0f, 2.0f, "%.2f");
         ImGui::TextDisabled("Distance: far scenery soft. Focus: what the crosshair is on sharp, nearer and farther\n"
                             "soft, more while aiming down the sights. The gun stays sharp (Vulkan; not in Retro).");
+    }
+    if (ImGui::CollapsingHeader("Motion blur", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::Checkbox("Motion blur", &s.motion_blur);
+        changed |= ImGui::SliderFloat("Amount##mb", &s.motion_blur_strength, 0.0f, 2.0f, "%.2f");
+        ImGui::TextDisabled("A little blur as the camera turns and moves; the gun and HUD stay sharp (Vulkan; not in Retro).");
     }
     if (ImGui::CollapsingHeader("HDR tone mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
         int h = s.hdr_tonemap;

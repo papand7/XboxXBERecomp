@@ -1468,6 +1468,59 @@ float4 resolve(O i) : SV_Target {
 }
 )";
 
+// motion blur (VulkanBackend::MotionBlurPass): each pixel's place in the world (the depth, the view's inverse) put
+// through the last frame's view: the way it moved on screen, a share of it (the shutter) and at most a cap, sampled
+// along. The gun and hands (drawn after the mid-frame clear: nearer than the kept depth) stay sharp and are not
+// smeared into the world; a jump too large to be motion (a cut) none. b1 p[8]: [0] 1/width, 1/height, tan of half
+// the vertical view, width / height; [1] the kept depth is there, the shutter, the cap (parts of the height),
+// samples; [2..4] the view to the world now; [5..7] the world to the last frame's view. t0 the scene, t1 its depth,
+// t2 the depth kept at the clear.
+const char* kMotionHlsl = R"(
+cbuffer P : register(b1) { float4 p[8]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D<float> keptz : register(t2);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z); }
+float2 screenuv(float3 v) { return v.xy / (v.z * p[0].z * float2(p[0].w, -1)) * 0.5 + 0.5; }
+float3 toworld(float3 v) { return float3(dot(p[2].xyz, v) + p[2].w, dot(p[3].xyz, v) + p[3].w, dot(p[4].xyz, v) + p[4].w); }
+float3 tolast(float3 w) { return float3(dot(p[5].xyz, w) + p[5].w, dot(p[6].xyz, w) + p[6].w, dot(p[7].xyz, w) + p[7].w); }
+bool gun(float2 uv) { return p[1].x != 0 && depthtex.SampleLevel(pt, uv, 0) < keptz.SampleLevel(pt, uv, 0) - 1e-6; }
+float4 ps(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    if (gun(uv)) return float4(c, 1);
+    float d = p[1].x != 0 ? keptz.SampleLevel(pt, uv, 0) : depthtex.SampleLevel(pt, uv, 0);
+    float z = d >= 0.99999 ? 3000 : d * 4096;  // the sky: far, so it blurs with the turn alone
+    float3 v = tolast(toworld(viewpos(uv, z)));
+    if (v.z <= 0.05) return float4(c, 1);
+    float2 vel = (uv - screenuv(v)) * p[1].y;
+    float len = length(vel * float2(p[0].w, 1));
+    if (len < 0.0005 || len > 0.25 * p[1].y) return float4(c, 1);  // still, or a cut
+    vel *= min(1, p[1].z / len);
+    int n = int(p[1].w);
+    float j = frac(sin(dot(i.pos.xy, float2(12.9898, 78.233))) * 43758.5453);
+    float3 sum = c;
+    float wsum = 1;
+    [loop] for (int k = 0; k < n; k++) {
+        float2 q = uv + vel * ((k + j) / n - 0.5);
+        if (gun(q)) continue;
+        sum += scene.SampleLevel(ls, q, 0).rgb;
+        wsum += 1;
+    }
+    return float4(sum / wsum, 1);
+}
+)";
+
 const char* kDofHlsl = R"(
 cbuffer P : register(b1) { float4 p[4]; };
 Texture2D scene : register(t0);
@@ -2854,12 +2907,16 @@ private:
     void AtmospherePass(Target& rt, Target* ds);  // light shafts and fog (GraphicsStyle::atmosphere)
     void BouncePass(Target& rt, Target* ds);      // bounced light (GraphicsStyle::bounce_light)
     void DofPass(Target& rt, Target* ds);         // depth of field (GraphicsStyle::dof)
+    void MotionBlurPass(Target& rt, Target* ds);  // motion blur (GraphicsStyle::motion_blur)
+    float mb_last_[3][4] = {};                    // the last frame's world to view (MotionBlurPass)
+    uint64_t mb_frame_ = 0;                       // the frame (presents_ + 1) it was kept for
     bool DofWanted() const { return Style().dof != kDofOff && Style().mode != kStyleRetro; }
     // the scene's passes that read the world's distance (the depth kept at the mid-frame clear, RtKeepDepth)
     bool KeptDepthWanted() const {
         const GraphicsStyle& st = Style();
         return DofWanted() || st.mode == kStyleNoir ||
-               (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light || QualityAo(st) > 0 || st.weather));
+               (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light || QualityAo(st) > 0 || st.weather ||
+                                           st.motion_blur));
     }
     float dof_aim_ = 0;          // aiming down the sights, eased 0 to 1
     uint32_t scene_zwrites_ = 0;  // the frame's 3D draws that wrote the scene's depth
@@ -3025,7 +3082,7 @@ private:
     static constexpr const char* kPassNames[24] = {"relight", "rt ao", "rt reflect", "gtao", "lights", "bounce",
                                                    "atmosphere", "weather", "tone", "style", "smaa", "dof",
                                                    "rt-gi", "rt-lit", "rt-vol", "rt-build",
-                                                   "lt-tiles", "lt-pick", "lt-light", nullptr, nullptr, nullptr, nullptr, nullptr};
+                                                   "lt-tiles", "lt-pick", "lt-light", "motion", nullptr, nullptr, nullptr, nullptr};
     double pass_ms_[24] = {};
     uint32_t pass_n_[24] = {};
     bool frame_stamp_due_ = true;
@@ -5422,8 +5479,8 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }();
     pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
     if (!draw_2d_ && bound_ds_) scene_wbuf_ = pk.wbuf;
-    // snow: how much of the world is snow, and (without ray tracing's capture) the level's camera
-    if (WeatherWanted() && !draw_2d_ && sh.prog && pk.wbuf && a.topology == Topology::Triangles && !sh.quad &&
+    // snow: how much of the world is snow, and (without ray tracing's capture) the level's camera (snow, motion blur)
+    if ((WeatherWanted() || (Style().motion_blur && Style().mode != kStyleRetro)) && !draw_2d_ && sh.prog && pk.wbuf && a.topology == Topology::Triangles && !sh.quad &&
         bound_ds_ && bound_ds_->rt_depth_frame != presents_ + 1) {
         uint64_t n = (a.index_count ? a.index_count : a.draw_count) / 3;
         const SkyCheck sky = SkyDraw(s, a, sh);
@@ -7428,6 +7485,7 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     if (StylePassWanted()) StylePass(rt, ds), timed(9);
     if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt), timed(10);
     if (DofWanted()) DofPass(rt, ds), timed(11);
+    if (Style().motion_blur && Style().mode != kStyleRetro) MotionBlurPass(rt, ds), timed(19);
     End();
     // HDR: the finished scene before the HUD, which HdrOut compares the presented frame with
     if (swap_hdr_ && (rt.hdr_scene.w == rt.w && rt.hdr_scene.h == rt.h ||
@@ -7928,6 +7986,66 @@ void VulkanBackend::ToneResolve(Target& rt) {
     static bool said = false;
     if (!said) said = true, LOGR("vulkan: HDR tone mapping drawn (%s%s)", st.hdr_tonemap == kHdrToneAgx ? "AgX" : "ACES",
                                  st.auto_exposure ? ", auto exposure" : "");
+}
+
+// motion blur over the finished scene (kMotionHlsl): the level's camera now and the last frame's
+void VulkanBackend::MotionBlurPass(Target& rt, Target* ds) {
+    const GraphicsStyle& st = Style();
+    if (!ds || ds->w != rt.w || ds->h != rt.h || !scene_wbuf_ || rt_cams_.empty()) return;
+    uint64_t vh, ph;
+    if (!Compile(kMotionHlsl, "vs", "vs_5_0", vh) || !Compile(kMotionHlsl, "ps", "ps_5_0", ph)) {
+        LOG_FIRST(1, "vulkan: the motion blur did not compile; none drawn");
+        return;
+    }
+    VkPipeline pl = PassPipeline({vh, ph, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pl) return;
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    // the level's camera (the most triangles), as WeatherPass takes it
+    const RtCam* cam = nullptr;
+    for (const auto& [h, c] : rt_cams_)
+        if (!cam || c.tris > cam->tris) cam = &c;
+    const float ty = 0.5774f, aspect = float(rt.w) / float(rt.h);
+    const float scale[3] = {ty * aspect, ty, 1};
+    float m[3][4];
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 4; k++) m[r][k] = cam->r[r][k] * scale[r];
+    float a = m[0][0], b = m[0][1], c3 = m[0][2], d = m[1][0], e = m[1][1], f = m[1][2], g = m[2][0], h = m[2][1], k = m[2][2];
+    float det = a * (e * k - f * h) - b * (d * k - f * g) + c3 * (d * h - e * g);
+    const bool last = mb_frame_ == presents_;
+    if (std::abs(det) < 1e-12f || !last) {
+        std::memcpy(mb_last_, m, sizeof(m));
+        mb_frame_ = presents_ + 1;
+        return;
+    }
+    float inv[3][4] = {{(e * k - f * h) / det, (c3 * h - b * k) / det, (b * f - c3 * e) / det, 0},
+                       {(f * g - d * k) / det, (a * k - c3 * g) / det, (c3 * d - a * f) / det, 0},
+                       {(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det, 0}};
+    for (int r = 0; r < 3; r++) inv[r][3] = -(inv[r][0] * m[0][3] + inv[r][1] * m[1][3] + inv[r][2] * m[2][3]);
+    const bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    float c[32] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
+                   kept ? 1.0f : 0.0f, 0.25f * st.motion_blur_strength, 0.008f * st.motion_blur_strength, 8.0f};
+    std::memcpy(c + 8, inv, sizeof(inv));
+    std::memcpy(c + 20, mb_last_, sizeof(mb_last_));
+    std::memcpy(mb_last_, m, sizeof(m));
+    mb_frame_ = presents_ + 1;
+    if (st.motion_blur_strength <= 0) return;
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[3] = {rt.fb.view, ds->res.view, kept ? ds->rt_depth.view : ds->res.view};
+    FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 32, views, 3);
+    End();
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: motion blur drawn (amount %.2f)", st.motion_blur_strength);
 }
 
 // light shafts and fog over the scene: what lights the air at a quarter size, halved four times to a field that
