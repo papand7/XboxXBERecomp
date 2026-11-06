@@ -487,6 +487,7 @@ struct Target {
     // distance), cleared at the frame's first; the lights it makes, a tile each (RGBA32F: colour and brightness;
     // where, as the screen's fractions and the distance)
     Image glow, light_a, light_b, light_list;
+    Image light_pa, light_pb, light_rank;  // the tiles' 8 x 8 parts' sums, the tiles' ranks
     Image atmo[5];  // light shafts and fog: a quarter of the scene's size, then each half the one before
     Image atmo_pick;  // their lights: each quarter's bright centre, the sky's colour
     Image bounce;     // bounced light: the gathered light, a quarter of the scene's size
@@ -2075,7 +2076,7 @@ float4 gi(O i) : SV_Target {
 }
 static const float kVolFar = 90, kVolDensity = 0.002;
 // the game's lights in the air at X, each with its shadow: a glow about the lamp more than the reach's broad light
-float3 airlamps(float3 X) {
+float3 airlamps(float3 X, float w) {
     float3 added = 0;
     [loop] for (int n = 0; n < int(p[1].x); n++) {
         float4 a = p[8 + 2 * n];
@@ -2085,6 +2086,12 @@ float3 airlamps(float3 X) {
         float att = 1 - sqrt(d2 / r2);
         float3 e = p[9 + 2 * n].rgb * (att * att * p[4].w / (1 + 64 * d2 / r2));
         if (dot(e, float3(0.3, 0.59, 0.11)) < 0.01) continue;
+        // what it adds to the pixel (times the step's weight): too little to show, half of it untraced
+        float shows = dot(e, float3(0.3, 0.59, 0.11)) * w;
+        if (shows < 4e-5) {
+            added += e * 0.5;
+            continue;
+        }
         float dl = sqrt(d2);
         added += e * open(X, D / max(dl, 1e-4), dl * 0.95);
     }
@@ -2110,9 +2117,10 @@ float4 vol(O i) : SV_Target {
         float t = (k + j) * dt;
         float3 X = dir * t;
         float w = exp(-sigma * 0.5 * t) * sigma * dt;
-        float3 l = airlamps(X) * 2 * w;
+        float3 l = airlamps(X, 2 * w) * 2 * w;
         lsum += l;
-        if (p[2].w > 0) sum += sunl * open(X, p[2].xyz, kFar) * w;
+        // the sun's ray only where its light here would show (a night's moonlit air adds little a step)
+        if (p[2].w > 0) sum += sunl * w * (dot(sunl * w, float3(0.3, 0.59, 0.11)) < 4e-5 ? 0.5 : open(X, p[2].xyz, kFar));
     }
     // XBE_RT_TEST=8: the sun's share red, the lamps' green
     if (int(p[1].z) == 8) return float4(dot(sum, 0.33), dot(lsum, 0.33), 0, tmax);
@@ -2248,6 +2256,66 @@ void sums(float2 tpos, out float4 a, out float4 b) {
 }
 float4 tilea(O i) : SV_Target { float4 a, b; sums(i.pos.xy, a, b); return a; }
 float4 tileb(O i) : SV_Target { float4 a, b; sums(i.pos.xy, a, b); return b; }
+// the same sums in two steps, so the GPU's many threads share them (a tile's one thread summed thousands of pixels):
+// parta / partb a tile cut 8 x 8 (a pixel each part: the same pixels the tile takes, every second each way), a the
+// colour and brightness summed, b the brightness' places, distance and the count; parttilea / parttileb a tile's 64
+// parts added (t0 the parts' a, t2 their b), then as sums gives
+void partsums(float2 ppos, out float4 a, out float4 b) {
+    int2 pp = int2(ppos), t = pp / 8, s = pp % 8;
+    float2 tile = p[0].xy / p[2].xy;
+    int2 o = int2(t * tile), e = int2(min((t + 1) * tile, p[0].xy));
+    int2 ns = (e - o + 1) / 2, i0 = s * ns / 8, i1 = (s + 1) * ns / 8;
+    float3 rgb = 0;
+    float l = 0, lu = 0, lv = 0, lz = 0, n = 0;
+    [loop] for (int y = i0.y; y < i1.y; y++)
+        [loop] for (int x = i0.x; x < i1.x; x++) {
+            int2 q = o + 2 * int2(x, y);
+            float4 g = t0.Load(int3(q, 0));
+            float w = dot(g.rgb, float3(0.3, 0.59, 0.11));
+            rgb += g.rgb;
+            l += w;
+            lu += w * (q.x + 0.5);
+            lv += w * (q.y + 0.5);
+            lz += g.a;
+            n += 1;
+        }
+    a = float4(rgb, l);
+    b = float4(lu, lv, lz, n);
+}
+float4 parta(O i) : SV_Target { float4 a, b; partsums(i.pos.xy, a, b); return a; }
+float4 partb(O i) : SV_Target { float4 a, b; partsums(i.pos.xy, a, b); return b; }
+void tilesums(float2 tpos, out float4 a, out float4 b) {
+    int2 t = int2(tpos);
+    float4 sa = 0, sb = 0;
+    [unroll] for (int y = 0; y < 8; y++)
+        [unroll] for (int x = 0; x < 8; x++) {
+            sa += t0.Load(int3(t * 8 + int2(x, y), 0));
+            sb += t2.Load(int3(t * 8 + int2(x, y), 0));
+        }
+    a = sa / max(sb.w, 1);
+    b = sa.w > 1e-5 ? float4(sb.x / sa.w / p[0].x, sb.y / sa.w / p[0].y, sb.z / sa.w, 0) : 0;
+}
+float4 parttilea(O i) : SV_Target { float4 a, b; tilesums(i.pos.xy, a, b); return a; }
+float4 parttileb(O i) : SV_Target { float4 a, b; tilesums(i.pos.xy, a, b); return b; }
+// rank: each tile's place among them by brightness (a thread each); pickrank: the n-th listed by its rank (t0 the
+// ranks, t2 t3 the tiles), as pick lists them
+float4 rank(O i) : SV_Target {
+    int2 t = int2(i.pos.xy);
+    int tx = int(p[2].x), n = tx * int(p[2].y), j = t.y * tx + t.x, r = 0;
+    float lj = t2.Load(int3(t, 0)).w;
+    [loop] for (int k = 0; k < n; k++) {
+        float lk = t2.Load(int3(k % tx, k / tx, 0)).w;
+        r += lk > lj || (lk == lj && k < j) ? 1 : 0;
+    }
+    return float4(r, 0, 0, 0);
+}
+float4 pickrank(O i) : SV_Target {
+    int px = int(i.pos.x), want = px >> 1, tx = int(p[2].x), n = tx * int(p[2].y);
+    [loop] for (int j = 0; j < n; j++)
+        if (int(t0.Load(int3(j % tx, j / tx, 0)).r) == want)
+            return (px & 1) ? t3.Load(int3(j % tx, j / tx, 0)) : t2.Load(int3(j % tx, j / tx, 0));
+    return 0;
+}
 // pick: the brightest tiles listed, brightest first: pixel 2n the n-th's a, 2n + 1 its b (t2 t3 the tiles); the light
 // pass reads the list from t2 and goes through p[0].w of them
 float4 pick(O i) : SV_Target {
@@ -2304,8 +2372,12 @@ float4 light(O i) : SV_Target {
             float ndl = saturate((dot(N, D * rsqrt(d2)) + 0.15) / 1.15);
             float3 e = a.rgb * (omega * zl * zl / d2 * ndl);
 #ifdef RT
-            // a shadow: anything between the surface and the light (only for a light that shows)
-            if (dot(e, float3(0.3, 0.59, 0.11)) * p[1].x * p[3].z > 0.004) {
+            // a shadow: anything between the surface and the light, only where the light shows on this pixel (it adds
+            // (c + 0.03) times it: on a dark surface a dim light changes nothing an 8 bit picture keeps); one that would
+            // not show counts half, so the error stays under a quarter of a step
+            float shows = dot(e * (c + 0.03), float3(0.3, 0.59, 0.11)) * p[1].x * p[3].z;
+            if (dot(e, float3(0.3, 0.59, 0.11)) * p[1].x * p[3].z > 0.004 && shows < 0.001) e *= 0.5;
+            else if (dot(e, float3(0.3, 0.59, 0.11)) * p[1].x * p[3].z > 0.004) {
                 float dl = length(D);
                 RayDesc ray;
                 ray.Origin = P + N * (0.01 + 0.002 * P.z);
@@ -2925,6 +2997,7 @@ private:
         DropImage(t.smaa_edges), DropImage(t.smaa_weights), DropImage(t.mask), DropImage(t.mask_ds);
         DropImage(t.soft_depth);
         DropImage(t.glow), DropImage(t.light_a), DropImage(t.light_b), DropImage(t.light_list);
+        DropImage(t.light_pa), DropImage(t.light_pb), DropImage(t.light_rank);
         DropImage(t.rt_ao), DropImage(t.rt_depth), DropImage(t.rt_gi), DropImage(t.rt_vol), DropImage(t.gtao);
         DropImage(t.dof_focus[0]), DropImage(t.dof_focus[1]);
         DropImage(t.hdr_scene);
@@ -2942,12 +3015,13 @@ private:
     VkQueryPool stamps_ = VK_NULL_HANDLE;
     uint32_t stamp_written_[kFramesInFlight] = {};  // bits of those written
     // the scene pass's passes timed (XBE_PERF's log): stamp 4 + k after pass k, its time from the stamp before
-    static constexpr uint32_t kStamps = 4 + 16;
-    static constexpr const char* kPassNames[16] = {"relight", "rt ao", "rt reflect", "gtao", "lights", "bounce",
+    static constexpr uint32_t kStamps = 4 + 24;
+    static constexpr const char* kPassNames[24] = {"relight", "rt ao", "rt reflect", "gtao", "lights", "bounce",
                                                    "atmosphere", "weather", "tone", "style", "smaa", "dof",
-                                                   nullptr, nullptr, nullptr, nullptr};
-    double pass_ms_[16] = {};
-    uint32_t pass_n_[16] = {};
+                                                   "rt-gi", "rt-lit", "rt-vol", "rt-build",
+                                                   "lt-tiles", "lt-pick", "lt-light", nullptr, nullptr, nullptr, nullptr, nullptr};
+    double pass_ms_[24] = {};
+    uint32_t pass_n_[24] = {};
     bool frame_stamp_due_ = true;
     double gpu_frame_ms_ = 0, gpu_post_ms_ = 0;
     uint32_t gpu_frames_ = 0, gpu_posts_ = 0;
@@ -5923,7 +5997,10 @@ bool VulkanBackend::RtBuild(float aspect) {
     for (Level& l : lv) {
         l.info = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
         l.info.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        l.info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+        // the world's traced for fast rays (its build costs a little more, the passes' many rays a lot less); the
+        // gun's few triangles for a fast build
+        l.info.flags = &l == &lv[0] ? VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+                                    : VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
         l.info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         l.info.geometryCount = l.ng;
         l.info.pGeometries = l.g;
@@ -6302,6 +6379,7 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
         VkRect2D gsc{{0, 0}, {gw, gh}};
         FullScreen(pgi, {rt.rt_gi.att, VK_NULL_HANDLE, gw, gh}, gvp, gsc, c, floats, gv, 4, rt_[frame_slot_].tlas);
         End();
+        Stamp(4 + 12);
         Barrier();
         static bool said_gi = false;
         if (!said_gi) said_gi = true, LOGR("vulkan: ray traced bounced light drawn (%d rays at %ux%u, strength %.2f)", kGiRays, gw, gh, st.rt_gi_strength);
@@ -6309,12 +6387,14 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
     VkImageView views[4] = {rt.fb.view, ds->res.view, keptv, pgi ? rt.rt_gi.view : dummy_.view};
     FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, floats, views, 4, rt_[frame_slot_].tlas);
     End();
+    Stamp(4 + 13);
     if (pvol) {
         VkImageView vv[4] = {rt.fb.view, ds->res.view, keptv, dummy_.view};
         VkViewport vvp{0, 0, float(gw), float(gh), 0, 1};
         VkRect2D vsc{{0, 0}, {gw, gh}};
         FullScreen(pvol, {rt.rt_vol.att, VK_NULL_HANDLE, gw, gh}, vvp, vsc, c, floats, vv, 4, rt_[frame_slot_].tlas);
         End();
+        Stamp(4 + 14);
         Barrier();
         vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
         dirty_ = true;
@@ -6446,10 +6526,11 @@ void VulkanBackend::DrawGlow(const Assembled& a, PsoKey k, const DrawShaders& sh
 void VulkanBackend::LightPass(Target& rt, Target* ds) {
     const GraphicsStyle& st = Style();
     if (!ds || ds->w != rt.w || ds->h != rt.h || !rt.glow.img || rt.glow_frame != presents_ + 1) return;
-    uint64_t vh, ah, bh, kh, lh;
-    if (!Compile(kLightsHlsl, "vs", "vs_5_0", vh) || !Compile(kLightsHlsl, "tilea", "ps_5_0", ah) ||
-        !Compile(kLightsHlsl, "pick", "ps_5_0", kh) ||
-        !Compile(kLightsHlsl, "tileb", "ps_5_0", bh) || !Compile(kLightsHlsl, "light", "ps_5_0", lh)) {
+    uint64_t vh, ah, bh, kh, lh, pah, pbh, rh;
+    if (!Compile(kLightsHlsl, "vs", "vs_5_0", vh) || !Compile(kLightsHlsl, "parttilea", "ps_5_0", ah) ||
+        !Compile(kLightsHlsl, "pickrank", "ps_5_0", kh) || !Compile(kLightsHlsl, "parttileb", "ps_5_0", bh) ||
+        !Compile(kLightsHlsl, "light", "ps_5_0", lh) || !Compile(kLightsHlsl, "parta", "ps_5_0", pah) ||
+        !Compile(kLightsHlsl, "partb", "ps_5_0", pbh) || !Compile(kLightsHlsl, "rank", "ps_5_0", rh)) {
         LOG_FIRST(1, "vulkan: the effect lights' passes did not compile; effects light nothing");
         return;
     }
@@ -6472,12 +6553,18 @@ void VulkanBackend::LightPass(Target& rt, Target* ds) {
     VkPipeline pb = PassPipeline({vh, bh, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
     VkPipeline pk = PassPipeline({vh, kh, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
     VkPipeline pl = traced ? plt : PassPipeline({vh, lh, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0});
-    if (!pa || !pb || !pk || !pl) return;
+    VkPipeline ppa = PassPipeline({vh, pah, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline ppb = PassPipeline({vh, pbh, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pr = PassPipeline({vh, rh, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pa || !pb || !pk || !pl || !ppa || !ppb || !pr) return;
     const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if ((!rt.light_a.img && !MakeImage(rt.light_a, VK_IMAGE_TYPE_2D, kTileFormat, kLightTilesX, kLightTilesY, 1, 1, 1, u)) ||
         (!rt.light_b.img && !MakeImage(rt.light_b, VK_IMAGE_TYPE_2D, kTileFormat, kLightTilesX, kLightTilesY, 1, 1, 1, u)) ||
         (!rt.light_list.img && !MakeImage(rt.light_list, VK_IMAGE_TYPE_2D, kTileFormat, kLights * 2, 1, 1, 1, 1, u)) ||
+        (!rt.light_pa.img && !MakeImage(rt.light_pa, VK_IMAGE_TYPE_2D, kTileFormat, kLightTilesX * 8, kLightTilesY * 8, 1, 1, 1, u)) ||
+        (!rt.light_pb.img && !MakeImage(rt.light_pb, VK_IMAGE_TYPE_2D, kTileFormat, kLightTilesX * 8, kLightTilesY * 8, 1, 1, 1, u)) ||
+        (!rt.light_rank.img && !MakeImage(rt.light_rank, VK_IMAGE_TYPE_2D, kTileFormat, kLightTilesX, kLightTilesY, 1, 1, 1, u)) ||
         (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
         return;
@@ -6493,18 +6580,35 @@ void VulkanBackend::LightPass(Target& rt, Target* ds) {
     c[15] = kept ? 1.0f : 0.0f;
     End();
     if (dirty_) Barrier();
+    // the glow's tiles summed: 8 x 8 parts each first (a thread each), then the parts added a tile each
+    const uint32_t pw = kLightTilesX * 8, ph = kLightTilesY * 8;
+    VkViewport pv{0, 0, float(pw), float(ph), 0, 1};
+    VkRect2D ps{{0, 0}, {pw, ph}};
+    FullScreen(ppa, {rt.light_pa.att, VK_NULL_HANDLE, pw, ph}, pv, ps, c, 16, &rt.glow.view, 1);
+    End();
+    FullScreen(ppb, {rt.light_pb.att, VK_NULL_HANDLE, pw, ph}, pv, ps, c, 16, &rt.glow.view, 1);
+    End();
+    Barrier();
     VkViewport tv{0, 0, float(kLightTilesX), float(kLightTilesY), 0, 1};
     VkRect2D ts{{0, 0}, {kLightTilesX, kLightTilesY}};
-    FullScreen(pa, {rt.light_a.att, VK_NULL_HANDLE, kLightTilesX, kLightTilesY}, tv, ts, c, 16, &rt.glow.view, 1);
+    VkImageView parts[3] = {rt.light_pa.view, VK_NULL_HANDLE, rt.light_pb.view};
+    FullScreen(pa, {rt.light_a.att, VK_NULL_HANDLE, kLightTilesX, kLightTilesY}, tv, ts, c, 16, parts, 3);
     End();
-    FullScreen(pb, {rt.light_b.att, VK_NULL_HANDLE, kLightTilesX, kLightTilesY}, tv, ts, c, 16, &rt.glow.view, 1);
+    FullScreen(pb, {rt.light_b.att, VK_NULL_HANDLE, kLightTilesX, kLightTilesY}, tv, ts, c, 16, parts, 3);
+    End();
+    Stamp(4 + 16);
+    Barrier();
+    // the brightest listed: each tile's rank (a thread each), then the list by rank
+    VkImageView ranked[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, rt.light_a.view};
+    FullScreen(pr, {rt.light_rank.att, VK_NULL_HANDLE, kLightTilesX, kLightTilesY}, tv, ts, c, 16, ranked, 3);
     End();
     Barrier();
     VkViewport lv{0, 0, float(kLights * 2), 1, 0, 1};
     VkRect2D ls{{0, 0}, {kLights * 2, 1}};
-    VkImageView tiles[4] = {rt.glow.view, VK_NULL_HANDLE, rt.light_a.view, rt.light_b.view};
+    VkImageView tiles[4] = {rt.light_rank.view, VK_NULL_HANDLE, rt.light_a.view, rt.light_b.view};
     FullScreen(pk, {rt.light_list.att, VK_NULL_HANDLE, kLights * 2, 1}, lv, ls, c, 16, tiles, 4);
     End();
+    Stamp(4 + 17);
     Barrier();
     VkImageCopy cp{};
     cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -6517,6 +6621,7 @@ void VulkanBackend::LightPass(Target& rt, Target* ds) {
     FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4,
                traced ? rt_[frame_slot_].tlas : VK_NULL_HANDLE);
     End();
+    Stamp(4 + 18);
 }
 
 // a particle: blended over the 3D scene (alpha blended, or added), depth tested but not written, no reflective
@@ -7283,6 +7388,7 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     End();
     Stamp(2);
     rt_built_ = RtWanted() && ds && ds->w == rt.w && ds->h == rt.h && RtBuild(float(rt.w) / float(rt.h));
+    if (rt_built_) End(), Stamp(4 + 15);
     rt_gi_drawn_ = false;
     tone_drawn_ = Style().hdr_tonemap && Style().mode != kStyleRetro && ToneBegin(rt);
     auto timed = [&](uint32_t k) { End(), Stamp(4 + k); };
@@ -7958,13 +8064,15 @@ void VulkanBackend::ReadStamps(uint32_t slot) {
     double ns = props_.limits.timestampPeriod;
     if ((w & 3) == 3 && t[1] > t[0]) gpu_frame_ms_ += double(t[1] - t[0]) * ns / 1e6, gpu_frames_++;
     if ((w & 12) == 12 && t[3] > t[2]) gpu_post_ms_ += double(t[3] - t[2]) * ns / 1e6, gpu_posts_++;
-    // each pass: from the stamp before it (the scene pass's start, 2, or the pass before's)
+    // each pass: from the stamp just before it in time (the scene pass's start, 2, or another pass's end)
     if (w & 4)
-        for (uint32_t k = 0, before = 2; k < 16; k++)
-            if (w >> (4 + k) & 1) {
-                if (t[4 + k] >= t[before]) pass_ms_[k] += double(t[4 + k] - t[before]) * ns / 1e6, pass_n_[k]++;
-                before = 4 + k;
-            }
+        for (uint32_t k = 0; k < 24; k++) {
+            if (!(w >> (4 + k) & 1)) continue;
+            uint64_t before = t[2];
+            for (uint32_t j = 0; j < 24; j++)
+                if (j != k && (w >> (4 + j) & 1) && t[4 + j] <= t[4 + k] && t[4 + j] > before) before = t[4 + j];
+            if (t[4 + k] >= before) pass_ms_[k] += double(t[4 + k] - before) * ns / 1e6, pass_n_[k]++;
+        }
     vkResetQueryPool(dev_, stamps_, slot * kStamps, kStamps);
     stamp_written_[slot] = 0;
 }
@@ -7988,11 +8096,11 @@ void VulkanBackend::LogPerf() {
     {
         std::string passes;
         char one[48];
-        for (uint32_t k = 0; k < 16; k++)
+        for (uint32_t k = 0; k < 24; k++)
             if (pass_n_[k] && kPassNames[k])
                 std::snprintf(one, sizeof(one), " %s %.2f", kPassNames[k], pass_ms_[k] / pass_n_[k]), passes += one;
         if (!passes.empty()) LOGR("perf: vulkan scene passes (GPU ms):%s", passes.c_str());
-        for (uint32_t k = 0; k < 16; k++) pass_ms_[k] = 0, pass_n_[k] = 0;
+        for (uint32_t k = 0; k < 24; k++) pass_ms_[k] = 0, pass_n_[k] = 0;
     }
     LOGR("perf: vulkan draws a frame: %.0f 2D, %.0f vertex programs, %.0f fixed function (%.0f lit)",
          perf_2d_ / n, perf_prog_ / n, perf_fixed_ / n, perf_lit_ / n);
