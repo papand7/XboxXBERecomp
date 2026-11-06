@@ -5337,9 +5337,12 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
     std::sort(nearest.begin(), nearest.end(), [](const Near& a, const Near& b) { return a.key < b.key; });
     uint32_t lights = uint32_t(std::min<size_t>(nearest.size(), kRtLights));
     for (uint32_t i = 0; i < lights; i++) std::memcpy(&c[(8 + 2 * i) * 4], nearest[i].v, sizeof(nearest[i].v));
-    // the sun: high and to one side, the world's +y up
-    const float sun_w[3] = {0.42f, 0.80f, 0.43f};
-    float sun[3];
+    // the sun (SunDirection, the world's +y up): warmer the lower it stands
+    float sun_w[3], sun[3];
+    SunDirection(sun_w);
+    float wl = std::sqrt(sun_w[0] * sun_w[0] + sun_w[1] * sun_w[1] + sun_w[2] * sun_w[2]);
+    float high = std::clamp(wl > 0 ? sun_w[1] / wl : 1.0f, 0.0f, 1.0f);
+    float low = 1.0f - std::clamp((high - 0.35f) / 0.45f, 0.0f, 1.0f);
     place(sun_w, 0, sun);
     float sl = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
     for (float& v : sun) v = sl > 0 ? v / sl : 0;
@@ -5352,7 +5355,7 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
     const float p[8 * 4] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
                             float(lights), kept ? 1.0f : 0.0f, float(test), 0,
                             sun[0], sun[1], sun[2], st.rt_sun,
-                            1.00f, 0.95f, 0.85f, 0.35f,
+                            1.00f, 0.95f - 0.17f * low, 0.85f - 0.30f * low, 0.35f,
                             rt_fog_[0], rt_fog_[1], rt_fog_[2], 1.2f,
                             up[0], up[1], up[2], 0.6f,
                             0.06f, 0.06f, 0.06f, 0,

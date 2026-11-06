@@ -391,7 +391,16 @@ void SetAiming(bool on) { g_aiming.store(on, std::memory_order_relaxed); }
 namespace {
 std::mutex g_lights_lock;
 std::vector<SceneLight> g_lights;
+float g_sun[3] = {0.42f, 0.80f, 0.43f};  // high and to one side
 }  // namespace
+void SetSunDirection(const float dir[3]) {
+    std::lock_guard<std::mutex> lock(g_lights_lock);
+    std::copy(dir, dir + 3, g_sun);
+}
+void SunDirection(float out[3]) {
+    std::lock_guard<std::mutex> lock(g_lights_lock);
+    std::copy(g_sun, g_sun + 3, out);
+}
 void SetSceneLights(const SceneLight* lights, uint32_t count) {
     std::lock_guard<std::mutex> lock(g_lights_lock);
     g_lights.assign(lights, lights + count);

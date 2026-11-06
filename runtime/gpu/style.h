@@ -167,5 +167,8 @@ struct SceneLight {
 };
 void SetSceneLights(const SceneLight* lights, uint32_t count);
 uint32_t SceneLights(SceneLight* out, uint32_t max);  // the latest set, at most max
+// the sun's direction for that lighting (towards it, the world's, +y up; a game may pick one per level)
+void SetSunDirection(const float dir[3]);
+void SunDirection(float out[3]);
 
 }  // namespace gpu
