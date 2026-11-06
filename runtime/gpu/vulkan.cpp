@@ -207,6 +207,8 @@ constexpr uint32_t kBindRtVerts = 12, kBindRtTris = 13;
 // and each triangle's material (a word: its texture, alpha test), the first word the opaque triangles' count; set 1
 // (not pushed, one a frame slot): the frame's textures the materials name, and the sampler they are read with
 constexpr uint32_t kBindRtMats = 14, kRtTextures = 1024;
+// and where the level lighting adds up its outdoor pixels' baked light (RtFrame::stats, RtRelightPass)
+constexpr uint32_t kBindRtStats = 15;
 constexpr uint32_t kRtLights = 64;  // the game's lights the level lighting takes, the nearest (RtRelightPass)
 // a captured vertex: its place (float4), then its texture coordinates (float2), diffuse colour (RGBA8) and a pad
 constexpr uint32_t kRtVertBytes = 32;
@@ -1523,7 +1525,8 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
 // nothing: the capture leaves the sky out) the baked light is kept, darker in shade and brighter where a ray toward
 // the sun is open, so a night level stays a night. b1 p: [0] 1/width, 1/height, tan of half the vertical view,
 // width / height; [1] the lights, the kept depth is there, test (XBE_RT_TEST=5 the light's change, halved, 6 the
-// lights as dots); [2] toward the sun, its strength; [3] the sun's colour, the baked light's share indoors; [4] the
+// lights as dots), the outdoor baked light added up into u (binding 15: red, green, blue in 64ths, pixels; every
+// eighth pixel each way); [2] toward the sun, its strength; [3] the sun's colour, the baked light's share indoors; [4] the
 // fog's colour, the lights' scale; [5] up, the shade's share outdoors; [6] the least light; [8 + 2n] a light's place
 // and reach, [9 + 2n] its colour. t0 the scene, t1 its depth, t2 the depth kept at a mid-frame clear (RtKeepDepth);
 // s1 point. Shader model 6.5.
@@ -1533,6 +1536,9 @@ Texture2D scene : register(t0);
 Texture2D<float> depthtex : register(t1);
 Texture2D<float> keptz : register(t2);
 SamplerState pt : register(s1);
+#if STATS
+[[vk::binding(15, 0)]] RWByteAddressBuffer stats;
+#endif
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
     O o;
@@ -1627,6 +1633,15 @@ float4 ps(O i) : SV_Target {
         float sl = saturate(dot(N, sun));
         if (sl > 0 && p[2].w > 0) sl *= open(o, sun, kFar);
         ratio = p[5].w + p[3].rgb * (0.75 * p[2].w * sl) + added / max(baked, 0.04);
+#if STATS
+        if (p[1].w != 0 && all((uint2(i.pos.xy) & 7) == 0)) {  // the outdoor baked light added up (the sun's colour)
+            uint3 b = uint3(min(baked, 4) * 64 + 0.5);
+            stats.InterlockedAdd(0, b.r);
+            stats.InterlockedAdd(4, b.g);
+            stats.InterlockedAdd(8, b.b);
+            stats.InterlockedAdd(12, 1);
+        }
+#endif
     }
     ratio = clamp(ratio, 0, 4);
     if (test >= 5) return float4(ratio * 0.5, 1);
@@ -2211,6 +2226,8 @@ private:
         VkDescriptorSet tex_set = VK_NULL_HANDLE;  // set 1: the textures the materials name
         uint32_t tex_written = 0;                  // of them written with a texture last time (the rest the dummy)
         Buffer inst;   // the top level's one instance (host)
+        Buffer stats;  // the level lighting's outdoor baked light: red, green, blue (64ths), pixels (host)
+        uint64_t stats_frame = 0;  // the frame that last read and cleared it
         Buffer scratch, blas_mem, tlas_mem;
         Buffer gun_blas_mem;  // the gun and hands' bottom level (RtBuild)
         VkAccelerationStructureKHR blas = VK_NULL_HANDLE, tlas = VK_NULL_HANDLE, gun_blas = VK_NULL_HANDLE;
@@ -2232,6 +2249,7 @@ private:
     void DropRt(RtFrame& f);
     RtFrame rt_[kFramesInFlight];
     bool rt_ok_ = false;  // the GPU has ray queries, and they are turned on
+    bool frag_stores_ = false;  // pixel shaders may write storage buffers (the level lighting's sums)
     VkDeviceSize rt_scratch_align_ = 256;
     VkDescriptorSetLayout rt_set_layout_ = VK_NULL_HANDLE, rt_tex_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool rt_pool_ = VK_NULL_HANDLE;
@@ -2256,6 +2274,8 @@ private:
     float rt_fog_[4] = {};
     uint64_t rt_fog_tris_[2] = {};  // the frame's world triangles drawn with fog off, on
     float rt_fogged_ = 0;           // the last frame's share fogged
+    float rt_sky_[4] = {};          // the outdoor baked light eased over frames, its weight (the sun's colour)
+    int rt_sky_kind_ = -1;          // logged: 0 day, 1 night, 2 dusk, 3 snow
     void RtRelightPass(Target& rt, Target* ds);
     uint64_t perf_rt_draws_ = 0, perf_rt_tris_ = 0;
     uint64_t rt_skips_[5] = {};  // draws not traced: not the scene, depth not written, not triangles, blended, cut-out
@@ -2552,6 +2572,8 @@ bool VulkanBackend::CreateDevice() {
     on.features.dualSrcBlend = f2.features.dualSrcBlend;
     on.features.occlusionQueryPrecise = f2.features.occlusionQueryPrecise;
     on.features.depthBiasClamp = f2.features.depthBiasClamp;
+    on.features.fragmentStoresAndAtomics = f2.features.fragmentStoresAndAtomics;
+    frag_stores_ = f2.features.fragmentStoresAndAtomics;
     fill_lines_ = f2.features.fillModeNonSolid;
     aniso_ok_ = f2.features.samplerAnisotropy;
     gs_ok_ = f2.features.geometryShader;
@@ -2772,14 +2794,15 @@ bool VulkanBackend::CreateFixed() {
     if (vkCreatePipelineLayout(dev_, &pl, nullptr, &layout_) != VK_SUCCESS) return false;
     // the ray traced passes': the same, and the acceleration structure
     if (rt_ok_) {
-        VkDescriptorSetLayoutBinding rb[kBindRtMats + 1]{};
+        VkDescriptorSetLayoutBinding rb[kBindRtStats + 1]{};
         std::memcpy(rb, b, sizeof(VkDescriptorSetLayoutBinding) * (kBindCapture + 1));
         rb[kBindTlas] = {kBindTlas, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_ALL_GRAPHICS, nullptr};
         rb[kBindRtVerts] = {kBindRtVerts, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         rb[kBindRtTris] = {kBindRtTris, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         rb[kBindRtMats] = {kBindRtMats, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        rb[kBindRtStats] = {kBindRtStats, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo rdl = dl;
-        rdl.bindingCount = kBindRtMats + 1;
+        rdl.bindingCount = kBindRtStats + 1;
         rdl.pBindings = rb;
         // set 1: the frame's textures and their sampler (repeating, linear)
         VkDescriptorSetLayoutBinding tb[2] = {
@@ -3800,7 +3823,7 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
     v.height = -vp.height;
     vkCmdSetViewport(c, 0, 1, &v);
     vkCmdSetScissor(c, 0, 1, &sc);
-    VkWriteDescriptorSet w[1 + 4 + 4 + 4]{};
+    VkWriteDescriptorSet w[1 + 4 + 4 + 5]{};
     VkDescriptorBufferInfo bi{};
     VkDescriptorImageInfo ii[4]{}, si[4]{};
     uint32_t n = 0;
@@ -3822,7 +3845,7 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
                   VK_DESCRIPTOR_TYPE_SAMPLER, &si[i], nullptr, nullptr};
     }
     VkWriteDescriptorSetAccelerationStructureKHR wa{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
-    VkDescriptorBufferInfo rv{}, rtr{}, rm{};
+    VkDescriptorBufferInfo rv{}, rtr{}, rm{}, rs{};
     if (tlas) {
         wa.accelerationStructureCount = 1;
         wa.pAccelerationStructures = &tlas;
@@ -3839,6 +3862,9 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
         rm = {f.mats.buf, 0, VK_WHOLE_SIZE};
         w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindRtMats, 0, 1,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rm, nullptr};
+        rs = {f.stats.buf ? f.stats.buf : f.mats.buf, 0, VK_WHOLE_SIZE};
+        w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindRtStats, 0, 1,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rs, nullptr};
         vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_layout_, 1, 1, &f.tex_set, 0, nullptr);
     }
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, tlas ? rt_layout_ : layout_, 0, n, w);
@@ -5289,7 +5315,7 @@ void VulkanBackend::RtReflectPass(Target& rt, Target* ds) {
 void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
     const GraphicsStyle& st = Style();
     if (!ds || ds->w != rt.w || ds->h != rt.h || !scene_wbuf_ || rt_cams_.empty()) return;
-    static const std::string src = std::string(kRtCommonHlsl) + kRtRelightHlsl;
+    static const std::string src = std::string(frag_stores_ ? "#define STATS 1\n" : "#define STATS 0\n") + kRtCommonHlsl + kRtRelightHlsl;
     uint64_t vh, ph;
     if (!Compile(src, "vs", "vs_6_5", vh) || !Compile(src, "ps", "ps_6_5", ph)) {
         LOG_FIRST(1, "vulkan: the ray traced level lighting did not compile; the level keeps its own");
@@ -5351,11 +5377,48 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
     place(y, 0, up);
     float ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
     for (float& v : up) v = ul > 0 ? v / ul : 0;
+    // the sun's colour from the level's outdoor baked light (what the shader added up kFramesInFlight frames ago,
+    // eased): its hue, a little whiter, and dimmer where that light is dark (a night's moon); a low sun warmer
+    RtFrame& fs = rt_[frame_slot_];
+    if (!fs.stats.buf && frag_stores_) MakeBuffer(fs.stats, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    if (fs.stats.buf && fs.stats_frame != presents_ + 1) {
+        uint32_t* sum = reinterpret_cast<uint32_t*>(fs.stats.mem.map);
+        if (fs.stats_frame && sum[3] > 64) {
+            float w = std::min(1.0f, rt_sky_[3] + 0.02f), ease = rt_sky_[3] < 0.02f ? 1.0f : 0.03f;
+            for (int k = 0; k < 3; k++) rt_sky_[k] += (sum[k] / 64.0f / sum[3] - rt_sky_[k]) * ease;
+            rt_sky_[3] = w;
+        }
+        std::memset(sum, 0, 16);
+        fs.stats_frame = presents_ + 1;
+    }
+    auto ramp = [](float v, float a, float b) {
+        float t = std::clamp((v - a) / (b - a), 0.0f, 1.0f);
+        return t * t * (3 - 2 * t);
+    };
+    float sunc[3] = {1.00f, 0.95f - 0.17f * low, 0.85f - 0.30f * low}, power = 1.0f;
+    float bl = 0.299f * rt_sky_[0] + 0.587f * rt_sky_[1] + 0.114f * rt_sky_[2];
+    float bm = std::max({rt_sky_[0], rt_sky_[1], rt_sky_[2], 1e-3f});
+    float tint[3];
+    for (int k = 0; k < 3; k++) tint[k] = 0.35f + 0.65f * rt_sky_[k] / bm;
+    float known = rt_sky_[3] * ramp(bm, 0.01f, 0.05f);
+    for (int k = 0; k < 3; k++) sunc[k] += (tint[k] - sunc[k]) * 0.7f * known;
+    power = 1.0f - 0.6f * ramp(bl, 0.45f, 0.15f) * known;
+    // logged: what the sun took (a night, dusk, snow, a day)
+    int kind = bl < 0.3f ? 1 : tint[2] < 0.75f ? 2 : bl > 1.2f ? 3 : 0;
+    static double next_log = 0;
+    double now_s = double(presents_) / 60.0;
+    if (rt_sky_[3] > 0.9f && (kind != rt_sky_kind_ || now_s > next_log)) {
+        static const char* names[] = {"day", "night", "dusk", "snow"};
+        LOGR("vulkan: the level's sun: %s (outdoor baked light %.2f %.2f %.2f, colour %.2f %.2f %.2f, strength %.2f)",
+             names[kind], rt_sky_[0], rt_sky_[1], rt_sky_[2], sunc[0], sunc[1], sunc[2], power);
+        rt_sky_kind_ = kind;
+        next_log = now_s + 10;
+    }
     bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
     const float p[8 * 4] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
-                            float(lights), kept ? 1.0f : 0.0f, float(test), 0,
-                            sun[0], sun[1], sun[2], st.rt_sun,
-                            1.00f, 0.95f - 0.17f * low, 0.85f - 0.30f * low, 0.35f,
+                            float(lights), kept ? 1.0f : 0.0f, float(test), fs.stats.buf ? 1.0f : 0.0f,
+                            sun[0], sun[1], sun[2], st.rt_sun * power,
+                            sunc[0], sunc[1], sunc[2], 0.35f,
                             rt_fog_[0], rt_fog_[1], rt_fog_[2], 1.2f,
                             up[0], up[1], up[2], 0.6f,
                             0.06f, 0.06f, 0.06f, 0,
@@ -5408,6 +5471,7 @@ void VulkanBackend::DropRt(RtFrame& f) {
     f.blas = f.tlas = f.gun_blas = VK_NULL_HANDLE;
     DropBuffer(f.gun_blas_mem);
     DropBuffer(f.verts), DropBuffer(f.tris), DropBuffer(f.mats), DropBuffer(f.inst), DropBuffer(f.scratch);
+    DropBuffer(f.stats);
     DropBuffer(f.blas_mem), DropBuffer(f.tlas_mem);
     f.vert_cap = 0;
 }
