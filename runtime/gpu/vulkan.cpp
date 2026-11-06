@@ -677,10 +677,11 @@ std::string LocateInputs(std::string src) {
 // sharpen, bloom, bloom threshold; [3] AO, AO radius, vignette, grain; [4] bands, outline px, internal edges, edge
 // threshold; [5] outline colour, halftone; [6] block px, colour levels, dither, retro grading; [7] depth bound,
 // width, height, host px per console px; [8] reflections' strength (0 none), ray steps, tan of half the vertical view
-// angle, width / height; [9] the thickness a ray hits and its reach (parts of the surface's distance). t0 the scene, t1
-// its depth, t2 the reflection mask (r), t3 its depth; s0 linear, s1 point.
+// angle, width / height; [9] the thickness a ray hits and its reach (parts of the surface's distance); [10] the depth
+// holds what was drawn after a mid-frame clear alone (NightFire's gun and hands: RtKeepDepth kept the world's). t0 the
+// scene, t1 its depth, t2 the reflection mask (r), t3 its depth; s0 linear, s1 point.
 const char* kScenePostHlsl = R"(
-cbuffer P : register(b1) { float4 p[10]; };
+cbuffer P : register(b1) { float4 p[11]; };
 Texture2D scene : register(t0);
 Texture2D<float> depthtex : register(t1);
 Texture2D maskc : register(t2);
@@ -717,9 +718,10 @@ float3 grade(float3 c) {
     c *= float3(1 + 0.1 * p[2].x, 1, 1 - 0.1 * p[2].x);
     return saturate(c);
 }
-// noir: black and white, hard, but what is red (blood, lamps, the HUD's red) kept a deep red
-float3 noir(float3 c) {
-    float red = saturate((c.r / max(max(c.g, c.b), 0.02) - 2.2) * 2) * saturate(c.r * 4);  // skin is not
+// noir: black and white, hard, but what is red (blood, lamps, the HUD's red) kept a deep red; the player's own gun
+// and hands never (skin under a red or warm lamp passes for red)
+float3 noir(float3 c, bool hands) {
+    float red = hands ? 0 : saturate((c.r / max(max(c.g, c.b), 0.02) - 2.2) * 2) * saturate(c.r * 4);
     float g = saturate((sqrt(luma(c)) - 0.15) / 0.55);  // a dim level's mid tones kept off black
     g = g * g * (3 - 2 * g);
     return lerp(g.xxx, float3(0.85, 0.03, 0.03) * (0.4 + 0.6 * saturate(c.r * 1.3)), red);
@@ -864,7 +866,7 @@ float4 ps(O i) : SV_Target {
             c *= 1 - p[5].w * 0.6 * (length(g) < dotr ? 1 : 0);
         }
         c = grade(c);
-        if (mode == 4) c = noir(c);
+        if (mode == 4) c = noir(c, p[10].x != 0 && d < 0.99999);
         c = lerp(c, p[5].rgb, edge(uv, px, d));
         return float4(c, 1);
     }
@@ -2212,7 +2214,7 @@ private:
     // the scene's passes that read the world's distance (the depth kept at the mid-frame clear, RtKeepDepth)
     bool KeptDepthWanted() const {
         const GraphicsStyle& st = Style();
-        return DofWanted() || (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light));
+        return DofWanted() || st.mode == kStyleNoir || (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light));
     }
     float dof_aim_ = 0;          // aiming down the sights, eased 0 to 1
     uint32_t scene_zwrites_ = 0;  // the frame's 3D draws that wrote the scene's depth
@@ -6297,7 +6299,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
     float ao = rt_drawn_ ? 0.0f : QualityAo(st),
           bloom = st.mode == kStyleOriginal || st.mode == kStyleEnhanced ? QualityBloom(st) : 0.0f;
     if (st.mode == kStyleOriginal && st.quality_bloom) g.bloom_threshold = 0.85f;
-    float c[40] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
+    float c[44] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
                    g.exposure, float(g.tonemap), g.contrast, g.saturation,
                    g.temperature, g.sharpen, bloom, g.bloom_threshold,
                    ao, g.ao_radius, g.vignette, g.grain,
@@ -6320,13 +6322,15 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
     }();
     c[38] = float(show_mask);
     c[39] = scene_wbuf_ ? 1.0f : 0.0f;
+    // the scene's depth was cleared mid-frame and the world's kept (RtKeepDepth): what it holds now is the gun alone
+    c[40] = depth && ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1 ? 1.0f : 0.0f;
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
     VkImageView views[4] = {rt.fb.view, depth ? ds->res.view : VK_NULL_HANDLE, mask ? rt.mask.view : VK_NULL_HANDLE,
                             mask ? rt.mask_ds.view : VK_NULL_HANDLE};
     for (VkImageView& v : views)
         if (!v && !null_descriptor_) v = dummy_.view;
-    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 40, views, 4);
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 44, views, 4);
     End();
 }
 
