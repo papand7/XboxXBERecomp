@@ -110,6 +110,11 @@ void DrawHud(double fps);         // the frame counter, inside the ImGui frame (
 void HitMarker(float x, float y, int kind);
 void DrawHitMarkers();                          // inside the ImGui frame, from DrawHud
 void MixHitSound(float* out, uint32_t frames);  // the ticks into the mixer's stereo output
+// blood (gpu::GraphicsStyle::blood, blood.cpp): a game's hooks, a spray where a player's shot hit a character (x, y
+// the shown frame's fractions, strength 0 to 1), and a player's view (its corners, the same) hit, by how much (0 to 1)
+void BloodSpray(float x, float y, float strength);
+void BloodHurt(float x0, float y0, float x1, float y1, float amount);
+void DrawBlood();                               // inside the ImGui frame, from DrawHud
 void FeedPad();                   // controllers to the settings window's navigation, before each ImGui frame
 Mode Output();
 float RenderScale(uint32_t guest_height);

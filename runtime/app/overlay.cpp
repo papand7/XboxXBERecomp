@@ -537,6 +537,7 @@ void Achievements() {
 
 void DrawHud(double fps) {
     DrawUnlock();
+    DrawBlood();
     DrawHitMarkers();
     if (!Get().show_fps) return;
     ImGuiViewport* vp = ImGui::GetMainViewport();

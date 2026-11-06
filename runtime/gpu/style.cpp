@@ -33,8 +33,8 @@ std::atomic<bool> g_aiming{false};
 std::filesystem::file_time_type g_file_time{};  // graphics.toml as last read or written
 std::chrono::steady_clock::time_point g_checked;
 
-const char* kModes[] = {"original", "enhanced", "toon", "retro"};
-const char* kModeLabels[] = {"Original", "Enhanced", "Toon", "Retro"};
+const char* kModes[] = {"original", "enhanced", "toon", "retro", "noir"};
+const char* kModeLabels[] = {"Original", "Enhanced", "Toon", "Retro", "Noir"};
 const char* kFilters[] = {"game", "nearest", "anisotropic"};
 const char* kTonemaps[] = {"off", "filmic", "reinhard"};
 const char* kReflectNames[] = {"off", "low", "high"};
@@ -79,6 +79,7 @@ void Clamp(GraphicsStyle& s) {
     s.rt_ao = std::clamp(s.rt_ao, 0.0f, 2.0f);
     s.rt_radius = std::clamp(s.rt_radius, 0.25f, 6.0f);
     s.rt_rays = std::clamp(s.rt_rays, 1, 16);
+    s.rt_sun = std::clamp(s.rt_sun, 0.0f, 2.0f);
     s.dof = std::clamp(s.dof, 0, int(kDofModes) - 1);
     s.dof_strength = std::clamp(s.dof_strength, 0.0f, 2.0f);
 }
@@ -101,7 +102,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "effect_lights", "light_strength", "atmosphere", "shaft_strength", "fog_strength", "bounce_light", "bounce_strength",
                                   "materials", "material_strength", "surface_depth",
                                   "ground_detail", "detail_strength", "detail_distance",
-                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows",
+                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "blood",
                                   "depth_of_field", "dof_strength"};
     for (auto&& [k, v] : t) {
         bool ok = false;
@@ -127,7 +128,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
             else out = i;
         }
     };
-    named("mode", s.mode, kModes, 4);
+    named("mode", s.mode, kModes, kStyleModes);
     num("exposure", s.exposure);
     named("tonemap", s.tonemap, kTonemaps, 3);
     num("contrast", s.contrast);
@@ -183,6 +184,9 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     num("rt_radius", s.rt_radius);
     integer("rt_rays", s.rt_rays);
     flag("rt_shadows", s.rt_shadows);
+    flag("rt_lighting", s.rt_lighting);
+    num("rt_sun", s.rt_sun);
+    flag("blood", s.blood);
     named("depth_of_field", s.dof, kDofNames, 3);
     num("dof_strength", s.dof_strength);
     Clamp(s);
@@ -244,6 +248,9 @@ toml::table Write(const GraphicsStyle& s) {
                        {"rt_radius", double(s.rt_radius)},
                        {"rt_rays", int64_t(s.rt_rays)},
                        {"rt_shadows", s.rt_shadows},
+                       {"rt_lighting", s.rt_lighting},
+                       {"rt_sun", double(s.rt_sun)},
+                       {"blood", s.blood},
                        {"depth_of_field", kDofNames[s.dof]},
                        {"dof_strength", double(s.dof_strength)}};
 }
@@ -288,6 +295,16 @@ std::vector<StylePreset> BuiltIn() {
     r.vertex_snap = true;
     r.tex_filter = kFilterNearest;
     v.push_back({"retro", "Retro", "", r});
+    GraphicsStyle n;  // toon's bands and outlines in black, white and red
+    n.preset = "noir";
+    n.mode = kStyleNoir;
+    n.contrast = 1.15f;
+    n.bands = 4;
+    n.outline = 1.5f;
+    n.outline_color[0] = n.outline_color[1] = n.outline_color[2] = 0.0f;
+    n.halftone = 0.3f;
+    n.tex_filter = kFilterAnisotropic;
+    v.push_back({"noir", "Noir", "", n});
     return v;
 }
 
@@ -372,6 +389,21 @@ bool Aiming() { return g_aiming.load(std::memory_order_relaxed); }
 void SetAiming(bool on) { g_aiming.store(on, std::memory_order_relaxed); }
 
 namespace {
+std::mutex g_lights_lock;
+std::vector<SceneLight> g_lights;
+}  // namespace
+void SetSceneLights(const SceneLight* lights, uint32_t count) {
+    std::lock_guard<std::mutex> lock(g_lights_lock);
+    g_lights.assign(lights, lights + count);
+}
+uint32_t SceneLights(SceneLight* out, uint32_t max) {
+    std::lock_guard<std::mutex> lock(g_lights_lock);
+    uint32_t n = std::min<uint32_t>(max, uint32_t(g_lights.size()));
+    std::copy(g_lights.begin(), g_lights.begin() + n, out);
+    return n;
+}
+
+namespace {
 void LoadStyleOnce() {
     g_presets = BuiltIn();
     // mods/presets/*.toml: a name, a base preset, then any of graphics.toml's keys; no code runs from them
@@ -389,9 +421,9 @@ void LoadStyleOnce() {
             p.file = f.string();
             p.label = t["name"].value_or(f.stem().string());
             std::string base = t["base"].value_or(std::string("original"));
-            int b = Index(base, kModes, 4, -1);
+            int b = Index(base, kModes, kStyleModes, -1);
             if (b < 0) {
-                LOGR("graphics: %s: base '%s' is not original, enhanced, toon or retro; preset left out", where.c_str(),
+                LOGR("graphics: %s: base '%s' is not original, enhanced, toon, retro or noir; preset left out", where.c_str(),
                      base.c_str());
                 continue;
             }
@@ -463,6 +495,9 @@ void ApplyPreset(const StylePreset& p) {
     g_style.rt_radius = keep.rt_radius;
     g_style.rt_rays = keep.rt_rays;
     g_style.rt_shadows = keep.rt_shadows;
+    g_style.rt_lighting = keep.rt_lighting;
+    g_style.rt_sun = keep.rt_sun;
+    g_style.blood = keep.blood;
     g_style.dof = keep.dof;
     g_style.dof_strength = keep.dof_strength;
     StyleChanged();
@@ -677,7 +712,7 @@ void DrawStyleSettings(bool vulkan) {
     ImGui::TextDisabled("Switches at once, in play. Original is the console's picture; the others add a scene pass\n"
                         "drawn before the HUD, so menus' and HUD's pixels keep the game's look.");
     int mode = s.mode;
-    if (ImGui::Combo("Rendering", &mode, kModeLabels, 4)) s.mode = mode, changed = true;
+    if (ImGui::Combo("Rendering", &mode, kModeLabels, kStyleModes)) s.mode = mode, changed = true;
 
     if (s.mode != kStyleOriginal && ImGui::CollapsingHeader("Post-processing", ImGuiTreeNodeFlags_DefaultOpen)) {
         int tm = s.tonemap;
@@ -697,7 +732,7 @@ void DrawStyleSettings(bool vulkan) {
         if (ImGui::Combo("Scene texture filtering", &f, "As the game\0Nearest (pixelated)\0Anisotropic 16x\0"))
             s.tex_filter = f, changed = true;
     }
-    if (s.mode == kStyleToon && ImGui::CollapsingHeader("Toon", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if ((s.mode == kStyleToon || s.mode == kStyleNoir) && ImGui::CollapsingHeader("Toon", ImGuiTreeNodeFlags_DefaultOpen)) {
         changed |= ImGui::SliderInt("Lighting bands", &s.bands, 2, 12);
         changed |= ImGui::SliderFloat("Outline thickness", &s.outline, 0.0f, 6.0f, "%.1f px");
         changed |= ImGui::ColorEdit3("Outline color", s.outline_color);
@@ -743,6 +778,7 @@ void DrawStyleSettings(bool vulkan) {
         ImGui::TextDisabled("Distance: far scenery soft. Focus: what the crosshair is on sharp, nearer and farther\n"
                             "soft, more while aiming down the sights. The gun stays sharp (Vulkan; not in Retro).");
     }
+    changed |= ImGui::Checkbox("Blood where shots hit, and at the view's edges when you are hit", &s.blood);
     if (ImGui::CollapsingHeader("Ray tracing", ImGuiTreeNodeFlags_DefaultOpen)) {
         bool rt = RayTracingSupported();
         if (!rt) ImGui::BeginDisabled();
@@ -751,6 +787,8 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::SliderFloat("Ray reach", &s.rt_radius, 0.25f, 6.0f, "%.2f m");
         changed |= ImGui::SliderInt("Rays per pixel", &s.rt_rays, 1, 16);
         changed |= ImGui::Checkbox("Ray-traced shadows from effect lights", &s.rt_shadows);
+        changed |= ImGui::Checkbox("Ray-traced level lighting (the game's lights and a sun)", &s.rt_lighting);
+        changed |= ImGui::SliderFloat("Sun strength", &s.rt_sun, 0.0f, 2.0f, "%.2f");
         if (!rt) ImGui::EndDisabled();
         ImGui::TextDisabled(rt ? "Traced against the scene's own triangles, so corners, crevices and what stands behind\n"
                                  "or beside the view shade too. Replaces the screen-space AO. Not drawn in Retro."

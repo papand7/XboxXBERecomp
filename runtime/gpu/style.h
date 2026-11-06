@@ -9,7 +9,7 @@
 
 namespace gpu {
 
-enum StyleMode : int { kStyleOriginal, kStyleEnhanced, kStyleToon, kStyleRetro, kStyleModes };
+enum StyleMode : int { kStyleOriginal, kStyleEnhanced, kStyleToon, kStyleRetro, kStyleNoir, kStyleModes };
 enum TexFilter : int { kFilterGame, kFilterNearest, kFilterAnisotropic };
 enum Tonemap : int { kToneOff, kToneFilmic, kToneReinhard };
 // graphics quality, apart from the style: Low, Medium, High, Ultra set the values below and the settings' anisotropic
@@ -92,6 +92,13 @@ struct GraphicsStyle {
     float rt_radius = 1.5f;  // metres an occlusion ray reaches
     int rt_rays = 4;         // per pixel, 1 to 16
     bool rt_shadows = true;  // effect lights (effect_lights) cast traced shadows
+    // the level lit again (Vulkan, ray tracing on): its baked light (the vertex colours) taken out and the game's own
+    // lights (SetSceneLights) and a sun where the sky shows put in, each with traced shadows
+    bool rt_lighting = false;
+    float rt_sun = 1.0f;  // the sun's strength, 0 to 2
+    // blood (every style and renderer, drawn over the picture: app/blood.cpp): a spray where a player's shot hits a
+    // character, and red at the edges of a player's view as they are hit, fading
+    bool blood = false;
     // depth of field (Vulkan; every style but Retro): the scene blurred by its distance from the focus, the gun and
     // hands kept sharp; Distance: the far scenery alone, Focus: what is in the middle of the view sharp, nearer and
     // farther blurred, more while aiming down the sights (SetAiming)
@@ -150,5 +157,15 @@ void SetRayTracingSupported(bool on);
 // the player aims down the sights (the game's thread, each frame): depth of field's focus blurs more
 bool Aiming();
 void SetAiming(bool on);
+// the game's lights (the game's thread, each frame): in its world's units, the frame's camera's world; lifetime 0 a
+// light placed in the level, else a passing one (a muzzle flash)
+struct SceneLight {
+    float pos[3];
+    float radius;
+    float rgb[3];  // 1 the full colour
+    float lifetime;
+};
+void SetSceneLights(const SceneLight* lights, uint32_t count);
+uint32_t SceneLights(SceneLight* out, uint32_t max);  // the latest set, at most max
 
 }  // namespace gpu
