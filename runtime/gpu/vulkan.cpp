@@ -55,6 +55,7 @@
 #include "gpu/texture.h"
 #include "gpu/texture_pack.h"
 #include "gpu/detail.h"
+#include "gpu/displace.h"
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 
@@ -490,6 +491,8 @@ struct Target {
     Image bounce;     // bounced light: the gathered light, a quarter of the scene's size
     Image rt_ao;      // ray traced ambient occlusion: what is open (r) and the distance (g), the scene's size
     Image rt_gi;      // ray traced bounced light (kRtRelightHlsl's gi): its light and distance, half the scene's size
+    Image rt_vol;     // ray traced volumetric light (kRtRelightHlsl's vol): the air's light and distance, half size
+    Image gtao;       // ground truth ambient occlusion (kGtaoHlsl): what is open (r) and the distance (g), half size
     Image dof_focus[2];  // depth of field: the distance in focus (1 / metres), this frame's and the last's in turn
     uint64_t dof_frame = 0;  // the frame (presents_ + 1) it was last drawn for
     uint64_t glow_frame = 0;
@@ -1001,6 +1004,297 @@ float4 comp(O i) : SV_Target {
     if (test == 2) c = float3(saturate(fog), saturate(z / 200), sky ? 1 : 0);  // 2: the fog (r), distance / 200 (g)
     if (test == 3) c = sh;                               // 3: the shafts alone
     return float4(saturate(c), 1);
+}
+)";
+
+// snow (VulkanBackend::WeatherPass, GraphicsStyle::weather): over the scene after its fog. Footprints first: each
+// pixel's place in the world (the world's depth, the camera's inverse) against the nearest prints (a toe and a heel,
+// pressed in: darker and bluer, a lit rim), only on what looks like snow (bright, grey). Then the falling snow: the
+// view ray walked through three layers of cells (0.7, 1.6 and 3.5 m, out to 7, 18 and 45 m), a flake in some cells
+// (how many by the amount), the cells' space moved up and along by the fall and the wind so the flakes fall and
+// drift; a flake its size or a pixel's, whichever is larger (fainter then), hidden behind the scene; with ray tracing
+// a ray up from it to the sky (none under a roof). Then a pale haze by distance. b1 p: [0] 1/width, 1/height, tan of
+// half the vertical view, width / height; [1] the depth was kept, seconds, amount, metres a world unit; [2]-[4] the
+// view to the world (rows); [5]-[7] the world to the view; [8] the wind (world x, z, metres a second), the fall
+// (metres a second), outdoors (0 to 1); [9] the snow's colour, the prints; [10] test (XBE_SNOW_TEST=1 the snow alone,
+// 2 the prints red); [16 + n] a print: its place (the world's) and its fade (whole hundredths) + its heading (turns).
+// t0 the scene, t1 its depth, t2 the kept depth; s1 point
+const char* kSnowHlsl = R"(
+cbuffer P : register(b1) { float4 p[16 + 96]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D<float> keptz : register(t2);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float depthat(float2 uv) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    return p[1].x != 0 ? min(d, keptz.SampleLevel(pt, uv, 0)) : d;
+}
+bool gunat(float2 uv) {
+    return p[1].x != 0 && depthtex.SampleLevel(pt, uv, 0) < keptz.SampleLevel(pt, uv, 0) - 1e-6;
+}
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z); }
+float3 toworld(float3 v) { return float3(dot(p[2].xyz, v) + p[2].w, dot(p[3].xyz, v) + p[3].w, dot(p[4].xyz, v) + p[4].w); }
+float3 dirworld(float3 v) { return float3(dot(p[2].xyz, v), dot(p[3].xyz, v), dot(p[4].xyz, v)); }
+float3 toview(float3 w) { return float3(dot(p[5].xyz, w) + p[5].w, dot(p[6].xyz, w) + p[6].w, dot(p[7].xyz, w) + p[7].w); }
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float3 hash3(float3 c) {
+    uint3 q = uint3(int3(c) + 65536) * uint3(1597334673u, 3812015801u, 2798796415u);
+    uint n = (q.x ^ q.y ^ q.z) * 1597334673u;
+    n ^= n >> 15;
+    n *= 2246822519u;
+    return float3(n & 1023, (n >> 10) & 1023, (n >> 20) & 1023) / 1023.0;
+}
+#if RT
+float open(float3 o, float3 d, float tmax) {
+    RayDesc r;
+    r.Origin = o;
+    r.Direction = d;
+    r.TMin = 0;
+    r.TMax = tmax;
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(tlas, RAY_FLAG_NONE, 1, r);
+    RT_PROCEED(q)
+    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0 : 1;
+}
+#endif
+float4 ps(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    float d = depthat(uv);
+    bool sky = d >= 0.99999, gun = gunat(uv);
+    float zs = d * 4096;
+    float unit = p[1].w, T = p[1].y, amount = p[1].z, outdoors = p[8].w;
+    float3 snowc = p[9].rgb;
+    int test = int(p[10].x);
+    if (test == 1) c *= 0.15;
+    // the footprints
+    if (!sky && !gun && p[9].w > 0) {
+        float3 W = toworld(viewpos(uv, zs));
+        float mx = max(c.r, max(c.g, c.b)), mn = min(c.r, min(c.g, c.b));
+        float snowy = saturate((luma(c) - 0.3) * 4) * saturate(1.2 - (mx - mn) / max(mx, 1e-3) * 5);
+        if (test == 2) snowy = 1;
+        float m = 0, rim = 0, wall = 0;
+        if (snowy > 0) {
+            [loop] for (int k = 0; k < int(p[9].w); k++) {
+                float4 f = p[16 + k];
+                float3 D = (W - f.xyz) * unit;
+                if (test == 2 && length(D.xz) < 0.3) m = max(m, 0.5);
+                if (D.y < -3.0 || D.y > 0.4 || abs(D.x) > 0.25 || abs(D.z) > 0.25) continue;  // the place is above the feet
+                float fade = floor(f.w) / 100, yaw = frac(f.w) * 6.2831853;
+                float2 l = float2(cos(yaw) * D.x - sin(yaw) * D.z, sin(yaw) * D.x + cos(yaw) * D.z);
+                // a boot's sole: the ball, the heel and the waist between, one shape (a smooth union)
+                float e1 = length(float2(l.x / 0.052, (l.y - 0.05) / 0.08));
+                float e2 = length(float2(l.x / 0.044, (l.y + 0.085) / 0.05));
+                float e3 = length(float2(l.x / 0.034, (l.y + 0.02) / 0.07));
+                float e = min(min(e1, e2), e3) - 0.06 * saturate(1 - abs(e1 - e2) * 3);
+                float pressed = saturate((1 - e) * 6) * fade;
+                // its tread across the sole, and the wall toward the far side lit (the near side in shade)
+                float tread = 0.5 + 0.5 * sin(l.y * 190) * saturate((0.8 - e) * 5);
+                m = max(m, pressed * (0.8 + 0.2 * tread));
+                float2 dir = normalize(l + 1e-5);
+                rim = max(rim, saturate(1 - abs(e - 1.1) * 6) * fade * (1 - pressed));
+                wall = max(wall, saturate(1 - abs(e - 0.92) * 8) * fade * saturate(dir.y));
+            }
+        }
+        if (test == 2) c = lerp(c, float3(1, 0, 0), m);
+        else c = lerp(c, c * float3(0.66, 0.72, 0.86), m * snowy * 0.85) + (rim * 0.05 + wall * 0.07) * snowy;
+    }
+    // the falling snow
+    if (amount > 0 && outdoors > 0) {
+        float3 ro = float3(p[2].w, p[3].w, p[4].w);
+        float3 rd = normalize(dirworld(viewpos(uv, 1)));
+        float vz = max(dot(p[7].xyz, rd), 1e-4);  // view metres a world unit along the ray
+        float far = sky ? 45 : min(zs, 45);
+        float tmax = far / vz;
+        float3 up = normalize(float3(p[5].y, p[6].y, p[7].y));
+        float pxm = 2 * p[0].z * p[0].y;  // a pixel, in metres at a metre
+        float presence = saturate(0.45 * amount);
+        float4 acc = 0;
+        [loop] for (int L = 0; L < 3; L++) {
+            float cs = (L == 0 ? 0.7 : L == 1 ? 1.6 : 3.5) / unit;
+            float tbeg = (L == 0 ? 0.3 : L == 1 ? 7.0 : 18.0) / unit;
+            float tend = min(tmax, (L == 0 ? 7.0 : L == 1 ? 18.0 : 45.0) / unit);
+            if (tbeg >= tend) break;
+            float3 off = float3(p[8].x, -p[8].z * (1 + 0.15 * L), p[8].y) * (T / unit);
+            float3 shift = float3(17.3, 5.1, 9.7) * L * cs;
+            float3 q0 = ro - off + shift;
+            float3 rdx = float3(abs(rd.x) < 1e-6 ? 1e-6 : rd.x, abs(rd.y) < 1e-6 ? 1e-6 : rd.y, abs(rd.z) < 1e-6 ? 1e-6 : rd.z);
+            float3 pos = q0 + rdx * tbeg;
+            float3 cell = floor(pos / cs);
+            float3 stp = sign(rdx);
+            float3 tdelta = abs(cs / rdx);
+            float3 tnext = tbeg + ((cell + max(stp, 0)) * cs - pos) / rdx;
+            float t = tbeg;
+            [loop] for (int k = 0; k < 16 && t < tend && acc.a < 0.98; k++) {
+                float3 h = hash3(cell + L * 4099);
+                if (h.x < presence) {
+                    float3 fl = (cell + 0.15 + 0.7 * hash3(cell * 3 + 1187)) * cs;
+                    fl.x += sin(T * (0.6 + h.y) + h.z * 6.28) * 0.1 / unit;
+                    fl.z += cos(T * (0.5 + h.z) + h.y * 6.28) * 0.1 / unit;
+                    float tc = dot(fl - q0, rdx);
+                    if (tc > tbeg && tc < tend) {
+                        float dist = length(q0 + rdx * tc - fl) * unit;
+                        float tm = tc * unit * vz;
+                        float r = (0.018 + 0.016 * h.y) * (1 + 0.3 * saturate(amount - 1));
+                        float rp = max(r, tm * pxm * 1.6);
+                        float a = saturate(1.2 - dist / rp);
+                        a = a * a * min(1, r * r / (rp * rp) * 4);
+                        a *= saturate(1.15 - tm / 45) * saturate((tm - 0.3) / 0.5);
+#if RT
+                        if (a > 0.004) a *= open(toview(fl + off - shift) + up * 0.05, up, 60);
+#endif
+                        acc.rgb += (1 - acc.a) * a * snowc;
+                        acc.a += (1 - acc.a) * a;
+                    }
+                }
+                if (tnext.x < tnext.y && tnext.x < tnext.z) t = tnext.x, tnext.x += tdelta.x, cell.x += stp.x;
+                else if (tnext.y < tnext.z) t = tnext.y, tnext.y += tdelta.y, cell.y += stp.y;
+                else t = tnext.z, tnext.z += tdelta.z, cell.z += stp.z;
+            }
+        }
+        acc *= outdoors;
+        // a flake never darker than what is behind it (grey specks on white ground otherwise)
+        if (acc.a > 1e-4) c = lerp(c, max(acc.rgb / acc.a, c * 1.06), acc.a);
+        if (!gun && !sky && zs < 300) {  // a sky dome drawn as the level's (hundreds of metres off) not hazed
+            float haze = (1 - exp(-zs * 0.002 * amount)) * 0.3 * outdoors * saturate((300 - zs) / 100);
+            c = lerp(c, snowc * 0.75, haze);
+        }
+    }
+    return float4(saturate(c), 1);
+}
+)";
+
+// ground truth ambient occlusion (VulkanBackend::GtaoPass; Jimenez et al. 2016, as Intel's XeGTAO): at half the
+// scene's size, for each pixel a few slices about the view ray, in each the highest horizon either side within a
+// radius in metres (falling off toward it), the visible arc of the cosine weighted hemisphere about the surface's
+// normal (from the depth: the nearer neighbour each way) integrated; slices turned and steps offset by 4x4 patterns.
+// comp darkens the scene by it, the 4x4 about a pixel weighed by distance. The world's depth (min with the one kept
+// at the mid-frame clear: NightFire's end-of-frame depth holds the gun alone); the gun and the sky not shaded.
+// b1 p: [0] 1/width, 1/height, tan of half the vertical view, width / height; [1] the depth was kept, strength,
+// radius (metres), slices; [2] steps, 1/ao width, 1/ao height, test (XBE_GTAO_TEST=1 the occlusion alone). t0 the
+// scene, t1 its depth, t2 the kept depth, t3 the occlusion (comp); s1 point
+const char* kGtaoHlsl = R"(
+cbuffer P : register(b1) { float4 p[3]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D<float> keptz : register(t2);
+Texture2D aotex : register(t3);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+static const float PI = 3.14159265, HALF_PI = 1.5707963;
+static const float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+float depthat(float2 uv) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    return p[1].x != 0 ? min(d, keptz.SampleLevel(pt, uv, 0)) : d;
+}
+bool gunat(float2 uv) {
+    return p[1].x != 0 && depthtex.SampleLevel(pt, uv, 0) < keptz.SampleLevel(pt, uv, 0) - 1e-6;
+}
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z); }
+// the world alone where it was kept: the gun is no occluder (it shaded the ground beside it in rows)
+float worldz(float2 uv) { return p[1].x != 0 ? keptz.SampleLevel(pt, uv, 0) : depthtex.SampleLevel(pt, uv, 0); }
+float3 posat(float2 uv) { return viewpos(uv, worldz(uv) * 4096); }
+float facos(float x) {
+    float r = -0.156583 * abs(x) + HALF_PI;
+    r *= sqrt(1 - abs(x));
+    return x >= 0 ? r : PI - r;
+}
+float4 gtao(O i) : SV_Target {
+    float2 uv = i.uv;
+    float d = depthat(uv);
+    if (d >= 0.99999 || gunat(uv)) return float4(1, 0, 0, 0);
+    float3 P = viewpos(uv, d * 4096);
+    float2 fpx = p[0].xy;
+    float3 l = posat(uv - float2(fpx.x, 0)), r = posat(uv + float2(fpx.x, 0));
+    float3 u = posat(uv - float2(0, fpx.y)), dn = posat(uv + float2(0, fpx.y));
+    float3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;
+    float3 dy = abs(dn.z - P.z) < abs(P.z - u.z) ? dn - P : P - u;
+    // the game's depth comes in steps (flat ground near the camera is terraces some 26 pixels deep, each facing the
+    // camera): across 24 pixels where the surface runs on (no edge between), the slope of the ground itself
+    float3 L2 = posat(uv - float2(fpx.x, 0) * 24), R2 = posat(uv + float2(fpx.x, 0) * 24);
+    float3 U2 = posat(uv - float2(0, fpx.y) * 24), D2 = posat(uv + float2(0, fpx.y) * 24);
+    float tol = P.z * 0.08 + 0.1;
+    if (abs(R2.z + L2.z - 2 * P.z) < tol) dx = (R2 - L2) * 0.5;
+    if (abs(D2.z + U2.z - 2 * P.z) < tol) dy = (D2 - U2) * 0.5;
+    float3 N = normalize(cross(dx, dy));
+    if (any(isnan(N))) return float4(1, P.z, 0, 0);
+    if (dot(N, P) > 0) N = -N;
+    float3 V = normalize(-P);
+    // lifted off the surface by about a step of the depth, so the steps do not shade it in bands
+    P += N * (0.05 + P.z * 0.01);
+    float radius = p[1].z;
+    float ruv = min(radius / (P.z * p[0].z * 2), 0.2);  // the radius on screen (uv, vertically)
+    if (ruv < fpx.y * 2) return float4(1, P.z, 0, 0);
+    uint2 ip = uint2(i.pos.xy);
+    float j0 = (bayer[(ip.y & 3) * 4 + (ip.x & 3)] + 0.5) / 16.0;
+    float j1 = (bayer[((ip.x + 2) & 3) * 4 + ((ip.y + 1) & 3)] + 0.5) / 16.0;
+    int slices = int(p[1].w), steps = int(p[2].x);
+    float vis = 0;
+    [loop] for (int s = 0; s < slices; s++) {
+        float phi = (s + j0) * PI / slices;
+        float2 sd = float2(cos(phi), sin(phi));         // on the screen (uv, y down)
+        float3 dir = float3(sd.x, -sd.y, 0);             // in the view (y up)
+        float3 ortho = dir - V * dot(dir, V);
+        float3 axis = normalize(cross(ortho, V));
+        float3 pn = N - axis * dot(N, axis);
+        float plen = length(pn);
+        float cosn = saturate(dot(pn, V) / max(plen, 1e-4));
+        float n = sign(dot(ortho, pn)) * facos(cosn);
+        float low0 = cos(n + HALF_PI), low1 = cos(n - HALF_PI);
+        float h0c = low0, h1c = low1;
+        float2 suv = sd * float2(1 / p[0].w, 1) * ruv;
+        [loop] for (int k = 0; k < steps; k++) {
+            float t = (k + j1) / steps;
+            t = t * t * 0.95 + 0.05;
+            float2 o = suv * t;
+            float3 s0 = posat(uv + o) - P, s1 = posat(uv - o) - P;
+            float l0 = length(s0), l1 = length(s1);
+            float w0 = saturate((1 - l0 / radius) * 2), w1 = saturate((1 - l1 / radius) * 2);
+            h0c = max(h0c, lerp(low0, dot(s0 / max(l0, 1e-4), V), w0));
+            h1c = max(h1c, lerp(low1, dot(s1 / max(l1, 1e-4), V), w1));
+        }
+        float h1 = n + clamp(facos(h0c) - n, -HALF_PI, HALF_PI);
+        float h0 = n + clamp(-facos(h1c) - n, -HALF_PI, HALF_PI);
+        float sn = sin(n);
+        float a0 = (cosn + 2 * h0 * sn - cos(2 * h0 - n)) / 4;
+        float a1 = (cosn + 2 * h1 * sn - cos(2 * h1 - n)) / 4;
+        vis += plen * (a0 + a1);
+    }
+    return float4(saturate(vis / slices), P.z, 0, 0);
+}
+float4 comp(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    float d = depthat(uv);
+    bool none = d >= 0.99999 || gunat(uv);
+    float z = d * 4096, sum = 0, wsum = 0;
+    [unroll] for (int y = -2; y < 2; y++) {
+        [unroll] for (int x = -2; x < 2; x++) {
+            float2 g = aotex.SampleLevel(pt, uv + (float2(x, y) + 0.5) * p[2].yz, 0).rg;
+            float w = g.y > 0 ? saturate(1 - abs(g.y - z) / (z * 0.03 + 0.03)) : 0;
+            sum += g.x * w;
+            wsum += w;
+        }
+    }
+    float ao = none || wsum <= 0 ? 1 : sum / wsum;
+    ao = pow(saturate(ao), 1.5 * p[1].y);
+    if (p[2].w == 1) return float4(ao.xxx, 1);
+    return float4(c * ao, 1);
 }
 )";
 
@@ -1541,6 +1835,11 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
 // baked light's units: rays cosine weighted about its slope (two 4x4 patterns, as the occlusion's), each met surface's
 // texture by the light on it (a share of its baked light, the sun with its shadow, the game's lights unshadowed); a
 // the surface's distance, which ps weighs the 4x4 traced pixels about it by (XBE_RT_TEST=7: the bounced light alone).
+// vol (GraphicsStyle::rt_volumetric, half size, RGBA16F; p[6].w its strength): the light the air between the camera and
+// the pixel's surface scatters toward the camera, 12 steps jittered by a 4x4 pattern: the sun where a ray toward it is
+// open (shafts through windows and past walls) by a forward-scattering phase, the game's lights about their places
+// with their shadows; a the distance marched. volc adds it over the scene, the 4x4 about a pixel weighed by distance,
+// and dims the scene behind by the air's thickness (XBE_RT_TEST=8: the air's light alone).
 const char* kRtRelightHlsl = R"(
 cbuffer P : register(b1) { float4 p[8 + 2 * 64]; };
 Texture2D scene : register(t0);
@@ -1680,6 +1979,70 @@ float4 gi(O i) : SV_Target {
         sum += rt_texel(rt_mat(tri), tuv).rgb * light;
     }
     return float4(sum / max(rays, 1) * p[7].x, P.z);
+}
+static const float kVolFar = 90, kVolDensity = 0.002;
+// the game's lights in the air at X, each with its shadow: a glow about the lamp more than the reach's broad light
+float3 airlamps(float3 X) {
+    float3 added = 0;
+    [loop] for (int n = 0; n < int(p[1].x); n++) {
+        float4 a = p[8 + 2 * n];
+        float3 D = a.xyz - X;
+        float d2 = dot(D, D), r2 = a.w * a.w;
+        if (d2 >= r2) continue;
+        float att = 1 - sqrt(d2 / r2);
+        float3 e = p[9 + 2 * n].rgb * (att * att * p[4].w / (1 + 64 * d2 / r2));
+        if (dot(e, float3(0.3, 0.59, 0.11)) < 0.01) continue;
+        float dl = sqrt(d2);
+        added += e * open(X, D / max(dl, 1e-4), dl * 0.95);
+    }
+    return added;
+}
+float marched(float2 uv) {
+    float d = depthat(uv);
+    float z = d >= 0.99999 ? kVolFar : min(d * 4096, kVolFar);
+    return length(viewpos(uv, z));
+}
+float4 vol(O i) : SV_Target {
+    float tmax = marched(i.uv);
+    float3 dir = normalize(viewpos(i.uv, 1));
+    uint2 ip = uint2(i.pos.xy);
+    float j = (bayer[(ip.y & 3) * 4 + (ip.x & 3)] + 0.5) / 16.0;
+    const int steps = 12;
+    float dt = tmax / steps, sigma = kVolDensity * p[6].w;
+    float g = 0.3, cs = dot(dir, p[2].xyz);
+    float phase = (1 - g * g) / pow(1 + g * g - 2 * g * cs, 1.5);
+    float3 sunl = p[3].rgb * (p[2].w * phase);
+    float3 sum = 0, lsum = 0;
+    [loop] for (int k = 0; k < steps; k++) {
+        float t = (k + j) * dt;
+        float3 X = dir * t;
+        float w = exp(-sigma * 0.5 * t) * sigma * dt;
+        float3 l = airlamps(X) * 2 * w;
+        lsum += l;
+        if (p[2].w > 0) sum += sunl * open(X, p[2].xyz, kFar) * w;
+    }
+    // XBE_RT_TEST=8: the sun's share red, the lamps' green
+    if (int(p[1].z) == 8) return float4(dot(sum, 0.33), dot(lsum, 0.33), 0, tmax);
+    return float4(sum + lsum, tmax);
+}
+float4 volc(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    float tmax = marched(uv);
+    float3 b = 0;
+    float wsum = 0;
+    [unroll] for (int y = -2; y < 2; y++) {
+        [unroll] for (int x = -2; x < 2; x++) {
+            float4 g = gitex.SampleLevel(pt, uv + (float2(x, y) + 0.5) * p[7].zw, 0);
+            float w = saturate(1 - abs(g.a - tmax) / (tmax * 0.06 + 0.05));
+            b += g.rgb * w;
+            wsum += w;
+        }
+    }
+    b = wsum > 0 ? b / wsum : gitex.SampleLevel(pt, uv, 0).rgb;
+    if (int(p[1].z) == 8) return float4(saturate(b * 2), 1);
+    float T = exp(-kVolDensity * p[6].w * 0.5 * tmax);
+    return float4(saturate(c * T + b), 1);
 }
 float4 ps(O i) : SV_Target {
     float2 uv = i.uv;
@@ -1930,6 +2293,8 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
 // position (the view taken as 60 degrees) and of its texture coordinates (a cotangent frame). Relief (pbr.z above 0):
 // parallax occlusion mapping, the view's ray stepped down the height map from the surface, its texture coordinates
 // moved to where it meets it, for the game's own textures too (game_main is handed the moved stage 0 coordinates).
+// RELIEF_HIGH (GraphicsStyle::relief_high): twice the steps, and the surface's own shadow, a ray from the hit toward
+// the light through the height map (bricks and stones shade the mortar beside them).
 // Light from above the view and from the camera: the ratio of the bumped normal's light to the flat one's scales the
 // game's colour, and a GGX highlight of the roughness adds a sheen, kept in proportion to it
 const char* kMatMain = R"(
@@ -1953,7 +2318,7 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
         // the view in the texture's frame; steps down from the top (height 1) until under the height map
         float3 vt = float3(dot(V, T), dot(V, B), max(dot(V, Ng), 0.08));
         float2 dir = -vt.xy / vt.z * pbr.z * 0.05;
-        int steps = int(lerp(24, 8, saturate(vt.z)));
+        int steps = int(lerp(24, 8, saturate(vt.z)) * (RELIEF_HIGH ? 2 : 1));
         float layer = 1.0 / steps, d = 0, hd = 1 - tex%d.SampleGrad(smp%d, uv, dux, duy).a, prev_hd = hd;
         float2 st = dir * layer, cur = uv;
         [loop] for (int k = 0; k < steps && d < hd; k++) {
@@ -1975,6 +2340,21 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
     float3 N = normalize(T * nt.x + B * nt.y + Ng * nt.z);
     if (any(isnan(N))) N = Ng;
     float3 L = normalize(float3(0.3, 0.8, -0.5));
+    float self_shadow = 1;
+    if (RELIEF_HIGH && pbr.z > 0) {
+        // from the hit toward the light: the most any step of the height map stands above the ray, in depth units
+        float3 lt = float3(dot(L, T), dot(L, B), dot(L, Ng));
+        if (lt.z > 0.05) {
+            float h0 = m.a, worst = 0;
+            float2 ld = lt.xy / lt.z * pbr.z * 0.05;
+            [loop] for (int k = 1; k <= 12; k++) {
+                float t = k / 12.0, rise = t * (1 - h0);
+                float h = tex%d.SampleGrad(smp%d, uv + ld * t * (1 - h0), dux, duy).a;
+                worst = max(worst, (h - h0 - rise) * (1 - t * 0.6));
+            }
+            self_shadow = 1 - saturate(worst * 6) * 0.55;
+        }
+    }
     float flat = 0.55 * saturate(dot(Ng, L)) + 0.45 * saturate(dot(Ng, V)) + 0.15;
     float bump = 0.55 * saturate(dot(N, L)) + 0.45 * saturate(dot(N, V)) + 0.15;
     float shade = clamp(lerp(1, bump / max(flat, 0.05), pbr.w), 0.4, 1.8);
@@ -1985,7 +2365,7 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
     float F = 0.04 + 0.96 * pow(1 - saturate(dot(H, V)), 5);
     float spec = min(D * F * saturate(dot(N, L)) * 0.25, 4);
     float lum = dot(c.rgb, float3(0.299, 0.587, 0.114));
-    c.rgb = c.rgb * shade + spec * pbr.w * saturate(lum * 1.5) * 0.5;
+    c.rgb = c.rgb * shade * lerp(1, self_shadow, saturate(pbr.w)) + spec * pbr.w * saturate(lum * 1.5) * 0.5 * self_shadow;
     return c;
 }
 )";
@@ -2313,10 +2693,12 @@ private:
     // the scene's passes that read the world's distance (the depth kept at the mid-frame clear, RtKeepDepth)
     bool KeptDepthWanted() const {
         const GraphicsStyle& st = Style();
-        return DofWanted() || st.mode == kStyleNoir || (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light));
+        return DofWanted() || st.mode == kStyleNoir ||
+               (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light || QualityAo(st) > 0 || st.weather));
     }
     float dof_aim_ = 0;          // aiming down the sights, eased 0 to 1
     uint32_t scene_zwrites_ = 0;  // the frame's 3D draws that wrote the scene's depth
+    uint64_t scene_cleared_ = 0;  // the frame (presents_ + 1) the scene's depth was cleared after its draws
     // ray tracing (GraphicsStyle::ray_tracing): the 3D scene's opaque draws write their vertices' places in the view
     // (RtCapture); the scene pass builds them into a bottom level acceleration structure, one instance of it the top
     // level, and traces against it (RtPass). A frame slot's buffers and structures, used again once its frame is done.
@@ -2367,6 +2749,19 @@ private:
     uint32_t rt_want_ = 1u << 20;  // the capture buffers' size in vertices: doubled after a frame that ran out
     bool rt_full_ = false;
     bool rt_drawn_ = false;  // this frame's occlusion was traced: the screen-space one is left out
+    bool gtao_drawn_ = false;  // this frame's ground truth occlusion was drawn: the style pass's left out
+    // snow (GraphicsStyle::weather): the frame's world triangles and those on snow (how snowy the level looks, eased),
+    // the footprints made (in the world's units) and each player's last step
+    bool WeatherWanted() const { return Style().weather != 0 && Style().mode != kStyleRetro; }
+    void WeatherPass(Target& rt, Target* ds);
+    bool game_snow_ = false;  // the game drew its own snow this frame (it snows here)
+    float snow_level_ = 0;
+    struct Print { float pos[3]; float yaw; double made; };
+    std::vector<Print> prints_;
+    struct Step { float pos[3]; int side = 0; bool ok = false; };
+    std::unordered_map<uint32_t, Step> steps_;
+    uint32_t print_epoch_ = 0;
+    void GtaoPass(Target& rt, Target* ds);  // ground truth ambient occlusion (quality_ao on a W-buffered scene)
     std::vector<uint32_t> rt_tris_, rt_cut_;     // opaque triangles, cut-outs (alpha tested): indices into the vertices
     std::vector<uint32_t> rt_mats_, rt_cut_mats_;  // a material word each (RtMaterial)
     std::vector<uint32_t> rt_gun_, rt_gun_mats_;   // the gun and hands (drawn after the mid-frame depth clear)
@@ -2429,7 +2824,7 @@ private:
         DropImage(t.smaa_edges), DropImage(t.smaa_weights), DropImage(t.mask), DropImage(t.mask_ds);
         DropImage(t.soft_depth);
         DropImage(t.glow), DropImage(t.light_a), DropImage(t.light_b), DropImage(t.light_list);
-        DropImage(t.rt_ao), DropImage(t.rt_depth), DropImage(t.rt_gi);
+        DropImage(t.rt_ao), DropImage(t.rt_depth), DropImage(t.rt_gi), DropImage(t.rt_vol), DropImage(t.gtao);
         DropImage(t.dof_focus[0]), DropImage(t.dof_focus[1]);
         DropImage(t.hdr_scene);
     }
@@ -2461,6 +2856,14 @@ private:
     uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0, perf_reflect_ = 0, perf_soft_ = 0,
              perf_mat_ = 0;  // draws by kind
     uint64_t perf_det_[4] = {};  // ground detail: tagged 3D draws, not opaque, no free stage, drawn
+    uint64_t perf_disp_[2] = {};  // ground displacement: draws cut, their triangles
+    // ground displacement (GraphicsStyle::displacement): a ground draw assembled again on the CPU, cut and pushed in
+    // (DisplaceMesh), kept by its vertices', indices' and settings' hash
+    bool Displace(const State& s, const DrawShaders& sh, uint32_t prim, uint32_t start, uint32_t count,
+                  const uint8_t* indices, Assembled& a);
+    struct DispMesh { std::vector<float> v; std::vector<uint32_t> ix; bool ok = false; };
+    std::unordered_map<uint64_t, DispMesh> disp_cache_;
+    size_t disp_bytes_ = 0;
     std::chrono::steady_clock::time_point perf_t_ = std::chrono::steady_clock::now();
     void LogPerf();
     friend VkBool32 VKAPI_PTR DebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -4153,6 +4556,8 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
         // pixels the CPU wrote before this clear go in first, a later upload would paint over the clear
         if (!t->depth && LatchCpuWrite(*t)) UploadTarget(*t, s.rt);
         // the scene's depth cleared after its traced draws (for the gun): kept for the ray traced passes
+        if (t == ds && (flags & kClearZ) && t == scene_ds_ && !post_done_ && scene_zwrites_)
+            scene_cleared_ = presents_ + 1;  // what follows is the gun and hands
         if (t == ds && (flags & kClearZ) && t == scene_ds_ && !post_done_ &&
             ((rt_used_ && RtWanted()) || (scene_zwrites_ && KeptDepthWanted())))
             RtKeepDepth(*t);
@@ -4405,7 +4810,7 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
                             palette.hash);
         }
     }
-    if (tx.detail == kDetailUnknown && Style().ground_detail && !draw_2d_)
+    if (tx.detail == kDetailUnknown && (Style().ground_detail || Style().displacement) && !draw_2d_)
         tx.detail = TextureDetail(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0);
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
     stages.levels[stage] = tx.levels;
@@ -4703,8 +5108,81 @@ void VulkanBackend::DrawGeometry(const Assembled& a) {
     }
 }
 
+bool VulkanBackend::Displace(const State& s, const DrawShaders& sh, uint32_t prim, uint32_t start, uint32_t count,
+                             const uint8_t* indices, Assembled& a) {
+    const GraphicsStyle& st = Style();
+    if (!st.displacement || st.displace_depth <= 0 || st.mode == kStyleRetro || draw_2d_ || !sh.prog || !stage_seen_ ||
+        !bound_ds_ || !scene_wbuf_ || !s.rs[kRsZEnable] || !SimpleState(s, kMZWriteEnable) ||
+        a.topology != Topology::Triangles)
+        return false;
+    // the world's alone: not the gun and hands (drawn after the game's mid-frame depth clear; a pistol's metal passed
+    // for rock, and its mesh came apart)
+    if (scene_cleared_ == presents_ + 1) return false;
+    if (stage_detail_ == kDetailNone || stage_detail_ == kDetailConcrete || stage_detail_ >= kDetailKinds) return false;
+    if (a.vertices.empty()) {  // the guest's own vertices: converted to floats for the cut
+        const bool raw = g_raw_vertices;
+        g_raw_vertices = false;
+        bool ok = Assemble(s, prim, start, count, indices, a);
+        g_raw_vertices = raw;
+        if (!ok || a.vertices.empty()) {
+            Assemble(s, prim, start, count, indices, a);
+            return false;
+        }
+    }
+    static const int disp_test = [] {
+        const char* e = std::getenv("XBE_DISP_TEST");
+        return e && *e ? std::atoi(e) : 0;
+    }();
+    if (disp_test == 1) return true;  // converted only, not cut: the layout's change alone
+    static const float tile = [] {
+        const char* e = std::getenv("XBE_DISP_TILE");
+        return e && *e ? float(std::atof(e)) : 2.0f;
+    }();
+    DisplaceParams p;
+    p.kind = stage_detail_;
+    p.depth = 0.08f * st.displace_depth;
+    p.tile = tile;
+    if (disp_test == 2) p.levels = 1;
+    if (disp_test == 3) p.push = false;
+    uint64_t key = Hash(a.vertices.data(), a.vertices.size() * 4, Hash(a.indices.data(), a.indices.size() * 4));
+    key = Hash(&p, sizeof(p), key ^ a.buffers[0].stride);
+    auto it = disp_cache_.find(key);
+    if (it == disp_cache_.end()) {
+        if (disp_bytes_ > (256u << 20)) disp_cache_.clear(), disp_bytes_ = 0;
+        DispMesh m;
+        Assembled cut = a;
+        cut.buffers[0].src = reinterpret_cast<const uint8_t*>(cut.vertices.data());
+        m.ok = DisplaceMesh(cut, p);
+        if (m.ok) m.v.swap(cut.vertices), m.ix.swap(cut.indices);
+        disp_bytes_ += m.v.size() * 4 + m.ix.size() * 4 + 64;
+        it = disp_cache_.emplace(key, std::move(m)).first;
+        static int said = 0;
+        if (said < 4 && it->second.ok)
+            said++, LOGR("vulkan: ground displacement: a %s draw cut from %zu to %zu triangles", DetailName(p.kind),
+                         a.indices.size() / 3, it->second.ix.size() / 3);
+    }
+    if (!it->second.ok) return false;
+    const uint32_t stride = a.buffers[0].stride;
+    a.vertices = it->second.v;
+    a.indices = it->second.ix;
+    a.vertex_count = uint32_t(a.vertices.size() * 4 / std::max<uint32_t>(stride, 16));
+    a.buffers[0] = {reinterpret_cast<const uint8_t*>(a.vertices.data()), uint32_t(a.vertices.size() * 4), stride};
+    a.index_src = a.indices.data();
+    a.index_count = uint32_t(a.indices.size());
+    a.index16 = false;
+    a.base_vertex = 0;
+    perf_disp_[0]++, perf_disp_[1] += a.index_count / 3;
+    return true;
+}
+
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     PerfScope ps{perf_draw_};
+    // the game's own snow (NightFire: draws of 4096 point sprites, its texture on stage 3, a vertex program, drawn
+    // where it snows): left out under the weather's, which it tells where to fall
+    if (WeatherWanted() && prim == 1 && count == 4096 && s.rs[kRsPointSpriteEnable] && !s.ps) {
+        game_snow_ = true;
+        return;
+    }
     if (const State* sprites = PointSpriteStages(s, prim)) return Draw(*sprites, prim, start, count, indices);
     if (s.blank_format && s.textures[0] && (::kernel::R32(s.textures[0] + 12) >> 8 & 0xFF) == s.blank_format) {
         Clear(s, 0, nullptr, kClearTarget, 0xFF000000u, 0, 0);  // a black clear in its place (State::blank_format)
@@ -4735,6 +5213,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     draw_seq_++;
     sky_keeps_game_ = !draw_2d_ && Style().texture_pack && SkyDraw(s, a, sh).sky;
     for (int i = 0; i < 4; i++) stages.view[i] = BindTexture(s, i, stages);
+    // ground displacement: the draw cut finer and pushed in, its vertex shader made for the converted layout
+    if (Displace(s, sh, prim, start, count, indices, a)) {
+        sh = ClassifyShaders(s, a, a.index_count);
+        if (sh.prog) EnsureProgramHash(s);
+        sh.vkey = VertexKey(s, a, sh);
+        EnsureVertexShader(s, a, sh);
+    }
     draw_env_ = false;
     for (int i = 0; i < 4; i++) draw_env_ |= stages.view[i] && stages.info[i].kind == kTexCube;
     if (!BindTargets(s)) return;
@@ -4747,6 +5232,18 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }();
     pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
     if (!draw_2d_ && bound_ds_) scene_wbuf_ = pk.wbuf;
+    // snow: how much of the world is snow, and (without ray tracing's capture) the level's camera
+    if (WeatherWanted() && !draw_2d_ && sh.prog && pk.wbuf && a.topology == Topology::Triangles && !sh.quad &&
+        bound_ds_ && bound_ds_->rt_depth_frame != presents_ + 1) {
+        uint64_t n = (a.index_count ? a.index_count : a.draw_count) / 3;
+        const SkyCheck sky = SkyDraw(s, a, sh);
+        if (!sky.sky && sky.cam_ok && !RtWanted()) {
+            RtCam& seen = rt_cams_[Hash(sky.cam, sizeof(sky.cam))];
+            if (!seen.tris) std::memcpy(seen.r, sky.cam, sizeof(seen.r));
+            seen.tris += n;
+            Color(s.rs[kRsFogColor], rt_fog_);
+        }
+    }
     sh.pkey = Hash(&pk, sizeof(pk));
     EnsurePixelShader(pk, sh);
     if (!sh.vs_code || !sh.ps_code) return;
@@ -5528,7 +6025,7 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
         return;
     static const int test = [] {
         const char* e = std::getenv("XBE_RT_TEST");
-        return e && *e >= '5' && *e <= '7' ? *e - '0' : 0;
+        return e && *e >= '5' && *e <= '8' ? *e - '0' : 0;
     }();
     // the bounced light (rt_gi): traced at half the size into rt.rt_gi first
     constexpr VkFormat kGiFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -5551,6 +6048,25 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
             pgi = VK_NULL_HANDLE;
     }
     rt_gi_drawn_ = pgi != VK_NULL_HANDLE;
+    // the volumetric light (rt_volumetric): traced at half the size into rt.rt_vol, added over the relit scene by volc
+    VkPipeline pvol = VK_NULL_HANDLE, pvolc = VK_NULL_HANDLE;
+    if (st.rt_volumetric && st.rt_vol_strength > 0) {
+        uint64_t volh, volch;
+        if (!Compile(src, "vol", "ps_6_5", volh) || !Compile(src, "volc", "ps_6_5", volch)) {
+            LOG_FIRST(1, "vulkan: the ray traced volumetric light did not compile; none drawn");
+        } else {
+            PassKey kv{vh, volh, kGiFormat, VK_FORMAT_UNDEFINED, 0, 0}, kc{vh, volch, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+            kv.rt = kc.rt = 1;
+            pvol = PassPipeline(kv);
+            pvolc = PassPipeline(kc);
+        }
+        if (rt.rt_vol.img && (rt.rt_vol.w != gw || rt.rt_vol.h != gh)) DropImage(rt.rt_vol);
+        if (pvol && pvolc && !rt.rt_vol.img &&
+            !MakeImage(rt.rt_vol, VK_IMAGE_TYPE_2D, kGiFormat, gw, gh, 1, 1, 1,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+            pvol = VK_NULL_HANDLE;
+        if (!pvolc) pvol = VK_NULL_HANDLE;
+    }
     // the camera: the one most of the frame's triangles were drawn with (the level's)
     const RtCam* cam = nullptr;
     for (const auto& [h, c] : rt_cams_)
@@ -5634,13 +6150,15 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
         next_log = now_s + 10;
     }
     bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    // the air's light by how bright the level is outdoors: a night's moonlit air glows a little, not as a day's fog
+    const float vol_day = 1.0f - 0.8f * known * (1.0f - ramp(bl, 0.15f, 0.6f));
     const float p[8 * 4] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
                             float(lights), kept ? 1.0f : 0.0f, float(test), fs.stats.buf ? 1.0f : 0.0f,
                             sun[0], sun[1], sun[2], st.rt_sun * power,
                             sunc[0], sunc[1], sunc[2], pgi ? 0.25f : 0.35f,
                             rt_fog_[0], rt_fog_[1], rt_fog_[2], 1.2f,
                             up[0], up[1], up[2], 0.6f,
-                            0.06f, 0.06f, 0.06f, 0,
+                            0.06f, 0.06f, 0.06f, pvol ? st.rt_vol_strength * vol_day : 0.0f,
                             pgi ? st.rt_gi_strength : 0.0f, float(kGiRays), 1.0f / gw, 1.0f / gh};
     std::memcpy(c, p, sizeof(p));
     End();
@@ -5668,6 +6186,22 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
     VkImageView views[4] = {rt.fb.view, ds->res.view, keptv, pgi ? rt.rt_gi.view : dummy_.view};
     FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, floats, views, 4, rt_[frame_slot_].tlas);
     End();
+    if (pvol) {
+        VkImageView vv[4] = {rt.fb.view, ds->res.view, keptv, dummy_.view};
+        VkViewport vvp{0, 0, float(gw), float(gh), 0, 1};
+        VkRect2D vsc{{0, 0}, {gw, gh}};
+        FullScreen(pvol, {rt.rt_vol.att, VK_NULL_HANDLE, gw, gh}, vvp, vsc, c, floats, vv, 4, rt_[frame_slot_].tlas);
+        End();
+        Barrier();
+        vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        dirty_ = true;
+        Barrier();
+        VkImageView cv[4] = {rt.fb.view, ds->res.view, keptv, rt.rt_vol.view};
+        FullScreen(pvolc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, floats, cv, 4, rt_[frame_slot_].tlas);
+        End();
+        static bool said_vol = false;
+        if (!said_vol) said_vol = true, LOGR("vulkan: ray traced volumetric light drawn (at %ux%u, strength %.2f)", gw, gh, st.rt_vol_strength);
+    }
     static bool said = false;
     if (!said) {
         said = true;
@@ -5956,7 +6490,8 @@ uint64_t VulkanBackend::DetailShader(const DrawShaders& sh, const PixelKey& pk, 
 }
 
 uint64_t VulkanBackend::MaterialShader(const DrawShaders& sh, const PixelKey& pk, int slot) {
-    uint64_t key = sh.pkey ^ kMatKeySalt ^ uint64_t(slot) << 56;
+    const bool high = Style().relief_high && Style().surface_depth > 0;
+    uint64_t key = sh.pkey ^ kMatKeySalt ^ uint64_t(slot) << 56 ^ uint64_t(high) << 60;
     if (auto it = shader_src_.find(key); it != shader_src_.end()) return it->second;
     uint64_t h = 0;
     std::string src = PixelHlsl(pk);
@@ -5971,8 +6506,8 @@ uint64_t VulkanBackend::MaterialShader(const DrawShaders& sh, const PixelKey& pk
         std::string scale = std::string("float2(1, 1)") + (proj ? " * i.tc0.w" : "") + (pk.tex[0].rect ? " * texsize[0].xy" : "");
         char tail[8192];
         std::snprintf(tail, sizeof(tail), kMatMain, pk.wbuf ? ", out float depth : SV_Depth" : "", uv.c_str(),
-                      scale.c_str(), slot, slot, slot, slot, pk.wbuf ? ", depth" : "", slot, slot);
-        src += tail;
+                      scale.c_str(), slot, slot, slot, slot, pk.wbuf ? ", depth" : "", slot, slot, slot, slot);
+        src = std::string("#define RELIEF_HIGH ") + (high ? "1" : "0") + "\n" + src + tail;
         if (!Compile(src, "main", "ps_5_0", h)) h = 0;
     }
     if (!h) LOG_FIRST(4, "vulkan: a material shader could not be made, the surface is drawn as the game's");
@@ -6461,6 +6996,8 @@ void VulkanBackend::Present(const Surface& front) {
     rt_tris_.clear(), rt_cut_.clear(), rt_mats_.clear(), rt_cut_mats_.clear(), rt_gun_.clear(), rt_gun_mats_.clear();
     rt_views_.clear(), rt_view_slot_.clear();
     rt_cams_.clear();
+    snow_level_ += ((game_snow_ ? 1.0f : 0.0f) - snow_level_) * 0.03f;
+    game_snow_ = false;
     if (uint64_t all = rt_fog_tris_[0] + rt_fog_tris_[1]; all > 500) rt_fogged_ = float(rt_fog_tris_[1]) / float(all);
     rt_fog_tris_[0] = rt_fog_tris_[1] = 0;
     rt_drawn_ = false;
@@ -6627,9 +7164,12 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     if (rt_built_ && Style().rt_lighting) RtRelightPass(rt, ds);
     if (rt_built_ && Style().rt_ao > 0) RtPass(rt, ds);
     if (rt_built_) RtReflectPass(rt, ds);
+    gtao_drawn_ = false;
+    if (!rt_drawn_ && QualityAo(Style()) > 0 && Style().mode != kStyleRetro && scene_wbuf_) GtaoPass(rt, ds);
     if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds);
     if (Style().bounce_light && Style().mode != kStyleRetro && !rt_gi_drawn_) BouncePass(rt, ds);
     if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds);
+    if (WeatherWanted()) WeatherPass(rt, ds);
     if (StylePassWanted()) StylePass(rt, ds);
     if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt);
     if (DofWanted()) DofPass(rt, ds);
@@ -6689,7 +7229,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
         g.exposure = neutral.exposure, g.tonemap = kToneOff, g.contrast = 1, g.saturation = 1, g.temperature = 0;
         g.sharpen = 0, g.vignette = 0, g.grain = 0, g.bloom_threshold = 0.85f;
     }
-    float ao = rt_drawn_ ? 0.0f : QualityAo(st),
+    float ao = rt_drawn_ || gtao_drawn_ ? 0.0f : QualityAo(st),
           bloom = st.mode == kStyleOriginal || st.mode == kStyleEnhanced ? QualityBloom(st) : 0.0f;
     if (st.mode == kStyleOriginal && st.quality_bloom) g.bloom_threshold = 0.85f;
     float c[44] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
@@ -6725,6 +7265,196 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
         if (!v && !null_descriptor_) v = dummy_.view;
     FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 44, views, 4);
     End();
+}
+
+// snow over the scene (kSnowHlsl): footprints made where the players stepped, then the pass. Where it snows: where the
+// game draws its own snow (snow_level_), or everywhere outdoors (weather 2)
+void VulkanBackend::WeatherPass(Target& rt, Target* ds) {
+    const GraphicsStyle& st = Style();
+    if (!ds || ds->w != rt.w || ds->h != rt.h || !scene_wbuf_ || rt_cams_.empty()) return;
+    const bool traced = rt_built_;
+    static const std::string plain = std::string("#define RT 0\n") + kSnowHlsl;
+    static const std::string with_rt = std::string("#define RT 1\n") + kRtCommonHlsl + kSnowHlsl;
+    uint64_t vh, ph;
+    if (!Compile(traced ? with_rt : plain, "vs", traced ? "vs_6_5" : "vs_5_0", vh) ||
+        !Compile(traced ? with_rt : plain, "ps", traced ? "ps_6_5" : "ps_5_0", ph)) {
+        LOG_FIRST(1, "vulkan: the snow did not compile; none drawn");
+        return;
+    }
+    PassKey kp{vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    kp.rt = traced ? 1 : 0;
+    VkPipeline pl = PassPipeline(kp);
+    if (!pl) return;
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    // the level's camera (the most triangles), the world to the view (rows x, y, distance; RtRelightPass's place)
+    const RtCam* cam = nullptr;
+    for (const auto& [h, c] : rt_cams_)
+        if (!cam || c.tris > cam->tris) cam = &c;
+    const float ty = 0.5774f, aspect = float(rt.w) / float(rt.h);
+    const float scale[3] = {ty * aspect, ty, 1};
+    float m[3][4];
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 4; k++) m[r][k] = cam->r[r][k] * scale[r];
+    const float unit = std::sqrt(m[2][0] * m[2][0] + m[2][1] * m[2][1] + m[2][2] * m[2][2]);  // metres a world unit
+    // its inverse: the 3x3's, then the camera's place
+    float a = m[0][0], b = m[0][1], c3 = m[0][2], d = m[1][0], e = m[1][1], f = m[1][2], g = m[2][0], h = m[2][1], k = m[2][2];
+    float det = a * (e * k - f * h) - b * (d * k - f * g) + c3 * (d * h - e * g);
+    if (std::abs(det) < 1e-12f || unit <= 0) return;
+    float inv[3][4] = {{(e * k - f * h) / det, (c3 * h - b * k) / det, (b * f - c3 * e) / det, 0},
+                       {(f * g - d * k) / det, (a * k - c3 * g) / det, (c3 * d - a * f) / det, 0},
+                       {(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det, 0}};
+    for (int r = 0; r < 3; r++) inv[r][3] = -(inv[r][0] * m[0][3] + inv[r][1] * m[1][3] + inv[r][2] * m[2][3]);
+    const float eye[3] = {inv[0][3], inv[1][3], inv[2][3]};
+    // how outdoors: ray tracing finds the roofs itself; else only on a snowy level's snow
+    const float snowy = st.weather == 2 ? 1.0f : snow_level_;
+    const float outdoors = traced ? snowy : snowy * snowy;
+    // footprints: a print each 0.7 m a player walks on the level (a jump or a fall none), left and right in turn,
+    // pressed for a minute then filled in over two (faster in heavier snow)
+    const double now = double(presents_) / 60.0;
+    if (FootprintEpoch() != print_epoch_) print_epoch_ = FootprintEpoch(), prints_.clear(), steps_.clear();
+    Walker ws[8];
+    uint32_t nw = st.footprints && snowy > 0.3f ? Walkers(ws, 8) : 0;
+    for (uint32_t i = 0; i < nw; i++) {
+        Step& sp = steps_[ws[i].id];
+        float dx = ws[i].pos[0] - sp.pos[0], dy = ws[i].pos[1] - sp.pos[1], dz = ws[i].pos[2] - sp.pos[2];
+        float flat = std::sqrt(dx * dx + dz * dz) * unit, rise = std::abs(dy) * unit;
+        if (!sp.ok || flat > 6.0f || rise > 0.6f) {
+            std::memcpy(sp.pos, ws[i].pos, sizeof(sp.pos));
+            sp.ok = true;
+            continue;
+        }
+        if (flat < 0.7f) continue;
+        float yaw = std::atan2(dx, dz);
+        float side = (sp.side ^= 1) ? 0.11f : -0.11f;
+        Print pr{{ws[i].pos[0] + std::cos(yaw) * side / unit, ws[i].pos[1], ws[i].pos[2] - std::sin(yaw) * side / unit},
+                 yaw, now};
+        prints_.push_back(pr);
+        if (prints_.size() > 600) prints_.erase(prints_.begin(), prints_.begin() + 100);
+        std::memcpy(sp.pos, ws[i].pos, sizeof(sp.pos));
+    }
+    const float last = 60.0f / std::max(0.5f, st.snow_amount), fill = 120.0f / std::max(0.5f, st.snow_amount);
+    struct Nearby { float key; float v[4]; };
+    std::vector<Nearby> nearby;
+    for (const Print& pr : prints_) {
+        float age = float(now - pr.made);
+        float fade = 1.0f - std::clamp((age - last) / fill, 0.0f, 1.0f);
+        if (fade <= 0) continue;
+        float dx = pr.pos[0] - eye[0], dy = pr.pos[1] - eye[1], dz = pr.pos[2] - eye[2];
+        float dist = std::sqrt(dx * dx + dy * dy + dz * dz) * unit;
+        if (dist > 40) continue;
+        float turns = pr.yaw / 6.2831853f;
+        turns -= std::floor(turns);
+        nearby.push_back({dist, {pr.pos[0], pr.pos[1], pr.pos[2], std::floor(fade * 99.0f + 0.5f) + std::min(turns, 0.9999f)}});
+    }
+    std::sort(nearby.begin(), nearby.end(), [](const Nearby& x, const Nearby& y) { return x.key < y.key; });
+    const uint32_t np = uint32_t(std::min<size_t>(nearby.size(), 96));
+    // the wind: about a metre a second, turning slowly, in gusts; harder in a blizzard
+    const float t = float(presents_ % 216000) / 60.0f;
+    const float around = 0.6f + 0.4f * std::sin(t * 0.021f), gust = 1.0f + 0.5f * std::sin(t * 0.31f) * std::sin(t * 0.13f);
+    const float wind = (0.6f + 1.2f * std::max(0.0f, st.snow_amount - 1.0f)) * gust;
+    // the snow's colour: the level's fog brightened (white in a white fog, grey-blue at night)
+    float fl = 0.299f * rt_fog_[0] + 0.587f * rt_fog_[1] + 0.114f * rt_fog_[2];
+    float bright = std::clamp(0.75f + 0.5f * fl, 0.7f, 1.0f);
+    static const int test = [] {
+        const char* e2 = std::getenv("XBE_SNOW_TEST");
+        return e2 && *e2 >= '1' && *e2 <= '2' ? *e2 - '0' : 0;
+    }();
+    const bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    std::vector<float> cb((16 + 96) * 4, 0.0f);
+    const float head[11 * 4] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
+                                kept ? 1.0f : 0.0f, t, st.snow_amount, unit,
+                                inv[0][0], inv[0][1], inv[0][2], inv[0][3],
+                                inv[1][0], inv[1][1], inv[1][2], inv[1][3],
+                                inv[2][0], inv[2][1], inv[2][2], inv[2][3],
+                                m[0][0], m[0][1], m[0][2], m[0][3],
+                                m[1][0], m[1][1], m[1][2], m[1][3],
+                                m[2][0], m[2][1], m[2][2], m[2][3],
+                                wind * std::cos(around), wind * std::sin(around), 1.1f + 0.4f * std::max(0.0f, st.snow_amount - 1.0f), outdoors,
+                                bright * 0.95f, bright * 0.97f, bright, float(np),
+                                float(test), 0, 0, 0};
+    std::memcpy(cb.data(), head, sizeof(head));
+    for (uint32_t i = 0; i < np; i++) std::memcpy(&cb[(16 + i) * 4], nearby[i].v, sizeof(nearby[i].v));
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    VkImageView views[4] = {rt.fb.view, ds->res.view, kept ? ds->rt_depth.view : ds->res.view, dummy_.view};
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, cb.data(), uint32_t(cb.size()), views, 4,
+               traced ? rt_[frame_slot_].tlas : VK_NULL_HANDLE);
+    End();
+    static double next_log = 0;
+    if (now > next_log) {
+        next_log = now + 20;
+        LOGR("vulkan: snow (%s, level snowy %.2f, outdoors %.2f, amount %.2f, %zu footprints, %u nearby; a world unit %.3f m; "
+             "%u players; the eye %.2f %.2f %.2f, player 0 %.2f %.2f %.2f)", traced ? "ray traced shelter" : "no shelter test",
+             snow_level_, outdoors, st.snow_amount, prints_.size(), np, unit, nw, eye[0], eye[1], eye[2],
+             nw ? ws[0].pos[0] : 0.0f, nw ? ws[0].pos[1] : 0.0f, nw ? ws[0].pos[2] : 0.0f);
+    }
+}
+
+// ground truth ambient occlusion over the scene (kGtaoHlsl): at half its size, then the scene darkened by it
+void VulkanBackend::GtaoPass(Target& rt, Target* ds) {
+    const GraphicsStyle& st = Style();
+    if (!ds || ds->w != rt.w || ds->h != rt.h) return;
+    uint64_t vh, gh, ch;
+    if (!Compile(kGtaoHlsl, "vs", "vs_5_0", vh) || !Compile(kGtaoHlsl, "gtao", "ps_5_0", gh) ||
+        !Compile(kGtaoHlsl, "comp", "ps_5_0", ch)) {
+        LOG_FIRST(1, "vulkan: the ambient occlusion's passes did not compile; the style pass's is drawn");
+        return;
+    }
+    constexpr VkFormat kAoFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkPipeline pg = PassPipeline({vh, gh, kAoFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pc = PassPipeline({vh, ch, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pg || !pc) return;
+    const uint32_t aw = std::max<uint32_t>(rt.w / 2, 1), ah = std::max<uint32_t>(rt.h / 2, 1);
+    if (rt.gtao.img && (rt.gtao.w != aw || rt.gtao.h != ah)) DropImage(rt.gtao);
+    if (!rt.gtao.img && !MakeImage(rt.gtao, VK_IMAGE_TYPE_2D, kAoFormat, aw, ah, 1, 1, 1,
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        return;
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    static const int test = [] {
+        const char* e = std::getenv("XBE_GTAO_TEST");
+        return e && *e == '1' ? 1 : 0;
+    }();
+    const bool high = st.quality_ao >= 2 || QualityAo(st) > 0.6f;
+    const bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    float c[12] = {1.0f / rt.w, 1.0f / rt.h, 0.5774f, float(rt.w) / float(rt.h),
+                   kept ? 1.0f : 0.0f, QualityAo(st), 1.0f * st.ao_radius, high ? 4.0f : 2.0f,
+                   high ? 8.0f : 5.0f, 1.0f / aw, 1.0f / ah, float(test)};
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    VkImageView keptv = kept ? ds->rt_depth.view : ds->res.view;
+    VkImageView gv[4] = {rt.fb.view, ds->res.view, keptv, dummy_.view};
+    VkViewport avp{0, 0, float(aw), float(ah), 0, 1};
+    VkRect2D asc{{0, 0}, {aw, ah}};
+    FullScreen(pg, {rt.gtao.att, VK_NULL_HANDLE, aw, ah}, avp, asc, c, 12, gv, 4);
+    End();
+    Barrier();
+    VkImageView cv[4] = {rt.fb.view, ds->res.view, keptv, rt.gtao.view};
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    FullScreen(pc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 12, cv, 4);
+    End();
+    gtao_drawn_ = true;
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: ground truth ambient occlusion drawn (%s: %d slices, %d steps at %ux%u, strength %.2f)",
+                                 high ? "high" : "low", high ? 4 : 2, high ? 8 : 5, aw, ah, QualityAo(st));
 }
 
 // bounced light over the scene (kBounceHlsl): the light about each pixel gathered at a quarter size, then the scene lit
@@ -7027,6 +7757,10 @@ void VulkanBackend::LogPerf() {
     LOGR("perf: vulkan ground detail a frame: %.1f tagged, %.1f not opaque, %.1f no free stage, %.1f drawn",
          perf_det_[0] / n, perf_det_[1] / n, perf_det_[2] / n, perf_det_[3] / n);
     for (uint64_t& d : perf_det_) d = 0;
+    if (Style().displacement)
+        LOGR("perf: vulkan ground displacement a frame: %.1f draws, %.0f triangles (%zu meshes kept, %.1f MB)",
+             perf_disp_[0] / n, perf_disp_[1] / n, disp_cache_.size(), disp_bytes_ / 1048576.0);
+    for (uint64_t& d : perf_disp_) d = 0;
     perf_soft_ = perf_mat_ = perf_glow_ = 0;
     LOGR("perf: vulkan reflective draws a frame: %.1f (3D %.0f, stage 0 seen %.0f, rt+ds %.0f, scene size %.0f, opaque %.0f, W-buffer %.0f)",
          perf_reflect_ / n, g_ssr_diag[0] / n, g_ssr_diag[1] / n, g_ssr_diag[2] / n, g_ssr_diag[3] / n, g_ssr_diag[4] / n,

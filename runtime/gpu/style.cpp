@@ -74,6 +74,7 @@ void Clamp(GraphicsStyle& s) {
     s.light_strength = std::clamp(s.light_strength, 0.0f, 3.0f);
     s.material_strength = std::clamp(s.material_strength, 0.0f, 1.5f);
     s.surface_depth = std::clamp(s.surface_depth, 0.0f, 2.0f);
+    s.displace_depth = std::clamp(s.displace_depth, 0.0f, 3.0f);
     s.detail_strength = std::clamp(s.detail_strength, 0.0f, 1.0f);
     s.detail_distance = std::clamp(s.detail_distance, 2.0f, 60.0f);
     s.rt_ao = std::clamp(s.rt_ao, 0.0f, 2.0f);
@@ -81,6 +82,9 @@ void Clamp(GraphicsStyle& s) {
     s.rt_rays = std::clamp(s.rt_rays, 1, 16);
     s.rt_sun = std::clamp(s.rt_sun, 0.0f, 2.0f);
     s.rt_gi_strength = std::clamp(s.rt_gi_strength, 0.0f, 2.0f);
+    s.rt_vol_strength = std::clamp(s.rt_vol_strength, 0.0f, 3.0f);
+    s.weather = std::clamp(s.weather, 0, 2);
+    s.snow_amount = std::clamp(s.snow_amount, 0.25f, 3.0f);
     s.dof = std::clamp(s.dof, 0, int(kDofModes) - 1);
     s.dof_strength = std::clamp(s.dof_strength, 0.0f, 2.0f);
 }
@@ -101,9 +105,9 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "quality_ao", "quality_bloom", "reflections", "reflection_strength",
                                   "reflections_auto", "soft_particles", "particle_fade",
                                   "effect_lights", "light_strength", "atmosphere", "shaft_strength", "fog_strength", "bounce_light", "bounce_strength",
-                                  "materials", "material_strength", "surface_depth",
+                                  "materials", "material_strength", "surface_depth", "relief_high", "displacement", "displace_depth",
                                   "ground_detail", "detail_strength", "detail_distance",
-                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "blood",
+                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "blood",
                                   "depth_of_field", "dof_strength"};
     for (auto&& [k, v] : t) {
         bool ok = false;
@@ -177,6 +181,9 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("materials", s.materials);
     num("material_strength", s.material_strength);
     num("surface_depth", s.surface_depth);
+    flag("relief_high", s.relief_high);
+    flag("displacement", s.displacement);
+    num("displace_depth", s.displace_depth);
     flag("ground_detail", s.ground_detail);
     num("detail_strength", s.detail_strength);
     num("detail_distance", s.detail_distance);
@@ -189,6 +196,11 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     num("rt_sun", s.rt_sun);
     flag("rt_gi", s.rt_gi);
     num("rt_gi_strength", s.rt_gi_strength);
+    flag("rt_volumetric", s.rt_volumetric);
+    num("rt_vol_strength", s.rt_vol_strength);
+    integer("weather", s.weather);
+    num("snow_amount", s.snow_amount);
+    flag("footprints", s.footprints);
     flag("blood", s.blood);
     named("depth_of_field", s.dof, kDofNames, 3);
     num("dof_strength", s.dof_strength);
@@ -243,6 +255,9 @@ toml::table Write(const GraphicsStyle& s) {
                        {"materials", s.materials},
                        {"material_strength", double(s.material_strength)},
                        {"surface_depth", double(s.surface_depth)},
+                       {"relief_high", s.relief_high},
+                       {"displacement", s.displacement},
+                       {"displace_depth", double(s.displace_depth)},
                        {"ground_detail", s.ground_detail},
                        {"detail_strength", double(s.detail_strength)},
                        {"detail_distance", double(s.detail_distance)},
@@ -255,6 +270,11 @@ toml::table Write(const GraphicsStyle& s) {
                        {"rt_sun", double(s.rt_sun)},
                        {"rt_gi", s.rt_gi},
                        {"rt_gi_strength", double(s.rt_gi_strength)},
+                       {"rt_volumetric", s.rt_volumetric},
+                       {"rt_vol_strength", double(s.rt_vol_strength)},
+                       {"weather", s.weather},
+                       {"snow_amount", double(s.snow_amount)},
+                       {"footprints", s.footprints},
                        {"blood", s.blood},
                        {"depth_of_field", kDofNames[s.dof]},
                        {"dof_strength", double(s.dof_strength)}};
@@ -406,6 +426,22 @@ void SunDirection(float out[3]) {
     std::lock_guard<std::mutex> lock(g_lights_lock);
     std::copy(g_sun, g_sun + 3, out);
 }
+namespace {
+std::vector<Walker> g_walkers;
+std::atomic<uint32_t> g_print_epoch{0};
+}  // namespace
+void SetWalkers(const Walker* walkers, uint32_t count) {
+    std::lock_guard<std::mutex> lock(g_lights_lock);
+    g_walkers.assign(walkers, walkers + count);
+}
+uint32_t Walkers(Walker* out, uint32_t max) {
+    std::lock_guard<std::mutex> lock(g_lights_lock);
+    uint32_t n = std::min<uint32_t>(max, uint32_t(g_walkers.size()));
+    std::copy(g_walkers.begin(), g_walkers.begin() + n, out);
+    return n;
+}
+void ClearFootprints() { g_print_epoch.fetch_add(1); }
+uint32_t FootprintEpoch() { return g_print_epoch.load(); }
 void SetSceneLights(const SceneLight* lights, uint32_t count) {
     std::lock_guard<std::mutex> lock(g_lights_lock);
     g_lights.assign(lights, lights + count);
@@ -501,6 +537,9 @@ void ApplyPreset(const StylePreset& p) {
     g_style.materials = keep.materials;
     g_style.material_strength = keep.material_strength;
     g_style.surface_depth = keep.surface_depth;
+    g_style.relief_high = keep.relief_high;
+    g_style.displacement = keep.displacement;
+    g_style.displace_depth = keep.displace_depth;
     g_style.ground_detail = keep.ground_detail;
     g_style.detail_strength = keep.detail_strength;
     g_style.detail_distance = keep.detail_distance;
@@ -513,6 +552,11 @@ void ApplyPreset(const StylePreset& p) {
     g_style.rt_sun = keep.rt_sun;
     g_style.rt_gi = keep.rt_gi;
     g_style.rt_gi_strength = keep.rt_gi_strength;
+    g_style.rt_volumetric = keep.rt_volumetric;
+    g_style.rt_vol_strength = keep.rt_vol_strength;
+    g_style.weather = keep.weather;
+    g_style.snow_amount = keep.snow_amount;
+    g_style.footprints = keep.footprints;
     g_style.blood = keep.blood;
     g_style.dof = keep.dof;
     g_style.dof_strength = keep.dof_strength;
@@ -584,6 +628,7 @@ bool StylePassWanted() {
 bool ScenePassWanted() {
     return StylePassWanted() ||
            ((app::Get().smaa || g_style.effect_lights || g_style.atmosphere || g_style.bounce_light || g_style.dof ||
+             g_style.weather ||
              (g_style.ray_tracing && g_ray_tracing.load())) &&
             g_style.mode != kStyleRetro);
 }
@@ -807,16 +852,28 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::SliderFloat("Sun strength", &s.rt_sun, 0.0f, 2.0f, "%.2f");
         changed |= ImGui::Checkbox("Ray-traced global illumination (bounced light, with level lighting)", &s.rt_gi);
         changed |= ImGui::SliderFloat("Bounced light strength", &s.rt_gi_strength, 0.0f, 2.0f, "%.2f");
+        changed |= ImGui::Checkbox("Ray-traced volumetric light (light shafts, with level lighting)", &s.rt_volumetric);
+        changed |= ImGui::SliderFloat("Volumetric strength", &s.rt_vol_strength, 0.0f, 3.0f, "%.2f");
         if (!rt) ImGui::EndDisabled();
         ImGui::TextDisabled(rt ? "Traced against the scene's own triangles, so corners, crevices and what stands behind\n"
                                  "or beside the view shade too. Replaces the screen-space AO. Not drawn in Retro."
                                : "Needs the Vulkan renderer on a GPU with ray queries (NVIDIA RTX, AMD RX 6000 or\n"
                                  "later, Intel Arc). The screen-space ambient occlusion stands in for it.");
     }
+    if (ImGui::CollapsingHeader("Weather", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int w = s.weather;
+        if (ImGui::Combo("Snow", &w, "Off\0Snowy levels\0Everywhere outdoors\0")) s.weather = w, changed = true;
+        changed |= ImGui::SliderFloat("Snowfall", &s.snow_amount, 0.25f, 3.0f, "%.2f");
+        changed |= ImGui::Checkbox("Footprints in the snow", &s.footprints);
+        ImGui::TextDisabled("Falling snow and footprints (Vulkan; kept from under roofs with ray tracing).");
+    }
     if (ImGui::CollapsingHeader("Materials (PBR)", ImGuiTreeNodeFlags_DefaultOpen)) {
         changed |= ImGui::Checkbox("Normal and roughness maps", &s.materials);
         changed |= ImGui::SliderFloat("Material strength", &s.material_strength, 0.0f, 1.5f, "%.2f");
         changed |= ImGui::SliderFloat("Relief depth (0 off)", &s.surface_depth, 0.0f, 2.0f, "%.2f");
+        changed |= ImGui::Checkbox("Relief High (more steps, self-shadowing)", &s.relief_high);
+        changed |= ImGui::Checkbox("Ground geometry (the ground cut finer and pushed in; prototype)", &s.displacement);
+        changed |= ImGui::SliderFloat("Ground geometry depth", &s.displace_depth, 0.0f, 3.0f, "%.2f");
         ImGui::TextDisabled("A texture pack's maps (tools\\hd_pack.exe --pbr) over the game's lighting: bumps and a\n"
                             "specular sheen. Turning them on takes effect at the next start. Not drawn in Retro.");
     }

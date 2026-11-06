@@ -78,6 +78,12 @@ struct GraphicsStyle {
     bool materials = false;
     float material_strength = 0.7f;
     float surface_depth = 0.0f;  // relief: parallax occlusion mapping of the height map, 0 off to 2
+    bool relief_high = false;    // relief High: twice the steps and the surface's own shadows (Medium without)
+    // ground displacement (Vulkan; every style but Retro; a prototype): the ground's draws (textures ground detail
+    // finds grass, snow, rock or dirt in) cut into more triangles and pushed in by their kind's height, so the ground
+    // has real lumps and hollows (seen against the sky, in the ray traced scene, its shadows); its edges stay put
+    bool displacement = false;
+    float displace_depth = 1.0f;  // 0 to 3, the push's scale (1: about 8 cm at the lowest)
     // ground detail (Vulkan; every style but Retro): the scenery's tiling textures get fine detail and bumps up close
     // by their kind (grass, snow, rock, dirt, concrete: gpu/detail.h), fading out by detail_distance metres
     bool ground_detail = true;
@@ -100,6 +106,17 @@ struct GraphicsStyle {
     // not), in their colour; in place of the screen-space bounce
     bool rt_gi = false;
     float rt_gi_strength = 1.0f;  // 0 to 2
+    // volumetric light (with rt_lighting): the air lit by the sun and the game's lights, with traced shadows, so light
+    // falls through windows and past walls in shafts and lamps glow in the air
+    bool rt_volumetric = false;
+    float rt_vol_strength = 1.0f;  // 0 to 3
+    // snow (Vulkan; every style but Retro): snow falling about the camera, in the world (it stays where it is as the
+    // view turns), blown by a gusting wind, a pale haze in the distance, kept out from under roofs (a traced ray up
+    // from each flake with ray tracing; without, only while the ground in view is snow), and footprints where the
+    // players walk on snow, which the snow covers again in a few minutes
+    int weather = 0;           // 0 off, 1 on snowy levels (their ground mostly snow), 2 everywhere outdoors
+    float snow_amount = 1.0f;  // 0.25 to 3 (3 a blizzard)
+    bool footprints = true;
     // blood (every style and renderer, drawn over the picture: app/blood.cpp): a spray where a player's shot hits a
     // character, and red at the edges of a player's view as they are hit, fading
     bool blood = false;
@@ -174,5 +191,14 @@ uint32_t SceneLights(SceneLight* out, uint32_t max);  // the latest set, at most
 // the sun's direction for that lighting (towards it, the world's, +y up; a game may pick one per level)
 void SetSunDirection(const float dir[3]);
 void SunDirection(float out[3]);
+// the players' places (the game's thread, each frame; the world's, as the lights'): footprints where they walk on snow
+struct Walker {
+    float pos[3];
+    uint32_t id;
+};
+void SetWalkers(const Walker* walkers, uint32_t count);
+uint32_t Walkers(Walker* out, uint32_t max);
+void ClearFootprints();         // a new level
+uint32_t FootprintEpoch();      // counts the clears
 
 }  // namespace gpu
