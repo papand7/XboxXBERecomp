@@ -25,6 +25,10 @@ struct Settings {
     uint32_t render_percent = 100;   // of the output height
     uint32_t fps_cap = 60;           // 0: only the title's present interval
     bool vsync = true;
+    // HDR output (the Vulkan renderer, on a screen in Windows' HDR mode): the picture at Windows' SDR white, the 3D
+    // scene's highlights raised toward the peak; nits, 0 the screen's own (Windows' "SDR content brightness", DXGI's peak)
+    bool hdr = false;
+    uint32_t hdr_peak = 0, hdr_paper = 0;
     uint32_t aniso = 0;              // 0 as the game asks
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
     // 0 from the output's shape, 1 4:3, 2 16:9 (the console's TV setting, at boot), 3 widescreen filling the screen's

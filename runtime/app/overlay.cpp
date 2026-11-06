@@ -95,6 +95,14 @@ void Display(Settings& s) {
         ImGui::EndCombo();
     }
     if (ImGui::Checkbox("Vertical sync", &s.vsync)) Save();
+    if (ImGui::Checkbox("HDR (Vulkan; Windows' HDR on)", &s.hdr)) Save();
+    if (s.hdr) {
+        int peak = int(s.hdr_peak), paper = int(s.hdr_paper);
+        if (ImGui::SliderInt("HDR peak (nits, 0 the screen's)", &peak, 0, 4000)) s.hdr_peak = uint32_t(peak);
+        if (ImGui::IsItemDeactivatedAfterEdit()) Save();
+        if (ImGui::SliderInt("HDR SDR white (nits, 0 Windows')", &paper, 0, 600)) s.hdr_paper = uint32_t(paper);
+        if (ImGui::IsItemDeactivatedAfterEdit()) Save();
+    }
     if (changed) {
         Save();
         ApplyDisplay();

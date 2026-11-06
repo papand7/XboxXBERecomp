@@ -219,6 +219,9 @@ void Load() {
     s.render_percent = std::clamp<uint32_t>(t["render_percent"].value_or(s.render_percent), 25, 200);
     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
     s.vsync = t["vsync"].value_or(s.vsync);
+    s.hdr = t["hdr"].value_or(s.hdr);
+    s.hdr_peak = std::min<uint32_t>(t["hdr_peak_nits"].value_or(s.hdr_peak), 10000);
+    s.hdr_paper = std::min<uint32_t>(t["hdr_paper_white_nits"].value_or(s.hdr_paper), 600);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     std::string aspect = t["aspect"].value_or(std::string(kAspects[s.aspect % kAspectCount]));
@@ -327,6 +330,9 @@ toml::table Table() {
                   {"render_percent", int64_t(s.render_percent)},
                   {"fps_cap", int64_t(s.fps_cap)},
                   {"vsync", s.vsync},
+                  {"hdr", s.hdr},
+                  {"hdr_peak_nits", int64_t(s.hdr_peak)},
+                  {"hdr_paper_white_nits", int64_t(s.hdr_paper)},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"join_ip", s.join_ip},
                   {"aspect", kAspects[s.aspect % kAspectCount]},

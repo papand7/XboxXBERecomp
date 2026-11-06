@@ -14,6 +14,7 @@
 #endif
 #include <windows.h>
 #include <d3dcompiler.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #define VK_NO_PROTOTYPES
@@ -491,6 +492,8 @@ struct Target {
     Image dof_focus[2];  // depth of field: the distance in focus (1 / metres), this frame's and the last's in turn
     uint64_t dof_frame = 0;  // the frame (presents_ + 1) it was last drawn for
     uint64_t glow_frame = 0;
+    Image hdr_scene;  // HDR: the scene as the scene pass left it (before the HUD), of the frame hdr_frame
+    uint64_t hdr_frame = 0;
 };
 
 // a texture from guest memory
@@ -2035,7 +2038,7 @@ private:
     // Present's steps
     bool Acquire(uint32_t& index);
     void UploadGammaRamp();
-    void BlitFrame(Target& t, VkImageView view);
+    void BlitFrame(Target& t, VkImageView view, VkFormat fmt);
     void RenderUi();
     void ReleaseOldTextures();
     void CountFps();
@@ -2121,6 +2124,17 @@ private:
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swap_ = VK_NULL_HANDLE;
     VkFormat swap_fmt_ = kBgra;
+    // HDR (Settings::hdr): an HDR10 swap chain (PQ, BT.2020) where the screen offers one (Windows' HDR on); the frame
+    // and the overlay drawn at the screen's size first (hdr_sdr_, hdr_ui_: the overlay premultiplied), then HdrOut.
+    // ui_fmt_ the overlay's format, fixed when ImGui starts; the screen's brightness (nits) read at each new chain
+    bool colorspaces_ = false, swap_hdr_ = false, swap_hdr_asked_ = false;
+    VkFormat ui_fmt_ = kBgra;
+    Image hdr_sdr_, hdr_ui_;
+    float display_peak_ = 0, display_paper_ = 0;
+    struct HdrNits { float paper, peak; };
+    HdrNits HdrLevels() const;  // Settings' or the screen's, else 200 and 1000
+    void HdrCompose(Target* t);
+    void HdrOut(Target* t, VkImageView view);
     std::vector<VkImage> swap_images_;
     std::vector<VkImageView> swap_views_;
     std::vector<VkSemaphore> present_sem_;  // per swapchain image
@@ -2331,6 +2345,7 @@ private:
         DropImage(t.glow), DropImage(t.light_a), DropImage(t.light_b), DropImage(t.light_list);
         DropImage(t.rt_ao), DropImage(t.rt_depth);
         DropImage(t.dof_focus[0]), DropImage(t.dof_focus[1]);
+        DropImage(t.hdr_scene);
     }
     // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
     // mod, read again when it changes), else the built-in kScenePostHlsl
@@ -2412,6 +2427,16 @@ bool VulkanBackend::CreateInstance() {
         return false;
     }
     std::vector<const char*> exts = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    {
+        // HDR: the swap chain's colour spaces past sRGB (HDR10's)
+        uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> ep(n);
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, ep.data());
+        for (auto& e : ep)
+            if (!std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
+                exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME), colorspaces_ = true;
+    }
     std::vector<const char*> layers;
     if (DebugWanted()) {
         uint32_t n = 0;
@@ -2671,6 +2696,44 @@ bool VulkanBackend::CreateDevice() {
     return true;
 }
 
+// the window's screen: its peak brightness (DXGI's) and the one Windows shows SDR white at in HDR (its "SDR content
+// brightness"), in nits; 0 where unknown
+static void DisplayLuminance(HWND wnd, float& peak, float& paper) {
+    peak = paper = 0;
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    Microsoft::WRL::ComPtr<IDXGIFactory1> f;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f)))) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> a;
+        for (UINT i = 0; !peak && f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> o;
+            for (UINT j = 0; a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; j++) {
+                Microsoft::WRL::ComPtr<IDXGIOutput6> o6;
+                DXGI_OUTPUT_DESC1 d;
+                if (SUCCEEDED(o.As(&o6)) && SUCCEEDED(o6->GetDesc1(&d)) && !wcscmp(d.DeviceName, mi.szDevice)) {
+                    peak = d.MaxLuminance;
+                    break;
+                }
+            }
+        }
+    }
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) return;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(np);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nm);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), nullptr) != ERROR_SUCCESS) return;
+    for (UINT32 i = 0; i < np; i++) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
+        src.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(src), paths[i].sourceInfo.adapterId, paths[i].sourceInfo.id};
+        if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS || wcscmp(src.viewGdiDeviceName, mi.szDevice)) continue;
+        DISPLAYCONFIG_SDR_WHITE_LEVEL wl{};
+        wl.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, sizeof(wl), paths[i].targetInfo.adapterId, paths[i].targetInfo.id};
+        if (DisplayConfigGetDeviceInfo(&wl.header) == ERROR_SUCCESS) paper = float(wl.SDRWhiteLevel) / 1000.0f * 80.0f;
+        break;
+    }
+}
+
 bool VulkanBackend::CreateSwapchain() {
     RECT rc;
     GetClientRect(static_cast<HWND>(app::Window()), &rc);
@@ -2690,6 +2753,24 @@ bool VulkanBackend::CreateSwapchain() {
             sf = f;
             if (f.format == VK_FORMAT_B8G8R8A8_UNORM) break;
         }
+    swap_hdr_asked_ = app::Get().hdr;
+    swap_hdr_ = false;
+    if (swap_hdr_asked_) {
+        for (auto& f : formats)
+            if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
+                f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT && colorspaces_) {
+                sf = f, swap_hdr_ = true;
+                break;
+            }
+        DisplayLuminance(static_cast<HWND>(app::Window()), display_peak_, display_paper_);
+        static bool told = false;
+        if (!told || swap_hdr_) {
+            told = true;
+            LOGR("vulkan: HDR %s; the screen's peak %.0f nits, SDR white %.0f nits", swap_hdr_ ? "on (HDR10)" :
+                 colorspaces_ ? "asked, but the screen offers no HDR10 (Windows' HDR off?)" : "asked, but the driver has no HDR colour spaces",
+                 display_peak_, display_paper_);
+        }
+    }
     swap_fmt_ = sf.format;
     uint32_t pn = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd_, surface_, &pn, nullptr);
@@ -2933,7 +3014,9 @@ bool VulkanBackend::InitUi() {
     ii.UseDynamicRendering = true;
     ii.PipelineRenderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
     ii.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
-    ii.PipelineRenderingCreateInfo.pColorAttachmentFormats = &swap_fmt_;
+    // the overlay is drawn into the screen's format, or into hdr_ui_ (BGRA) on an HDR10 chain
+    ui_fmt_ = swap_hdr_ ? kBgra : swap_fmt_;
+    ii.PipelineRenderingCreateInfo.pColorAttachmentFormats = &ui_fmt_;
     return ImGui_ImplVulkan_Init(&ii);
 }
 
@@ -4642,7 +4725,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // (the HUD, menus) has the scene pass drawn first, so the 2D keeps the game's look
     const GraphicsStyle& st = Style();
     bool styled = st.mode != kStyleOriginal;
-    if (ScenePassWanted() && bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_) {
+    if ((ScenePassWanted() || swap_hdr_) && bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_) {
         if (!draw_2d_ && bound_ds_) {
             scene_rt_ = bound_rt_;
             scene_ds_ = bound_ds_;
@@ -6007,7 +6090,7 @@ void VulkanBackend::UploadGammaRamp() {
 }
 
 // the frame at its shape (16:9 or 4:3, ultrawide the screen's), centred on black
-void VulkanBackend::BlitFrame(Target& t, VkImageView view) {
+void VulkanBackend::BlitFrame(Target& t, VkImageView view, VkFormat fmt) {
     float aspect = app::FrameAspect();
     float w = float(bb_w_), h = float(bb_h_);
     float vw = std::min(w, h * aspect);
@@ -6018,7 +6101,152 @@ void VulkanBackend::BlitFrame(Target& t, VkImageView view) {
     // the swap chain image's rendering instance is already open (Present)
     open_ = true;
     cur_ = {view, VK_NULL_HANDLE, bb_w_, bb_h_};
-    Blit(t.res.view, cur_, vp, sc, uv, {.gamma = gamma_, .final = true}, swap_fmt_);
+    Blit(t.res.view, cur_, vp, sc, uv, {.gamma = gamma_, .final = true}, fmt);
+}
+
+// HDR (Settings::hdr, HdrOut): the frame and the overlay, drawn at the screen's size (HdrCompose), put together on an
+// HDR10 chain: SDR's colours taken as gamma 2.2 at the SDR white Windows shows (paper), the 3D scene's highlights
+// raised toward the screen's peak from a knee up (by luminance, so colours keep their hue); a pixel is the scene's
+// where the presented frame still holds what the scene pass left there (hdr_scene: the HUD, menus and movies stay at
+// SDR white), then BT.709 to BT.2020 and PQ. b1 p: [0] the frame's rectangle on the screen (pixels); [1] HDR10 (0: an
+// SDR chain, the overlay's format alone differs), paper and peak nits, the scene known; [2] the game frame's size, the
+// knee (linear). t0 the frame, t1 the overlay (premultiplied), t2 the presented game frame, t3 its scene
+const char* kHdrHlsl = R"(
+cbuffer P : register(b1) { float4 p[3]; };
+Texture2D frame : register(t0);
+Texture2D overlay : register(t1);
+Texture2D game : register(t2);
+Texture2D scene : register(t3);
+struct O { float4 pos : SV_Position; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+float3 lin(float3 c) { return pow(saturate(c), 2.2); }
+float3 pq(float3 nits) {
+    float3 y = pow(saturate(nits / 10000), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * y) / (1 + 18.6875 * y), 78.84375);
+}
+float4 ps(O i) : SV_Target {
+    int2 px = int2(i.pos.xy);
+    float3 c = lin(frame.Load(int3(px, 0)).rgb);
+    float2 uv = (i.pos.xy - p[0].xy) / p[0].zw;
+    if (p[1].w > 0 && p[1].x > 0 && all(uv >= 0) && all(uv < 1)) {
+        int3 g = int3(uv * p[2].xy, 0);
+        float3 d = abs(game.Load(g).rgb - scene.Load(g).rgb);
+        if (max(d.r, max(d.g, d.b)) < 1.5 / 255) {
+            float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+            float t = saturate((y - p[2].z) / (1 - p[2].z));
+            c *= 1 + (p[1].z / p[1].y - 1) * t * t;
+            if (p[2].w > 0) c = float3(1, c.g * 0.3, c.b * 0.3);
+        }
+    }
+    float4 u = overlay.Load(int3(px, 0));
+    if (u.a > 0) c = lin(u.rgb / u.a) * u.a + c * (1 - u.a);
+    if (p[1].x <= 0) return float4(pow(c, 1 / 2.2), 1);
+    const float3x3 to2020 = {0.6274, 0.3293, 0.0433, 0.0691, 0.9195, 0.0114, 0.0164, 0.0880, 0.8956};
+    return float4(pq(mul(to2020, c) * p[1].y), 1);
+}
+)";
+
+// an HDR10 shot's pixels as SDR's (BGRA): PQ to nits, SDR white at paper, BT.2020 to BT.709, gamma 2.2, highlights
+// clipped; A2B10G10R10 has red in the low bits, A2R10G10B10 blue
+// XBE_HDR_TEST=1: the pixels taken as the scene's shown red
+static bool HdrTest() {
+    static const bool on = [] {
+        const char* e = std::getenv("XBE_HDR_TEST");
+        return e && *e == '1';
+    }();
+    return on;
+}
+
+static void HdrToSdr(std::vector<uint32_t>& px, bool red_low, float paper) {
+    float lut[1024];
+    for (int i = 0; i < 1024; i++) {
+        float m = std::pow(float(i) / 1023.0f, 1.0f / 78.84375f);
+        lut[i] = 10000.0f * std::pow(std::max(m - 0.8359375f, 0.0f) / (18.8515625f - 18.6875f * m), 1.0f / 0.1593017578125f) / paper;
+    }
+    auto enc = [](float v) { return uint32_t(std::lround(std::pow(std::clamp(v, 0.0f, 1.0f), 1.0f / 2.2f) * 255.0f)); };
+    size_t over = 0;
+    float top = 0;
+    for (uint32_t& q : px) {
+        float c[3] = {lut[q & 0x3FF], lut[q >> 10 & 0x3FF], lut[q >> 20 & 0x3FF]};
+        if (!red_low) std::swap(c[0], c[2]);
+        float r = 1.6605f * c[0] - 0.5876f * c[1] - 0.0728f * c[2];
+        float g = -0.1246f * c[0] + 1.1329f * c[1] - 0.0083f * c[2];
+        float b = -0.0182f * c[0] - 0.1006f * c[1] + 1.1187f * c[2];
+        float m = std::max(r, std::max(g, b));
+        over += m > 1.05f, top = std::max(top, m);
+        q = 0xFF000000u | enc(r) << 16 | enc(g) << 8 | enc(b);
+    }
+    LOGR("vulkan: HDR shot: %.2f%% of the pixels above SDR white, the brightest %.0f nits", 100.0 * double(over) / double(px.size()),
+         top * paper);
+}
+
+VulkanBackend::HdrNits VulkanBackend::HdrLevels() const {
+    const app::Settings& s = app::Get();
+    float paper = s.hdr_paper ? float(s.hdr_paper) : display_paper_ > 0 ? display_paper_ : 200.0f;
+    float peak = s.hdr_peak ? float(s.hdr_peak) : display_peak_ > 0 ? display_peak_ : 1000.0f;
+    paper = std::clamp(paper, 80.0f, 600.0f);
+    return {paper, std::clamp(peak, paper, 10000.0f)};
+}
+
+// the frame at its shape (FXAA, sharpening, the gamma ramp, as on an SDR screen) and the overlay, premultiplied over
+// nothing, each at the screen's size
+void VulkanBackend::HdrCompose(Target* t) {
+    for (Image* im : {&hdr_sdr_, &hdr_ui_})
+        if (im->w != bb_w_ || im->h != bb_h_) {
+            DropImage(*im);
+            MakeImage(*im, VK_IMAGE_TYPE_2D, im == &hdr_ui_ ? ui_fmt_ : kBgra, bb_w_, bb_h_, 1, 1, 1,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        }
+    if (!hdr_sdr_ || !hdr_ui_) return;
+    VkClearAttachment ca{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+    VkClearRect cr{{{0, 0}, {bb_w_, bb_h_}}, 0, 1};
+    Begin({hdr_sdr_.att, VK_NULL_HANDLE, bb_w_, bb_h_});
+    ca.clearValue.color = {{0, 0, 0, 1}};
+    vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
+    if (t) BlitFrame(*t, hdr_sdr_.att, kBgra);
+    Begin({hdr_ui_.att, VK_NULL_HANDLE, bb_w_, bb_h_});
+    ca.clearValue.color = {{0, 0, 0, 0}};
+    vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
+    if (ui_) {
+        VkViewport vp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
+        vkCmdSetViewport(cmd_, 0, 1, &vp);
+        RenderUi();
+    }
+    End();
+}
+
+// the two put together on the swap chain image (its rendering instance already open: Present)
+void VulkanBackend::HdrOut(Target* t, VkImageView view) {
+    open_ = true;
+    cur_ = {view, VK_NULL_HANDLE, bb_w_, bb_h_};
+    uint64_t vh, ph;
+    VkPipeline pipe = hdr_sdr_ && hdr_ui_ && Compile(kHdrHlsl, "vs", "vs_5_0", vh) && Compile(kHdrHlsl, "ps", "ps_5_0", ph)
+                          ? PassPipeline({vh, ph, swap_fmt_, VK_FORMAT_UNDEFINED, 0, 0})
+                          : VK_NULL_HANDLE;
+    if (!pipe) {
+        LOG_FIRST(1, "vulkan: the HDR pass did not compile or has no images; the frame is drawn as SDR's");
+        if (t) BlitFrame(*t, view, swap_fmt_);
+        return;
+    }
+    const float aspect = app::FrameAspect(), w = float(bb_w_), h = float(bb_h_);
+    const float fw = std::min(w, h * aspect), fh = fw / aspect;
+    const HdrNits n = HdrLevels();
+    const bool scene = swap_hdr_ && t && t->hdr_frame == presents_ + 1 && t->hdr_scene.w == t->w && t->hdr_scene.h == t->h;
+    const float c[12] = {(w - fw) / 2, (h - fh) / 2, fw, fh,
+                         swap_hdr_ ? 1.0f : 0.0f, n.paper, n.peak, scene ? 1.0f : 0.0f,
+                         t ? float(t->w) : 1.0f, t ? float(t->h) : 1.0f, 0.45f, HdrTest() ? 1.0f : 0.0f};
+    VkViewport vp{0, 0, w, h, 0, 1};
+    VkRect2D sc{{0, 0}, {bb_w_, bb_h_}};
+    VkImageView views[4] = {hdr_sdr_.view, hdr_ui_.view, scene ? t->res.view : VK_NULL_HANDLE,
+                            scene ? t->hdr_scene.view : VK_NULL_HANDLE};
+    FullScreen(pipe, cur_, vp, sc, c, 12, views, 4);
+    static bool told = false;
+    if (swap_hdr_ && !told) told = true, LOGR("vulkan: HDR10 out, SDR white %.0f nits, peak %.0f", n.paper, n.peak);
 }
 
 void VulkanBackend::RenderUi() {
@@ -6066,7 +6294,7 @@ bool VulkanBackend::Acquire(uint32_t& index) {
     RECT rc;
     GetClientRect(static_cast<HWND>(app::Window()), &rc);
     uint32_t w = std::max<LONG>(rc.right - rc.left, 1), h = std::max<LONG>(rc.bottom - rc.top, 1);
-    if (!swap_ || w != bb_w_ || h != bb_h_ || swap_vsync_ != app::Get().vsync) {
+    if (!swap_ || w != bb_w_ || h != bb_h_ || swap_vsync_ != app::Get().vsync || swap_hdr_asked_ != app::Get().hdr) {
         if (!CreateSwapchain()) return false;
         if (ui_) ImGui_ImplVulkan_SetMinImageCount(2);
     }
@@ -6087,7 +6315,7 @@ void VulkanBackend::Present(const Surface& front) {
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (ramp_dirty_) UploadGammaRamp();
-    if (t && ScenePassWanted() && !post_done_ && scene_rt_ == t) ScenePass(*t, scene_ds_);
+    if (t && (ScenePassWanted() || swap_hdr_) && !post_done_ && scene_rt_ == t) ScenePass(*t, scene_ds_);
     // XBE_PAD_CMD's diagnostic: a file named shot beside the exe holding a PNG path gets the window's picture, as
     // shown (the settings window too), there
     static const bool shots = [] {
@@ -6127,6 +6355,9 @@ void VulkanBackend::Present(const Surface& front) {
         PerfScope pa{perf_acquire_};
         acquired = Acquire(index);
     }
+    // HDR (or an overlay format the chain lacks): the frame and the overlay drawn apart first, then put together
+    const bool compose = swap_hdr_ || (ui_ && ui_fmt_ != swap_fmt_);
+    if (acquired && compose) HdrCompose(t);
     if (acquired) {
         End();
         VkCommandBuffer cb = Cmd();
@@ -6156,10 +6387,14 @@ void VulkanBackend::Present(const Surface& front) {
         ri.colorAttachmentCount = 1;
         ri.pColorAttachments = &color;
         vkCmdBeginRendering(cb, &ri);
-        if (t) BlitFrame(*t, swap_views_[index]);
-        VkViewport vp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
-        vkCmdSetViewport(cb, 0, 1, &vp);
-        if (ui_) RenderUi();
+        if (compose) {
+            HdrOut(t, swap_views_[index]);
+        } else {
+            if (t) BlitFrame(*t, swap_views_[index], swap_fmt_);
+            VkViewport vp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
+            vkCmdSetViewport(cb, 0, 1, &vp);
+            if (ui_) RenderUi();
+        }
         vkCmdEndRendering(cb);
         open_ = false;
         cur_ = {};
@@ -6208,6 +6443,7 @@ void VulkanBackend::Present(const Surface& front) {
             std::memcpy(px.data(), readback_.mem.map, px.size() * 4);
             if (swap_fmt_ == VK_FORMAT_R8G8B8A8_UNORM)
                 for (uint32_t& p : px) p = (p & 0xFF00FF00u) | (p >> 16 & 0xFF) | (p & 0xFF) << 16;
+            if (swap_hdr_) HdrToSdr(px, swap_fmt_ == VK_FORMAT_A2B10G10R10_UNORM_PACK32, HdrLevels().paper);
             for (uint32_t& p : px) p |= 0xFF000000u;
             LOGR("vulkan: shot %ls %s", shot_path.c_str(), WritePngFile(shot_path, px, bb_w_, bb_h_) ? "written" : "failed");
         }
@@ -6280,6 +6516,18 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt);
     if (DofWanted()) DofPass(rt, ds);
     End();
+    // HDR: the finished scene before the HUD, which HdrOut compares the presented frame with
+    if (swap_hdr_ && (rt.hdr_scene.w == rt.w && rt.hdr_scene.h == rt.h ||
+                      (DropImage(rt.hdr_scene), MakeImage(rt.hdr_scene, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))) {
+        if (dirty_) Barrier();
+        VkImageCopy cp{};
+        cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        cp.extent = {rt.w, rt.h, 1};
+        vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.hdr_scene.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        dirty_ = true;
+        rt.hdr_frame = presents_ + 1;
+    }
     Stamp(3);
     ForgetDrawState();  // the draw that asked for it goes on with its targets
 }
