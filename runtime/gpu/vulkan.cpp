@@ -1444,10 +1444,10 @@ float3 agx(float3 v) {
     v = mul(max(v, 1e-10), into);
     v = (clamp(log2(v), lo, hi) - lo) / (hi - lo);
     v = agxcurve(v);
-    // a little more contrast and colour than AgX's base: the game's look is a saturated one
+    // AgX's punchy look (more contrast and colour than its base): the game's look is a saturated, contrasty one
+    v = pow(max(v, 0), 1.35);
     float l = luma(v);
-    v = pow(max(v, 0), 1.1);
-    v = l + (v - l) * 1.15;
+    v = l + (v - l) * 1.4;
     return lin(mul(v, back));
 }
 // ACES (Narkowicz's fit), mid grey kept where it was
@@ -6253,20 +6253,28 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
     float known = rt_sky_[3] * ramp(bm, 0.01f, 0.05f);
     for (int k = 0; k < 3; k++) sunc[k] += (tint[k] - sunc[k]) * 0.7f * known;
     power = 1.0f - 0.6f * ramp(bl, 0.45f, 0.15f) * known;
+    // a night by the level's fog too (dark: The Exchange's 0.21 0.28 0.40): snow makes a moonlit level's baked light as
+    // bright as a day's, and a day's sun on it washed the night out white; the moon's light is weaker, bluer
+    const float fogl = 0.299f * rt_fog_[0] + 0.587f * rt_fog_[1] + 0.114f * rt_fog_[2];
+    const float night = std::max(ramp(bl, 0.45f, 0.15f) * known, rt_fogged_ > 0.3f && fogl > 0.01f ? ramp(fogl, 0.45f, 0.2f) : 0.0f);
+    power *= 1.0f - 0.65f * night;
+    sunc[0] *= 1.0f - 0.15f * night, sunc[1] *= 1.0f - 0.07f * night;
     // logged: what the sun took (a night, dusk, snow, a day)
-    int kind = bl < 0.3f ? 1 : tint[2] < 0.75f ? 2 : bl > 1.2f ? 3 : 0;
+    int kind = bl < 0.3f || night > 0.5f ? 1 : tint[2] < 0.75f ? 2 : bl > 1.2f ? 3 : 0;
     static double next_log = 0;
     double now_s = double(presents_) / 60.0;
     if (rt_sky_[3] > 0.9f && (kind != rt_sky_kind_ || now_s > next_log)) {
         static const char* names[] = {"day", "night", "dusk", "snow"};
-        LOGR("vulkan: the level's sun: %s (outdoor baked light %.2f %.2f %.2f, colour %.2f %.2f %.2f, strength %.2f)",
-             names[kind], rt_sky_[0], rt_sky_[1], rt_sky_[2], sunc[0], sunc[1], sunc[2], power);
+        LOGR("vulkan: the level's sun: %s (outdoor baked light %.2f %.2f %.2f, colour %.2f %.2f %.2f, strength %.2f; "
+             "fog %.2f %.2f %.2f)",
+             names[kind], rt_sky_[0], rt_sky_[1], rt_sky_[2], sunc[0], sunc[1], sunc[2], power, rt_fog_[0], rt_fog_[1],
+             rt_fog_[2]);
         rt_sky_kind_ = kind;
         next_log = now_s + 10;
     }
     bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
     // the air's light by how bright the level is outdoors: a night's moonlit air glows a little, not as a day's fog
-    const float vol_day = 1.0f - 0.8f * known * (1.0f - ramp(bl, 0.15f, 0.6f));
+    const float vol_day = (1.0f - 0.8f * known * (1.0f - ramp(bl, 0.15f, 0.6f))) * (1.0f - 0.7f * night);
     const float p[8 * 4] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
                             float(lights), kept ? 1.0f : 0.0f, float(test), fs.stats.buf ? 1.0f : 0.0f,
                             sun[0], sun[1], sun[2], st.rt_sun * power,
@@ -7766,7 +7774,7 @@ void VulkanBackend::ToneResolve(Target& rt) {
     float c[16] = {1.0f / rt.w, 1.0f / rt.h, float(st.hdr_tonemap), st.exposure,
                    st.auto_exposure ? 1.0f : 0.0f, last ? 1.0f : 0.0f, 1.0f - std::exp(-dt * 1.5f), float(test),
                    float(kMw), float(kMh), 0.25f, 0.7f,
-                   1.3f, 0, 0, 0};
+                   1.15f, 0, 0, 0};
     Barrier();
     if (st.auto_exposure) {
         VkViewport mvp{0, 0, float(kMw), float(kMh), 0, 1};
