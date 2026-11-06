@@ -7416,12 +7416,12 @@ void VulkanBackend::WeatherPass(Target& rt, Target* ds) {
     // how outdoors: ray tracing finds the roofs itself; else only on a snowy level's snow
     const float snowy = st.weather == 2 ? 1.0f : snow_level_;
     const float outdoors = traced ? snowy : snowy * snowy;
-    // footprints: a print each 0.7 m a player walks on the level (a jump or a fall none), left and right in turn,
+    // footprints: a print each 0.7 m a character walks on the level (a jump or a fall none), left and right in turn,
     // pressed for a minute then filled in over two (faster in heavier snow)
     const double now = double(presents_) / 60.0;
     if (FootprintEpoch() != print_epoch_) print_epoch_ = FootprintEpoch(), prints_.clear(), steps_.clear();
-    Walker ws[8];
-    uint32_t nw = st.footprints && snowy > 0.3f ? Walkers(ws, 8) : 0;
+    Walker ws[64];
+    uint32_t nw = st.footprints && snowy > 0.3f ? Walkers(ws, 64) : 0;
     for (uint32_t i = 0; i < nw; i++) {
         Step& sp = steps_[ws[i].id];
         float dx = ws[i].pos[0] - sp.pos[0], dy = ws[i].pos[1] - sp.pos[1], dz = ws[i].pos[2] - sp.pos[2];
@@ -7437,7 +7437,7 @@ void VulkanBackend::WeatherPass(Target& rt, Target* ds) {
         Print pr{{ws[i].pos[0] + std::cos(yaw) * side / unit, ws[i].pos[1], ws[i].pos[2] - std::sin(yaw) * side / unit},
                  yaw, now};
         prints_.push_back(pr);
-        if (prints_.size() > 600) prints_.erase(prints_.begin(), prints_.begin() + 100);
+        if (prints_.size() > 2400) prints_.erase(prints_.begin(), prints_.begin() + 200);
         std::memcpy(sp.pos, ws[i].pos, sizeof(sp.pos));
     }
     const float last = 60.0f / std::max(0.5f, st.snow_amount), fill = 120.0f / std::max(0.5f, st.snow_amount);
