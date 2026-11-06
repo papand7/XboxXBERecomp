@@ -2285,7 +2285,8 @@ float4 vol(O i) : SV_Target {
     float3 dir = normalize(viewpos(i.uv, 1));
     uint2 ip = uint2(i.pos.xy);
     float j = (bayer[(ip.y & 3) * 4 + (ip.x & 3)] + 0.5) / 16.0;
-    const int steps = 12;
+    // steps by how bright the air is (p[6].w: 1 a day's, a night's about 0.3): a dim air's noise is as dim, 6 to 12
+    const int steps = int(clamp(round(12 * sqrt(saturate(p[6].w))), 6, 12));
     float dt = tmax / steps, sigma = kVolDensity * p[6].w;
     float g = 0.3, cs = dot(dir, p[2].xyz);
     float phase = (1 - g * g) / pow(1 + g * g - 2 * g * cs, 1.5);
