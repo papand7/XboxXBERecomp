@@ -108,10 +108,6 @@ void DrawHud(double fps);         // the frame counter, inside the ImGui frame (
 // hit feedback (hit_marker.cpp): a game's hook when a local player's shot hits a character, at that player's
 // crosshair (x, y the shown frame's fractions); kind 0 a hit, 1 the head, 2 a kill
 void HitMarker(float x, float y, int kind);
-// focus blur (hit_marker.cpp): a game's hook sets how much (0 to 1) what lies behind the crosshair's point is blurred
-// this frame, as a player aims down the sights (one view); the Vulkan renderer draws it over the 3D scene
-void SetFocusBlur(float amount);
-float FocusBlur();
 void DrawHitMarkers();                          // inside the ImGui frame, from DrawHud
 void MixHitSound(float* out, uint32_t frames);  // the ticks into the mixer's stereo output
 void FeedPad();                   // controllers to the settings window's navigation, before each ImGui frame
