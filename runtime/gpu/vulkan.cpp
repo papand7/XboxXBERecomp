@@ -503,6 +503,8 @@ struct Target {
     // brightness metered on a 64 x 36 grid, the exposure this frame and the last in turn
     Image hdr_res, hdr_fb, tone_meter, tone_exp[2];
     Image bloom_down[6], bloom_up[5];  // HDR bloom: each half the one before, from half the scene's size
+    Image hdr_ratio;                   // HDR10: each pixel's brightness over its SDR's (ToneResolve's ratio)
+    uint64_t hdr_ratio_frame = 0;
     uint64_t tone_frame = 0;
     uint64_t hdr_frame = 0;
 };
@@ -1513,7 +1515,28 @@ float4 bup(O i) : SV_Target {
     [unroll] for (int y = -1; y <= 1; y++)
         [unroll] for (int x = -1; x <= 1; x++)
             s += scene.SampleLevel(ls, i.uv + float2(x, y) * px, 0).rgb * ((x == 0 ? 2 : 1) * (y == 0 ? 2 : 1) / 16.0);
-    return float4(s + meterz.SampleLevel(ls, i.uv, 0).rgb, 1);
+    // the wider levels count less (0.55 each step): a glow stays near what glows, not a halo over a dark gun
+    return float4(s * 0.55 + meterz.SampleLevel(ls, i.uv, 0).rgb, 1);
+}
+// HDR10 (an HDR screen): how much brighter than the SDR picture's a pixel is to be shown, from the float scene: up
+// to 0.6 as SDR's, above it a soft shoulder toward the screen's peak (p[3].z, in SDR whites), so a lamp or sunlit snow
+// past white reaches real brightness while what was white stays about white. The SDR curve's own output (what the
+// later passes grade and blur) is what it multiplies
+float curved(float3 x) {
+    float3 y = p[0].z == 1 ? agx(x) : aces(x);
+    return dot(saturate(y), float3(0.2126, 0.7152, 0.0722));
+}
+float4 ratio(O i) : SV_Target {
+    float3 c = scene.SampleLevel(pt, i.uv, 0).rgb;
+    float3 x = lin(c) * exposure();  // without the bloom: a glow over a dark pixel (the gun before the snow) stays SDR's
+    float ys = curved(x), yx = dot(x, float3(0.2126, 0.7152, 0.0722)), P = max(p[3].z, 1.01);
+    float yh = yx <= 0.6 ? ys : max(ys, 0.6 + (P - 0.6) * (1 - exp(-(yx - 0.6) / (P - 0.6))));
+    return float4(clamp(yh / max(ys, 1e-4), 1, P), 0, 0, 1);
+}
+// the scene's copy HdrOut compares the presented frame with, the ratio in its alpha (log2 / 4: up to 16 times)
+float4 pack(O i) : SV_Target {
+    float r = meterz.SampleLevel(pt, i.uv, 0).r;
+    return float4(scene.SampleLevel(pt, i.uv, 0).rgb, saturate(log2(max(r, 1)) / 4));
 }
 float4 resolve(O i) : SV_Target {
     float3 c = scene.SampleLevel(pt, i.uv, 0).rgb;
@@ -3038,6 +3061,7 @@ private:
     VkFormat scene_fmt_ = kBgra;
     bool tone_drawn_ = false;  // this frame's scene was tone mapped: the style pass's own tone map left out
     bool hdr_bloom_drawn_ = false;  // and bloomed from the float scene: the style pass's own bloom left out
+    bool hdr_ratio_shown_ = false;  // HDR10: the scene's copy holds tone mapping's brightness ratio (HdrOut uses it)
     std::chrono::steady_clock::time_point tone_time_{};
     bool ToneBegin(Target& rt);
     void ToneResolve(Target& rt);
@@ -3129,6 +3153,7 @@ private:
         DropImage(t.tone_exp[0]), DropImage(t.tone_exp[1]);
         for (Image& im : t.bloom_down) DropImage(im);
         for (Image& im : t.bloom_up) DropImage(im);
+        DropImage(t.hdr_ratio);
     }
     // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
     // mod, read again when it changes), else the built-in kScenePostHlsl
@@ -7159,7 +7184,11 @@ float4 ps(O i) : SV_Target {
     if (p[1].w > 0 && p[1].x > 0 && all(uv >= 0) && all(uv < 1)) {
         int3 g = int3(uv * p[2].xy, 0);
         float3 d = abs(game.Load(g).rgb - scene.Load(g).rgb);
-        if (max(d.r, max(d.g, d.b)) < 1.5 / 255) {
+        if (max(d.r, max(d.g, d.b)) < 1.5 / 255 && p[1].w == 2) {
+            // the float scene's own brightness over its SDR's (ToneResolve's ratio, in the copy's alpha)
+            c *= exp2(scene.Load(g).a * 4);
+            if (p[2].w > 0) c = float3(1, c.g * 0.3, c.b * 0.3);
+        } else if (max(d.r, max(d.g, d.b)) < 1.5 / 255) {
             float y = dot(c, float3(0.2126, 0.7152, 0.0722));
             float t = saturate((y - p[2].z) / (1 - p[2].z));
             c *= 1 + (p[1].z / p[1].y - 1) * t * t;
@@ -7261,7 +7290,7 @@ void VulkanBackend::HdrOut(Target* t, VkImageView view) {
     const HdrNits n = HdrLevels();
     const bool scene = swap_hdr_ && t && t->hdr_frame == presents_ + 1 && t->hdr_scene.w == t->w && t->hdr_scene.h == t->h;
     const float c[12] = {(w - fw) / 2, (h - fh) / 2, fw, fh,
-                         swap_hdr_ ? 1.0f : 0.0f, n.paper, n.peak, scene ? 1.0f : 0.0f,
+                         swap_hdr_ ? 1.0f : 0.0f, n.paper, n.peak, scene ? (hdr_ratio_shown_ ? 2.0f : 1.0f) : 0.0f,
                          t ? float(t->w) : 1.0f, t ? float(t->h) : 1.0f, 0.45f, HdrTest() ? 1.0f : 0.0f};
     VkViewport vp{0, 0, w, h, 0, 1};
     VkRect2D sc{{0, 0}, {bb_w_, bb_h_}};
@@ -7553,12 +7582,29 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     // HDR: the finished scene before the HUD, which HdrOut compares the presented frame with
     if (swap_hdr_ && (rt.hdr_scene.w == rt.w && rt.hdr_scene.h == rt.h ||
                       (DropImage(rt.hdr_scene), MakeImage(rt.hdr_scene, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
-                                                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))) {
+                                                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)))) {
         if (dirty_) Barrier();
-        VkImageCopy cp{};
-        cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        cp.extent = {rt.w, rt.h, 1};
-        vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.hdr_scene.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        // with tone mapping's ratio (HDR10 from the float scene): the copy drawn with it in the alpha
+        uint64_t vh, kh;
+        VkPipeline pk = rt.hdr_ratio_frame == presents_ + 1 && Compile(kToneHlsl, "vs", "vs_5_0", vh) &&
+                                Compile(kToneHlsl, "pack", "ps_5_0", kh)
+                            ? PassPipeline({vh, kh, kBgra, VK_FORMAT_UNDEFINED, 0, 0})
+                            : VK_NULL_HANDLE;
+        hdr_ratio_shown_ = pk != VK_NULL_HANDLE;
+        if (pk) {
+            VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+            VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+            VkImageView kv[2] = {rt.res.view, rt.hdr_ratio.view};
+            float kc[16] = {};
+            FullScreen(pk, {rt.hdr_scene.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, kc, 16, kv, 2);
+            End();
+        } else {
+            VkImageCopy cp{};
+            cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            cp.extent = {rt.w, rt.h, 1};
+            vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.hdr_scene.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        }
         dirty_ = true;
         rt.hdr_frame = presents_ + 1;
     }
@@ -8095,6 +8141,22 @@ void VulkanBackend::ToneResolve(Target& rt) {
     FullScreen(pr, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, rv, 4);
     End();
     dirty_ = true;
+    // HDR10: the ratio of the HDR brightness to the SDR's, for HdrOut (through the scene's copy: ScenePass)
+    if (swap_hdr_) {
+        uint64_t qh;
+        VkPipeline pq = Compile(kToneHlsl, "ratio", "ps_5_0", qh)
+                            ? PassPipeline({vh, qh, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0})
+                            : VK_NULL_HANDLE;
+        if (rt.hdr_ratio.img && (rt.hdr_ratio.w != rt.w || rt.hdr_ratio.h != rt.h)) DropImage(rt.hdr_ratio);
+        if (pq && (rt.hdr_ratio.img ||
+                   MakeImage(rt.hdr_ratio, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, rt.w, rt.h, 1, 1, 1, u))) {
+            const HdrNits n = HdrLevels();
+            c[14] = n.paper > 0 ? n.peak / n.paper : 1.0f;
+            FullScreen(pq, {rt.hdr_ratio.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, rv, 4);
+            End();
+            rt.hdr_ratio_frame = presents_ + 1;
+        }
+    }
     static bool said = false;
     if (!said) said = true, LOGR("vulkan: HDR tone mapping drawn (%s%s)", st.hdr_tonemap == kHdrToneAgx ? "AgX" : "ACES",
                                  st.auto_exposure ? ", auto exposure" : "");
