@@ -80,6 +80,7 @@ void Clamp(GraphicsStyle& s) {
     s.rt_radius = std::clamp(s.rt_radius, 0.25f, 6.0f);
     s.rt_rays = std::clamp(s.rt_rays, 1, 16);
     s.rt_sun = std::clamp(s.rt_sun, 0.0f, 2.0f);
+    s.rt_gi_strength = std::clamp(s.rt_gi_strength, 0.0f, 2.0f);
     s.dof = std::clamp(s.dof, 0, int(kDofModes) - 1);
     s.dof_strength = std::clamp(s.dof_strength, 0.0f, 2.0f);
 }
@@ -102,7 +103,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "effect_lights", "light_strength", "atmosphere", "shaft_strength", "fog_strength", "bounce_light", "bounce_strength",
                                   "materials", "material_strength", "surface_depth",
                                   "ground_detail", "detail_strength", "detail_distance",
-                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "blood",
+                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "blood",
                                   "depth_of_field", "dof_strength"};
     for (auto&& [k, v] : t) {
         bool ok = false;
@@ -186,6 +187,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("rt_shadows", s.rt_shadows);
     flag("rt_lighting", s.rt_lighting);
     num("rt_sun", s.rt_sun);
+    flag("rt_gi", s.rt_gi);
+    num("rt_gi_strength", s.rt_gi_strength);
     flag("blood", s.blood);
     named("depth_of_field", s.dof, kDofNames, 3);
     num("dof_strength", s.dof_strength);
@@ -250,6 +253,8 @@ toml::table Write(const GraphicsStyle& s) {
                        {"rt_shadows", s.rt_shadows},
                        {"rt_lighting", s.rt_lighting},
                        {"rt_sun", double(s.rt_sun)},
+                       {"rt_gi", s.rt_gi},
+                       {"rt_gi_strength", double(s.rt_gi_strength)},
                        {"blood", s.blood},
                        {"depth_of_field", kDofNames[s.dof]},
                        {"dof_strength", double(s.dof_strength)}};
@@ -506,6 +511,8 @@ void ApplyPreset(const StylePreset& p) {
     g_style.rt_shadows = keep.rt_shadows;
     g_style.rt_lighting = keep.rt_lighting;
     g_style.rt_sun = keep.rt_sun;
+    g_style.rt_gi = keep.rt_gi;
+    g_style.rt_gi_strength = keep.rt_gi_strength;
     g_style.blood = keep.blood;
     g_style.dof = keep.dof;
     g_style.dof_strength = keep.dof_strength;
@@ -798,6 +805,8 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::Checkbox("Ray-traced shadows from effect lights", &s.rt_shadows);
         changed |= ImGui::Checkbox("Ray-traced level lighting (the game's lights and a sun)", &s.rt_lighting);
         changed |= ImGui::SliderFloat("Sun strength", &s.rt_sun, 0.0f, 2.0f, "%.2f");
+        changed |= ImGui::Checkbox("Ray-traced global illumination (bounced light, with level lighting)", &s.rt_gi);
+        changed |= ImGui::SliderFloat("Bounced light strength", &s.rt_gi_strength, 0.0f, 2.0f, "%.2f");
         if (!rt) ImGui::EndDisabled();
         ImGui::TextDisabled(rt ? "Traced against the scene's own triangles, so corners, crevices and what stands behind\n"
                                  "or beside the view shade too. Replaces the screen-space AO. Not drawn in Retro."

@@ -489,6 +489,7 @@ struct Target {
     Image atmo_pick;  // their lights: each quarter's bright centre, the sky's colour
     Image bounce;     // bounced light: the gathered light, a quarter of the scene's size
     Image rt_ao;      // ray traced ambient occlusion: what is open (r) and the distance (g), the scene's size
+    Image rt_gi;      // ray traced bounced light (kRtRelightHlsl's gi): its light and distance, half the scene's size
     Image dof_focus[2];  // depth of field: the distance in focus (1 / metres), this frame's and the last's in turn
     uint64_t dof_frame = 0;  // the frame (presents_ + 1) it was last drawn for
     uint64_t glow_frame = 0;
@@ -1532,14 +1533,20 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
 // width / height; [1] the lights, the kept depth is there, test (XBE_RT_TEST=5 the light's change, halved, 6 the
 // lights as dots), the outdoor baked light added up into u (binding 15: red, green, blue in 64ths, pixels; every
 // eighth pixel each way); [2] toward the sun, its strength; [3] the sun's colour, the baked light's share indoors; [4] the
-// fog's colour, the lights' scale; [5] up, the shade's share outdoors; [6] the least light; [8 + 2n] a light's place
-// and reach, [9 + 2n] its colour. t0 the scene, t1 its depth, t2 the depth kept at a mid-frame clear (RtKeepDepth);
-// s1 point. Shader model 6.5.
+// fog's colour, the lights' scale; [5] up, the shade's share outdoors; [6] the least light; [7] the bounced light's
+// strength (0 none), its rays a pixel, 1 / its image's width, height; [8 + 2n] a light's place and reach, [9 + 2n] its
+// colour. t0 the scene, t1 its depth, t2 the depth kept at a mid-frame clear (RtKeepDepth), t3 the bounced light; s1
+// point. Shader model 6.5.
+// gi (GraphicsStyle::rt_gi, at half the scene's size, RGBA16F): the light bounced once onto a pixel's surface, in the
+// baked light's units: rays cosine weighted about its slope (two 4x4 patterns, as the occlusion's), each met surface's
+// texture by the light on it (a share of its baked light, the sun with its shadow, the game's lights unshadowed); a
+// the surface's distance, which ps weighs the 4x4 traced pixels about it by (XBE_RT_TEST=7: the bounced light alone).
 const char* kRtRelightHlsl = R"(
 cbuffer P : register(b1) { float4 p[8 + 2 * 64]; };
 Texture2D scene : register(t0);
 Texture2D<float> depthtex : register(t1);
 Texture2D<float> keptz : register(t2);
+Texture2D gitex : register(t3);
 SamplerState pt : register(s1);
 #if STATS
 [[vk::binding(15, 0)]] RWByteAddressBuffer stats;
@@ -1574,19 +1581,13 @@ float open(float3 o, float3 d, float tmax) {
     RT_PROCEED(q)
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0 : 1;
 }
-float4 ps(O i) : SV_Target {
-    float2 uv = i.uv;
-    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
-    int test = int(p[1].z);
-    if (test == 6) {
-        for (int n = 0; n < int(p[1].x); n++) {
-            float3 l = p[8 + 2 * n].xyz;
-            if (l.z > 0.1 && length((uv - screenuv(l)) * float2(p[0].w, 1)) < 0.01) return float4(saturate(p[9 + 2 * n].rgb * 4), 1);
-        }
-    }
+// the pixel's surface, its triangle where a ray from the camera meets it about the depth's place: its place, slope
+// (toward the camera), baked light and the fog's share there. 0 none there (the sky, the gun), 1 not traced, 2 found
+int surface(float2 uv, out float3 P, out float3 N, out float3 baked, out float f) {
+    P = 0, N = 0, baked = 0, f = 1;
     float d = depthat(uv);
-    if (d >= 0.99999 || d * 4096 > kFar || aftertheclear(uv)) return float4(test >= 5 ? c * 0.25 : c, 1);
-    float3 P = viewpos(uv, d * 4096);
+    if (d >= 0.99999 || d * 4096 > kFar || aftertheclear(uv)) return 0;
+    P = viewpos(uv, d * 4096);
     float lp = length(P);
     RayDesc pr;
     pr.Origin = 0;
@@ -1596,26 +1597,27 @@ float4 ps(O i) : SV_Target {
     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(tlas, RAY_FLAG_NONE, 1, pr);
     RT_PROCEED(q)
-    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return float4(test == 5 ? float3(1, 0, 1) : c, 1);
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return 1;
     uint hit = rt_tri(q.CommittedInstanceID(), q.CommittedGeometryIndex(), q.CommittedPrimitiveIndex());
     uint3 t = rt_tris.Load3(hit * 12);
     float2 bary = q.CommittedTriangleBarycentrics(), tuv;
     float4 col;
     rt_attr(hit, bary, tuv, col);
     float w0 = 1 - bary.x - bary.y;
-    float f = asfloat(rt_verts.Load(t.x * 32 + 12)) * w0 + asfloat(rt_verts.Load(t.y * 32 + 12)) * bary.x +
-              asfloat(rt_verts.Load(t.z * 32 + 12)) * bary.y;
+    f = asfloat(rt_verts.Load(t.x * 32 + 12)) * w0 + asfloat(rt_verts.Load(t.y * 32 + 12)) * bary.x +
+        asfloat(rt_verts.Load(t.z * 32 + 12)) * bary.y;
     float3 s = float3(p[0].z * p[0].w, p[0].z, 1);  // the instance's scale (RtBuild)
     float3 v0 = rt_place(t.x) * s, v1 = rt_place(t.y) * s, v2 = rt_place(t.z) * s;
-    float3 N = cross(v1 - v0, v2 - v0);
-    if (dot(N, N) < 1e-20) return float4(c, 1);
+    N = cross(v1 - v0, v2 - v0);
+    if (dot(N, N) < 1e-20) return 1;
     N = normalize(N);
     if (dot(N, P) > 0) N = -N;
     P = pr.Direction * q.CommittedRayT();
-    float3 o = P + N * (0.01 + 0.002 * P.z);
-    // the new light, in the baked light's units (1 the texture as it is): indoors a little of the baked (its bounce)
-    // and the game's lights, each with its shadow
-    float3 baked = col.rgb * 2;
+    baked = col.rgb * 2;
+    return 2;
+}
+// the game's lights on a point (o a little off it), each with its shadow where shadows
+float3 lamps(float3 P, float3 N, float3 o, bool shadows) {
     float3 added = 0;
     [loop] for (int n = 0; n < int(p[1].x); n++) {
         float4 a = p[8 + 2 * n];
@@ -1628,7 +1630,90 @@ float4 ps(O i) : SV_Target {
         float att = 1 - sqrt(d2 / r2);
         float3 e = p[9 + 2 * n].rgb * (att * att * ndl * p[4].w);
         if (dot(e, float3(0.3, 0.59, 0.11)) < 0.004) continue;
-        added += e * open(o, D / dl, dl * 0.95);
+        added += shadows ? e * open(o, D / dl, dl * 0.95) : e;
+    }
+    return added;
+}
+static const float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+float4 gi(O i) : SV_Target {
+    float3 P, N, baked;
+    float f;
+    if (surface(i.uv, P, N, baked, f) != 2) return 0;
+    float3 t = normalize(cross(abs(N.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0), N));
+    float3 bt = cross(N, t);
+    float3 o = P + N * (0.01 + 0.002 * P.z);
+    uint2 ip = uint2(i.pos.xy);
+    float a0 = (bayer[(ip.y & 3) * 4 + (ip.x & 3)] + 0.5) / 16.0;
+    float b0 = (bayer[((ip.x + 2) & 3) * 4 + ((ip.y + 1) & 3)] + 0.5) / 16.0;
+    float3 s = float3(p[0].z * p[0].w, p[0].z, 1);
+    int rays = int(p[7].y);
+    float3 sum = 0;
+    [loop] for (int k = 0; k < rays; k++) {
+        float phi = 6.2831853 * frac(a0 + k * 0.618034);
+        float r2 = frac(b0 + float(k) / rays);
+        float sr = sqrt(r2);
+        RayDesc r;
+        r.Origin = o;
+        r.Direction = t * (cos(phi) * sr) + bt * (sin(phi) * sr) + N * sqrt(1 - r2);
+        r.TMin = 0;
+        r.TMax = kFar;
+        RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+        q.TraceRayInline(tlas, RAY_FLAG_NONE, 1, r);
+        RT_PROCEED(q)
+        if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) continue;
+        uint tri = rt_tri(q.CommittedInstanceID(), q.CommittedGeometryIndex(), q.CommittedPrimitiveIndex());
+        float2 tuv;
+        float4 col;
+        rt_attr(tri, q.CommittedTriangleBarycentrics(), tuv, col);
+        uint3 tv = rt_tris.Load3(tri * 12);
+        float3 v0 = rt_place(tv.x) * s, v1 = rt_place(tv.y) * s, v2 = rt_place(tv.z) * s;
+        float3 n = cross(v1 - v0, v2 - v0);
+        if (dot(n, n) < 1e-20) continue;
+        n = normalize(n);
+        if (dot(n, r.Direction) > 0) n = -n;
+        float3 H = o + r.Direction * q.CommittedRayT();
+        float3 oh = H + n * (0.01 + 0.002 * abs(H.z));
+        float3 hb = col.rgb * 2;
+        float3 light = hb * p[3].w + p[6].rgb + lamps(H, n, oh, false);
+        float sl = saturate(dot(n, p[2].xyz));
+        if (sl > 0 && p[2].w > 0) light += hb * p[3].rgb * (0.75 * p[2].w * sl) * open(oh, p[2].xyz, kFar);
+        sum += rt_texel(rt_mat(tri), tuv).rgb * light;
+    }
+    return float4(sum / max(rays, 1) * p[7].x, P.z);
+}
+float4 ps(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    int test = int(p[1].z);
+    if (test == 6) {
+        for (int n = 0; n < int(p[1].x); n++) {
+            float3 l = p[8 + 2 * n].xyz;
+            if (l.z > 0.1 && length((uv - screenuv(l)) * float2(p[0].w, 1)) < 0.01) return float4(saturate(p[9 + 2 * n].rgb * 4), 1);
+        }
+    }
+    float3 P, N, baked;
+    float f;
+    int found = surface(uv, P, N, baked, f);
+    if (found == 0) return float4(test >= 5 ? c * 0.25 : c, 1);
+    if (found == 1) return float4(test == 5 ? float3(1, 0, 1) : c, 1);
+    float3 o = P + N * (0.01 + 0.002 * P.z);
+    // the new light, in the baked light's units (1 the texture as it is): indoors a little of the baked (its bounce)
+    // and the game's lights, each with its shadow; the bounced light traced (gi) where it is on
+    float3 added = lamps(P, N, o, true);
+    if (p[7].x > 0) {
+        float3 b = 0;
+        float wsum = 0;
+        [unroll] for (int y = -2; y < 2; y++) {
+            [unroll] for (int x = -2; x < 2; x++) {
+                float4 g = gitex.SampleLevel(pt, uv + (float2(x, y) + 0.5) * p[7].zw, 0);
+                float w = g.a > 0 ? saturate(1 - abs(g.a - P.z) / (P.z * 0.04 + 0.02)) : 0;
+                b += g.rgb * w;
+                wsum += w;
+            }
+        }
+        b = wsum > 0 ? b / wsum : 0;
+        if (test == 7) return float4(saturate(b), 1);
+        added += b;
     }
     float3 ratio = (baked * p[3].w + p[6].rgb + added) / max(baked, 0.04);
     // outdoors (open to the sky above it): the baked light kept, in shade a part of it, in the sun more
@@ -1649,7 +1734,7 @@ float4 ps(O i) : SV_Target {
 #endif
     }
     ratio = clamp(ratio, 0, 4);
-    if (test >= 5) return float4(ratio * 0.5, 1);
+    if (test == 5 || test == 6) return float4(ratio * 0.5, 1);
     if (f < 0.03) return float4(c, 1);
     float3 fogc = p[4].rgb;
     float3 L = saturate((c - fogc * (1 - f)) / f);
@@ -2299,6 +2384,7 @@ private:
     float rt_sky_[4] = {};          // the outdoor baked light eased over frames, its weight (the sun's colour)
     int rt_sky_kind_ = -1;          // logged: 0 day, 1 night, 2 dusk, 3 snow
     void RtRelightPass(Target& rt, Target* ds);
+    bool rt_gi_drawn_ = false;  // this frame's level lighting traced its bounced light (the screen-space one left out)
     uint64_t perf_rt_draws_ = 0, perf_rt_tris_ = 0;
     uint64_t rt_skips_[5] = {};  // draws not traced: not the scene, depth not written, not triangles, blended, cut-out
     // SMAA over the scene: its shaders (vs, edges, weights, blend) and lookup textures, made at the first use
@@ -2343,7 +2429,7 @@ private:
         DropImage(t.smaa_edges), DropImage(t.smaa_weights), DropImage(t.mask), DropImage(t.mask_ds);
         DropImage(t.soft_depth);
         DropImage(t.glow), DropImage(t.light_a), DropImage(t.light_b), DropImage(t.light_list);
-        DropImage(t.rt_ao), DropImage(t.rt_depth);
+        DropImage(t.rt_ao), DropImage(t.rt_depth), DropImage(t.rt_gi);
         DropImage(t.dof_focus[0]), DropImage(t.dof_focus[1]);
         DropImage(t.hdr_scene);
     }
@@ -5442,8 +5528,29 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
         return;
     static const int test = [] {
         const char* e = std::getenv("XBE_RT_TEST");
-        return e && (*e == '5' || *e == '6') ? *e - '0' : 0;
+        return e && *e >= '5' && *e <= '7' ? *e - '0' : 0;
     }();
+    // the bounced light (rt_gi): traced at half the size into rt.rt_gi first
+    constexpr VkFormat kGiFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    constexpr int kGiRays = 4;
+    VkPipeline pgi = VK_NULL_HANDLE;
+    const uint32_t gw = std::max<uint32_t>(rt.w / 2, 1), gh = std::max<uint32_t>(rt.h / 2, 1);
+    if (st.rt_gi && st.rt_gi_strength > 0) {
+        uint64_t gih;
+        if (!Compile(src, "gi", "ps_6_5", gih)) {
+            LOG_FIRST(1, "vulkan: the ray traced bounced light did not compile; none drawn");
+        } else {
+            PassKey kg{vh, gih, kGiFormat, VK_FORMAT_UNDEFINED, 0, 0};
+            kg.rt = 1;
+            pgi = PassPipeline(kg);
+        }
+        if (rt.rt_gi.img && (rt.rt_gi.w != gw || rt.rt_gi.h != gh)) DropImage(rt.rt_gi);
+        if (pgi && !rt.rt_gi.img &&
+            !MakeImage(rt.rt_gi, VK_IMAGE_TYPE_2D, kGiFormat, gw, gh, 1, 1, 1,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+            pgi = VK_NULL_HANDLE;
+    }
+    rt_gi_drawn_ = pgi != VK_NULL_HANDLE;
     // the camera: the one most of the frame's triangles were drawn with (the level's)
     const RtCam* cam = nullptr;
     for (const auto& [h, c] : rt_cams_)
@@ -5530,11 +5637,11 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
     const float p[8 * 4] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
                             float(lights), kept ? 1.0f : 0.0f, float(test), fs.stats.buf ? 1.0f : 0.0f,
                             sun[0], sun[1], sun[2], st.rt_sun * power,
-                            sunc[0], sunc[1], sunc[2], 0.35f,
+                            sunc[0], sunc[1], sunc[2], pgi ? 0.25f : 0.35f,
                             rt_fog_[0], rt_fog_[1], rt_fog_[2], 1.2f,
                             up[0], up[1], up[2], 0.6f,
                             0.06f, 0.06f, 0.06f, 0,
-                            0, 0, 0, 0};
+                            pgi ? st.rt_gi_strength : 0.0f, float(kGiRays), 1.0f / gw, 1.0f / gh};
     std::memcpy(c, p, sizeof(p));
     End();
     if (dirty_) Barrier();
@@ -5548,8 +5655,18 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
     const uint32_t floats = uint32_t(std::size(c));
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
-    VkImageView views[3] = {rt.fb.view, ds->res.view, keptv};
-    FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, floats, views, 3, rt_[frame_slot_].tlas);
+    if (pgi) {
+        VkImageView gv[4] = {rt.fb.view, ds->res.view, keptv, dummy_.view};
+        VkViewport gvp{0, 0, float(gw), float(gh), 0, 1};
+        VkRect2D gsc{{0, 0}, {gw, gh}};
+        FullScreen(pgi, {rt.rt_gi.att, VK_NULL_HANDLE, gw, gh}, gvp, gsc, c, floats, gv, 4, rt_[frame_slot_].tlas);
+        End();
+        Barrier();
+        static bool said_gi = false;
+        if (!said_gi) said_gi = true, LOGR("vulkan: ray traced bounced light drawn (%d rays at %ux%u, strength %.2f)", kGiRays, gw, gh, st.rt_gi_strength);
+    }
+    VkImageView views[4] = {rt.fb.view, ds->res.view, keptv, pgi ? rt.rt_gi.view : dummy_.view};
+    FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, floats, views, 4, rt_[frame_slot_].tlas);
     End();
     static bool said = false;
     if (!said) {
@@ -6506,11 +6623,12 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     End();
     Stamp(2);
     rt_built_ = RtWanted() && ds && ds->w == rt.w && ds->h == rt.h && RtBuild(float(rt.w) / float(rt.h));
+    rt_gi_drawn_ = false;
     if (rt_built_ && Style().rt_lighting) RtRelightPass(rt, ds);
     if (rt_built_ && Style().rt_ao > 0) RtPass(rt, ds);
     if (rt_built_) RtReflectPass(rt, ds);
     if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds);
-    if (Style().bounce_light && Style().mode != kStyleRetro) BouncePass(rt, ds);
+    if (Style().bounce_light && Style().mode != kStyleRetro && !rt_gi_drawn_) BouncePass(rt, ds);
     if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds);
     if (StylePassWanted()) StylePass(rt, ds);
     if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt);

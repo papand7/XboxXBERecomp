@@ -96,6 +96,10 @@ struct GraphicsStyle {
     // lights (SetSceneLights) and a sun where the sky shows put in, each with traced shadows
     bool rt_lighting = false;
     float rt_sun = 1.0f;  // the sun's strength, 0 to 2
+    // global illumination (with rt_lighting): light bounced once off the surfaces about a pixel, traced (on screen or
+    // not), in their colour; in place of the screen-space bounce
+    bool rt_gi = false;
+    float rt_gi_strength = 1.0f;  // 0 to 2
     // blood (every style and renderer, drawn over the picture: app/blood.cpp): a spray where a player's shot hits a
     // character, and red at the edges of a player's view as they are hit, fading
     bool blood = false;
