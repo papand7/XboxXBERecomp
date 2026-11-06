@@ -2991,6 +2991,12 @@ private:
                   const VkSampler smp[4], const float bf[4], uint32_t sref, const VkViewport& vp, const VkRect2D& sc,
                   int mode);
     void LightPass(Target& rt, Target* ds);
+    // the glows drawn (DrawGlow), by texture and shader: how steady each is (0 a flash, 1 drawn every frame)
+    struct GlowSeen {
+        uint64_t frame = 0;
+        float steady = 0;
+    };
+    std::unordered_map<uint64_t, GlowSeen> glow_seen_;
     void DrawMask(const Assembled& a, PsoKey k, const DrawShaders& sh, const PixelKey& pk, const DrawTextures& stages,
                   const VkSampler smp[4], const float bf[4], uint32_t sref, const VkViewport& vp, const VkRect2D& sc);
     void DropScene(Target& t) {
@@ -6488,9 +6494,24 @@ void VulkanBackend::DrawGlow(const Assembled& a, PsoKey k, const DrawShaders& sh
         shader_src_[key] = gh;
     }
     if (!gh) return;
+    // a steady glow (drawn frame after frame: a lamp's halo, a searchlight's beam) lights little, nothing where the
+    // ray traced lighting lights the level's lamps already; a flash, an explosion, the whole of it. Told by its texture
+    // and shader: steadiness grows each frame it is drawn again, falls away in about two seconds unseen
+    const uint64_t gkey = Hash(&stages.view[0], sizeof(stages.view[0])) ^ sh.pkey;
+    GlowSeen& seen = glow_seen_[gkey];
+    if (seen.frame != presents_ + 1) {
+        seen.steady = seen.frame == presents_ ? std::min(1.0f, seen.steady + 1.0f / 60.0f)
+                                              : std::max(0.0f, seen.steady - 0.01f * float(presents_ + 1 - seen.frame));
+        seen.frame = presents_ + 1;
+    }
+    const float steady_light = RtWanted() && Style().rt_lighting ? 0.0f : 0.3f;
+    const float s = seen.steady * seen.steady * (3 - 2 * seen.steady);
+    const float weight = 1.0f + (steady_light - 1.0f) * s;
+    if (weight < 0.01f) return;
+    if (glow_seen_.size() > 4096) glow_seen_.clear();
     k.ps = gh;
     k.blend = 1;
-    k.src = k.dst = 1;  // GL ONE: summed
+    k.src = 0x8001, k.dst = 1;  // GL CONSTANT_COLOR (the weight), ONE: summed
     k.wmask = 0xF;
     k.zen = 1, k.zwrite = 0;
     k.zfunc = 0x203;  // GL_LEQUAL
@@ -6510,8 +6531,10 @@ void VulkanBackend::DrawGlow(const Assembled& a, PsoKey k, const DrawShaders& sh
     VkCommandBuffer cb = cmd_;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ds_.pipeline = p);
     PushDescriptors(last_vsc_, last_dc_, stages, smp);
-    vkCmdSetBlendConstants(cb, bf);
-    std::memcpy(ds_.bf, bf, sizeof(ds_.bf));
+    const float wf[4] = {weight, weight, weight, weight};
+    vkCmdSetBlendConstants(cb, wf);
+    std::memcpy(ds_.bf, wf, sizeof(ds_.bf));
+    (void)bf;
     vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, ds_.sref = sref);
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
