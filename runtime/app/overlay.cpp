@@ -166,6 +166,7 @@ void Graphics(Settings& s) {
         }
     }
     if (kGame.sharpen_2d && ImGui::Checkbox("Sharp text and HUD", &s.sharp_2d)) Save();
+    if (kGame.vulkan_only) return;
     int renderer = int(s.renderer % 3);
     const char* renderers[] = {"Direct3D 12", "Direct3D 11", "Vulkan (experimental)"};
     if (ImGui::Combo("Renderer", &renderer, renderers, 3)) {

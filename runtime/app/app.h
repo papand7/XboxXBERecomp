@@ -255,6 +255,9 @@ struct GameInfo {
     // the pointer's picture in the menus: size x size premultiplied B8G8R8A8 pixels for a cursor that many pixels
     // high, and its hot spot; none, the system's arrow
     void (*menu_cursor)(int size, std::vector<uint32_t>& bgra, int& hot_x, int& hot_y) = nullptr;
+    // Vulkan always (Settings::renderer held at 2, the settings window's Renderer choice not shown): a title whose
+    // look is Vulkan's. Direct3D 12 still starts in its place on a PC where Vulkan cannot
+    bool vulkan_only = false;
 };
 extern const GameInfo kGame;
 

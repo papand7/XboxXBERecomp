@@ -256,6 +256,7 @@ void Load() {
     std::string renderer = t["renderer"].value_or(std::string(kRenderers[s.renderer % kRendererCount]));
     for (uint32_t i = 0; i < kRendererCount; i++)
         if (renderer == kRenderers[i]) s.renderer = i;
+    if (kGame.vulkan_only) s.renderer = 2;
     // the steering wheel: each control a table { device, guid, axis or button, rest, full, invert }; older files gave
     // the wheel's own axes as wheel_steer_axis, pedals as [axis, rest, full] and buttons as numbers
     s.wheel_steer.axis = int32_t(t["wheel_steer_axis"].value_or(int64_t(s.wheel_steer.axis)));
