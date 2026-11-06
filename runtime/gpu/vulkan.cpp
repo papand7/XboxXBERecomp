@@ -166,7 +166,10 @@ namespace {
     X(vkCmdBeginQuery)              \
     X(vkCmdWriteTimestamp2)         \
     X(vkCmdEndQuery)                \
-    X(vkCmdPushConstants)
+    X(vkCmdPushConstants)           \
+    X(vkAllocateDescriptorSets)     \
+    X(vkUpdateDescriptorSets)       \
+    X(vkCmdBindDescriptorSets)
 
 // ray tracing's, loaded when the GPU has ray queries (VulkanBackend::rt_ok_)
 #define VK_RT_FUNCS(X)                         \
@@ -201,6 +204,11 @@ constexpr uint32_t kBindVsc = 0, kBindDc = 1, kBindTex = 2, kBindSmp = 6, kBindi
 constexpr uint32_t kBindCapture = 10, kBindTlas = 11;
 // the ray traced passes' too: the frame's captured vertices and triangles (a hit's own triangle, its slope)
 constexpr uint32_t kBindRtVerts = 12, kBindRtTris = 13;
+// and each triangle's material (a word: its texture, alpha test), the first word the opaque triangles' count; set 1
+// (not pushed, one a frame slot): the frame's textures the materials name, and the sampler they are read with
+constexpr uint32_t kBindRtMats = 14, kRtTextures = 1024;
+// a captured vertex: its place (float4), then its texture coordinates (float2), diffuse colour (RGBA8) and a pad
+constexpr uint32_t kRtVertBytes = 32;
 
 const char* VkResultName(VkResult r) {
     switch (r) {
@@ -1116,7 +1124,8 @@ float4 blur(O i) : SV_Target {
 // ray tracing's capture (VulkanBackend::RtCapture): the draw's own vertex shader (renamed game_main), then where the
 // vertex is in the view written to u0 at the push constant's base + its index less the draw's least one: its place on
 // the screen times its distance (the acceleration structure's instance scales x and y by the view's width), the
-// distance as the scene pass's viewz reads a depth. %s the shader's parameters, %s its argument.
+// distance as the scene pass's viewz reads a depth; 16 bytes on, its texture coordinates and diffuse colour (a cut-out's
+// alpha, a reflection's colour where it is off screen). %s the shader's parameters, %s its argument.
 const char* kCaptureMain = R"(
 RWByteAddressBuffer rt_cap : register(u0);
 struct RtCap { uint base; uint count; int vmin; uint pad; };
@@ -1134,10 +1143,71 @@ VOut main(%s, uint rt_vid : SV_VertexID) {
             float z = 1 / max(1 - o.pos.z / w, 1e-6);
             v = float3(o.pos.xy / w * z, z);
         }
-        rt_cap.Store4((rt_pc.base + uint(slot)) * 16, asuint(float4(v, 1)));
+        uint at = (rt_pc.base + uint(slot)) * 32;
+        rt_cap.Store4(at, asuint(float4(v, 1)));
+        uint4 col = uint4(saturate(o.d0) * 255 + 0.5);
+        rt_cap.Store4(at + 16, uint4(asuint(o.tc0.xy), col.r | col.g << 8 | col.b << 16 | col.a << 24, 0));
     }
     return o;
 }
+)";
+
+// what every ray traced pass reads (prefixed to kRtHlsl, kRtReflectHlsl and kLightsHlsl's RT variant): the frame's
+// acceleration structure, its captured vertices (RtCapture: a place, then texture coordinates and diffuse colour, 32
+// bytes), triangles (the opaque ones, then the cut-outs: the second geometry) and their materials (RtMaterial), and
+// the textures those name. RT_PROCEED(q) runs a query, a cut-out's candidate hit kept where its texture's alpha
+// passes its alpha test; rt_tri gives a hit's triangle in the frame's list.
+const char* kRtCommonHlsl = R"(
+[[vk::binding(11, 0)]] RaytracingAccelerationStructure tlas;
+[[vk::binding(12, 0)]] ByteAddressBuffer rt_verts;
+[[vk::binding(13, 0)]] ByteAddressBuffer rt_tris;
+[[vk::binding(14, 0)]] ByteAddressBuffer rt_mats;
+[[vk::binding(0, 1)]] Texture2D rt_tex[1024];
+[[vk::binding(1, 1)]] SamplerState rt_smp;
+// a hit's triangle: the world's instance (custom index 0) its opaque geometry then its cut-outs, the gun's (1) after
+uint rt_tri(uint inst, uint geom, uint prim) {
+    return prim + (inst != 0 ? rt_mats.Load(4) : geom != 0 ? rt_mats.Load(0) : 0);
+}
+uint rt_mat(uint tri) { return rt_mats.Load(8 + tri * 4); }
+float3 rt_place(uint v) { return asfloat(rt_verts.Load3(v * 32)); }
+float4 rt_unpack(uint c) { return float4(c & 255, (c >> 8) & 255, (c >> 16) & 255, c >> 24) / 255.0; }
+// a point of a triangle: its texture coordinates and diffuse colour
+void rt_attr(uint tri, float2 bary, out float2 uv, out float4 col) {
+    uint3 t = rt_tris.Load3(tri * 12);
+    uint4 a = rt_verts.Load4(t.x * 32 + 16), b = rt_verts.Load4(t.y * 32 + 16), c = rt_verts.Load4(t.z * 32 + 16);
+    float w0 = 1 - bary.x - bary.y;
+    uv = asfloat(a.xy) * w0 + asfloat(b.xy) * bary.x + asfloat(c.xy) * bary.y;
+    col = rt_unpack(a.z) * w0 + rt_unpack(b.z) * bary.x + rt_unpack(c.z) * bary.y;
+}
+// the texture's colour there (white without one)
+float4 rt_texel(uint mat, float2 uv) {
+    uint slot = mat & 0xFFF;
+    return slot == 0xFFF ? 1 : rt_tex[NonUniformResourceIndex(slot)].SampleLevel(rt_smp, uv, 0);
+}
+// a cut-out's alpha test (D3D's comparisons, Cmp() less 1) on its texture's alpha
+bool rt_solid(uint inst, uint geom, uint prim, float2 bary) {
+    uint tri = rt_tri(inst, geom, prim), mat = rt_mat(tri);
+    float2 uv;
+    float4 col;
+    rt_attr(tri, bary, uv, col);
+    float a = floor(rt_texel(mat, uv).a * 255 + 0.5), ref = float((mat >> 12) & 255);
+    switch ((mat >> 20) & 7) {
+    case 0: return false;
+    case 1: return a < ref;
+    case 2: return a == ref;
+    case 3: return a <= ref;
+    case 4: return a > ref;
+    case 5: return a != ref;
+    case 6: return a >= ref;
+    default: return true;
+    }
+}
+#define RT_PROCEED(q) \
+    while (q.Proceed()) \
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && \
+            rt_solid(q.CandidateInstanceID(), q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), \
+                     q.CandidateTriangleBarycentrics())) \
+            q.CommitNonOpaqueTriangleHit();
 )";
 
 // ray traced ambient occlusion (VulkanBackend::RtPass): trace, at half the scene's size, a pixel's rays (cosine
@@ -1154,9 +1224,6 @@ Texture2D<float> depthtex : register(t1);
 Texture2D aotex : register(t2);
 Texture2D<float> keptz : register(t3);
 SamplerState pt : register(s1);
-[[vk::binding(11, 0)]] RaytracingAccelerationStructure tlas;
-[[vk::binding(12, 0)]] ByteAddressBuffer rt_verts;  // the captured places, 16 bytes each (RtCapture)
-[[vk::binding(13, 0)]] ByteAddressBuffer rt_tris;   // three indices into them a triangle
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
     O o;
@@ -1172,7 +1239,8 @@ float depthat(float2 uv) {
     float d = depthtex.SampleLevel(pt, uv, 0);
     return p[2].y != 0 ? min(d, keptz.SampleLevel(pt, uv, 0)) : d;
 }
-// drawn after the mid-frame clear (the gun and hands): nearer than the world kept there, not traced nor darkened
+// drawn after the mid-frame clear (the gun and hands): nearer than the world kept there. Its rays meet the world and
+// itself (the instance masks: the world 1, the gun 2); the world's leave the gun out (it reaches into walls)
 bool aftertheclear(float2 uv) {
     return p[2].y != 0 && depthtex.SampleLevel(pt, uv, 0) < keptz.SampleLevel(pt, uv, 0) - 1e-6;
 }
@@ -1186,16 +1254,16 @@ float4 trace(O i) : SV_Target {
     float d = depthat(uv);
     if (d >= 0.99999) return float4(1, 0, 0, 1);
     float3 P = viewpos(uv);
-    if (aftertheclear(uv)) return float4(1, P.z, 0, 1);
+    uint mask = aftertheclear(uv) ? 0xFF : 1;
     if (int(p[2].x) == 3) {
         RayDesc pr;
         pr.Origin = 0;
         pr.Direction = normalize(P);
         pr.TMin = 0;
         pr.TMax = 1e5;
-        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q0;
-        q0.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, pr);
-        q0.Proceed();
+        RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q0;
+        q0.TraceRayInline(tlas, RAY_FLAG_NONE, mask, pr);
+        RT_PROCEED(q0)
         if (q0.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return float4(0, 0, 0, 1);
         float e = (q0.CommittedRayT() - length(P)) / length(P);
         return float4(saturate(-e * 20), saturate(1 - abs(e) * 20), saturate(e * 20), 1);
@@ -1211,14 +1279,14 @@ float4 trace(O i) : SV_Target {
         pr.Direction = P / lp;
         pr.TMin = lp * 0.9;
         pr.TMax = lp * 1.1;
-        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q1;
-        q1.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, pr);
-        q1.Proceed();
+        RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q1;
+        q1.TraceRayInline(tlas, RAY_FLAG_NONE, mask, pr);
+        RT_PROCEED(q1)
         if (q1.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-            uint3 tri = rt_tris.Load3(q1.CommittedPrimitiveIndex() * 12);
+            uint hit = rt_tri(q1.CommittedInstanceID(), q1.CommittedGeometryIndex(), q1.CommittedPrimitiveIndex());
+            uint3 tri = rt_tris.Load3(hit * 12);
             float3 s = float3(p[0].z * p[0].w, p[0].z, 1);  // the instance's scale (RtBuild)
-            float3 v0 = asfloat(rt_verts.Load3(tri.x * 16)) * s, v1 = asfloat(rt_verts.Load3(tri.y * 16)) * s,
-                   v2 = asfloat(rt_verts.Load3(tri.z * 16)) * s;
+            float3 v0 = rt_place(tri.x) * s, v1 = rt_place(tri.y) * s, v2 = rt_place(tri.z) * s;
             n = cross(v1 - v0, v2 - v0);
             P = pr.Direction * q1.CommittedRayT();
         }
@@ -1252,9 +1320,9 @@ float4 trace(O i) : SV_Target {
         ray.Direction = t * (cos(phi) * sr) + bt * (sin(phi) * sr) + n * sqrt(1 - r2);
         ray.TMin = 0;
         ray.TMax = reach;
-        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
-        q.Proceed();
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+        q.TraceRayInline(tlas, RAY_FLAG_NONE, mask, ray);
+        RT_PROCEED(q)
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
             float f = q.CommittedRayT() / reach;
             occ += 1 - f * f;
@@ -1268,7 +1336,6 @@ float4 comp(O i) : SV_Target {
     float d = depthat(uv);
     int test = int(p[2].x);
     if (d >= 0.99999) return test >= 2 ? float4(1, 1, 1, 1) : float4(c, 1);
-    if (aftertheclear(uv) && test != 3) return test == 2 ? float4(1, 1, 1, 1) : float4(c, 1);
     float z = viewz(d), sum = 0, wsum = 0;
     [unroll] for (int y = -2; y < 2; y++) {
         [unroll] for (int x = -2; x < 2; x++) {
@@ -1284,6 +1351,117 @@ float4 comp(O i) : SV_Target {
     if (test == 2) return float4(ao.xxx, 1);
     if (test == 1 && uv.x > 0.5) return float4(c, 1);
     return float4(c * ao, 1);
+}
+)";
+
+// ray traced reflections (VulkanBackend::RtReflectPass; kRtCommonHlsl before it): from each pixel of a reflective
+// surface (the reflection mask, its own distance: glass need not write the scene's depth), a ray mirrored about the
+// surface's slope (its own triangle's where it is traced, else the mask's) against the frame's acceleration
+// structure. What it meets is the scene's colour where that point shows on screen (lit as the game lit it), else its
+// texture by its diffuse colour, brought to the scene's brightness about the surface; mixed in more at a grazing
+// view, as the screen-space reflections are (which this takes the place of). b1 p: [0] 1/width, 1/height, tan of
+// half the vertical view, width / height; [1] strength, W-buffer, test (XBE_RT_TEST=4: green met on screen, blue off
+// it, red missed), the lit texture's scale; [2] x the kept depth is there. t0 the scene, t1 its depth, t2 the
+// reflection mask, t3 the depth kept at a mid-frame clear (RtKeepDepth: the world's, the end's holds the gun alone); s0
+// linear, s1 point. Shader model 6.5.
+const char* kRtReflectHlsl = R"(
+cbuffer P : register(b1) { float4 p[3]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D maskc : register(t2);
+Texture2D<float> keptz : register(t3);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float viewz(float d) { return p[1].y != 0 ? d * 4096 : 1.0 / max(1.0 - d, 1e-6); }
+float depthat(float2 uv) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    return p[2].x != 0 ? min(d, keptz.SampleLevel(pt, uv, 0)) : d;
+}
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z); }
+float2 screenuv(float3 v) { return v.xy / (v.z * p[0].z * float2(p[0].w, -1)) * 0.5 + 0.5; }
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float4 ps(O i) : SV_Target {
+    float2 uv = i.uv, px = p[0].xy;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    float4 mk = maskc.SampleLevel(pt, uv, 0);
+    float m = mk.r, gz = mk.a;
+    if (m < 0.01 || gz <= 0 || viewz(depthat(uv)) < gz * 0.995) return float4(c, 1);
+    float3 P = viewpos(uv, gz);
+    // the slope: the surface's own triangle where a ray from the camera meets it, else the mask's
+    float3 N = 0;
+    {
+        float lp = length(P);
+        RayDesc pr;
+        pr.Origin = 0;
+        pr.Direction = P / lp;
+        pr.TMin = lp * 0.97;
+        pr.TMax = lp * 1.03;
+        RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q1;
+        q1.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, pr);
+        RT_PROCEED(q1)
+        if (q1.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            uint hit = rt_tri(q1.CommittedInstanceID(), q1.CommittedGeometryIndex(), q1.CommittedPrimitiveIndex());
+            uint3 tri = rt_tris.Load3(hit * 12);
+            float3 s = float3(p[0].z * p[0].w, p[0].z, 1);  // the instance's scale (RtBuild)
+            float3 v0 = rt_place(tri.x) * s, v1 = rt_place(tri.y) * s, v2 = rt_place(tri.z) * s;
+            N = cross(v1 - v0, v2 - v0);
+            P = pr.Direction * q1.CommittedRayT();
+        }
+    }
+    if (dot(N, N) < 1e-20) {
+        float3 dx = viewpos(uv + float2(px.x, 0), gz * (1 + mk.g)) - P;
+        float3 dy = viewpos(uv + float2(0, px.y), gz * (1 + mk.b)) - P;
+        N = cross(dx, dy);
+    }
+    if (dot(N, N) < 1e-20) return float4(c, 1);
+    N = normalize(N);
+    if (dot(N, P) > 0) N = -N;
+    float3 V = normalize(P);
+    float3 R = reflect(V, N);
+    RayDesc ray;
+    ray.Origin = P + N * (0.01 + 0.002 * P.z);
+    ray.Direction = R;
+    ray.TMin = 0;
+    ray.TMax = 1e5;
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(tlas, RAY_FLAG_NONE, 1, ray);  // the world: the gun is not where it is drawn
+    RT_PROCEED(q)
+    int test = int(p[1].z);
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return float4(test == 4 ? float3(1, 0, 0) : c, 1);
+    float t = q.CommittedRayT();
+    float3 H = ray.Origin + R * t;
+    float3 hit;
+    float2 hq = screenuv(H);
+    bool shown = false;
+    if (H.z > 0.05 && all(hq > 0) && all(hq < 1)) {
+        float hz = viewz(depthat(hq));
+        shown = abs(hz - H.z) < H.z * 0.03 + 0.05;
+    }
+    if (shown) {
+        hit = scene.SampleLevel(ls, hq, 0).rgb;
+    } else {
+        // off screen or hidden: its texture by its diffuse colour, as bright as the scene is about the surface
+        uint tri = rt_tri(q.CommittedInstanceID(), q.CommittedGeometryIndex(), q.CommittedPrimitiveIndex());
+        float2 tuv;
+        float4 col;
+        rt_attr(tri, q.CommittedTriangleBarycentrics(), tuv, col);
+        float3 albedo = rt_texel(rt_mat(tri), tuv).rgb * col.rgb;
+        float around = 0;
+        [unroll] for (int k = 0; k < 9; k++)
+            around += luma(scene.SampleLevel(ls, uv + (float2(k % 3, k / 3) - 1) * 0.04, 0).rgb) / 9;
+        hit = saturate(albedo * around * p[1].w);
+    }
+    if (test == 4) return float4(shown ? float3(0, 1, 0) : float3(0, 0, 1), 1);
+    float fres = 0.3 + 0.7 * pow(1 - saturate(dot(-V, N)), 4);
+    return float4(lerp(c, hit, saturate(m * p[1].x * fres)), 1);
 }
 )";
 
@@ -1331,11 +1509,8 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
 // test view; p[3] 1 / width, 1 / height, the lights' power. t0 the scene (or the glow), t1 its depth, t2 t3 the tiles.
 const char* kLightsHlsl = R"(
 cbuffer P : register(b1) { float4 p[4]; };
-#ifdef RT
-// ray traced (GraphicsStyle::rt_shadows): each light's ray from the surface, against the frame's acceleration
-// structure; the depth as the plain pass reads it, so only shadows change
-[[vk::binding(11, 0)]] RaytracingAccelerationStructure tlas;
-#endif
+// RT (GraphicsStyle::rt_shadows; kRtCommonHlsl before it): each light's ray from the surface, against the frame's
+// acceleration structure; the depth as the plain pass reads it, so only shadows change
 Texture2D t0 : register(t0);
 Texture2D<float> t1 : register(t1);
 Texture2D t2 : register(t2);
@@ -1431,9 +1606,9 @@ float4 light(O i) : SV_Target {
                 ray.Direction = D / dl;
                 ray.TMin = 0;
                 ray.TMax = dl * 0.92;
-                RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+                RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
                 q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
-                q.Proceed();
+                RT_PROCEED(q)
                 if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) e = 0;
             }
 #endif
@@ -1879,18 +2054,24 @@ private:
     // level, and traces against it (RtPass). A frame slot's buffers and structures, used again once its frame is done.
     struct RtFrame {
         Buffer verts;  // float4 places, written by the capture shaders (device)
-        Buffer tris;   // the triangles, indices into verts (host)
+        Buffer tris;   // the triangles, indices into verts (host): the opaque ones, then the cut-outs
+        Buffer mats;   // their materials (host): the opaque triangles' count, then a word a triangle (RtMaterial)
+        VkDescriptorSet tex_set = VK_NULL_HANDLE;  // set 1: the textures the materials name
+        uint32_t tex_written = 0;                  // of them written with a texture last time (the rest the dummy)
         Buffer inst;   // the top level's one instance (host)
         Buffer scratch, blas_mem, tlas_mem;
-        VkAccelerationStructureKHR blas = VK_NULL_HANDLE, tlas = VK_NULL_HANDLE;
+        Buffer gun_blas_mem;  // the gun and hands' bottom level (RtBuild)
+        VkAccelerationStructureKHR blas = VK_NULL_HANDLE, tlas = VK_NULL_HANDLE, gun_blas = VK_NULL_HANDLE;
         uint32_t vert_cap = 0;
     };
     bool RtWanted() const { return rt_ok_ && Style().ray_tracing && Style().mode != kStyleRetro; }
     bool rt_built_ = false;  // this frame's acceleration structure is built (the scene pass, before its passes)
-    bool RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, uint32_t push[4]);
+    bool RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, VkImageView tex, uint32_t push[4]);
     bool RtBuild(float aspect);
     void RtKeepDepth(Target& ds);
     void RtPass(Target& rt, Target* ds);
+    void RtReflectPass(Target& rt, Target* ds);
+    bool rt_reflected_ = false;  // this frame's reflections were traced: the screen-space ones are left out
     bool RtStorage(Buffer& mem, VkAccelerationStructureKHR& as, VkDeviceSize need, VkAccelerationStructureTypeKHR type);
     VkDeviceAddress Address(const Buffer& b) const {
         VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, b.buf};
@@ -1900,14 +2081,22 @@ private:
     RtFrame rt_[kFramesInFlight];
     bool rt_ok_ = false;  // the GPU has ray queries, and they are turned on
     VkDeviceSize rt_scratch_align_ = 256;
-    VkDescriptorSetLayout rt_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout rt_set_layout_ = VK_NULL_HANDLE, rt_tex_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool rt_pool_ = VK_NULL_HANDLE;
+    VkSampler rt_sampler_ = VK_NULL_HANDLE;
     VkPipelineLayout rt_layout_ = VK_NULL_HANDLE;
     bool rt_capturing_ = false;  // the draw being recorded writes its places (PushDescriptors adds u0)
     uint32_t rt_used_ = 0;       // vertices captured this frame
     uint32_t rt_want_ = 1u << 20;  // the capture buffers' size in vertices: doubled after a frame that ran out
     bool rt_full_ = false;
     bool rt_drawn_ = false;  // this frame's occlusion was traced: the screen-space one is left out
-    std::vector<uint32_t> rt_tris_;
+    std::vector<uint32_t> rt_tris_, rt_cut_;     // opaque triangles, cut-outs (alpha tested): indices into the vertices
+    std::vector<uint32_t> rt_mats_, rt_cut_mats_;  // a material word each (RtMaterial)
+    std::vector<uint32_t> rt_gun_, rt_gun_mats_;   // the gun and hands (drawn after the mid-frame depth clear)
+    std::vector<VkImageView> rt_views_;          // the frame's textures the materials name (their slots)
+    std::unordered_map<VkImageView, uint32_t> rt_view_slot_;
+    struct RtUndo { size_t tris, cut, mats, cut_mats, gun, gun_mats; uint32_t used; } rt_undo_{};  // before the last capture
+    uint32_t RtMaterial(const State& s, VkImageView tex, bool cut);
     uint64_t perf_rt_draws_ = 0, perf_rt_tris_ = 0;
     uint64_t rt_skips_[5] = {};  // draws not traced: not the scene, depth not written, not triangles, blended, cut-out
     // SMAA over the scene: its shaders (vs, edges, weights, blend) and lookup textures, made at the first use
@@ -2222,15 +2411,16 @@ bool VulkanBackend::CreateDevice() {
         custom_border_ = true;
     }
     // ray tracing: the vertex shaders write the scene's positions (stores), acceleration structures are built from
-    // buffers' addresses, ray queries read them
+    // buffers' addresses, ray queries read them, a hit's texture is one of an array (cut-outs, reflections)
     if (rt_exts && as_f.accelerationStructure && rq_f.rayQuery && f12.bufferDeviceAddress &&
-        f2.features.vertexPipelineStoresAndAtomics) {
+        f2.features.vertexPipelineStoresAndAtomics && f12.shaderSampledImageArrayNonUniformIndexing) {
         want.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         want.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
         want.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
         as_on.accelerationStructure = VK_TRUE;
         rq_on.rayQuery = VK_TRUE;
         on12.bufferDeviceAddress = VK_TRUE;
+        on12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
         on.features.vertexPipelineStoresAndAtomics = VK_TRUE;
         *tail = &as_on, as_on.pNext = &rq_on, tail = &rq_on.pNext;
         rt_ok_ = true;
@@ -2422,18 +2612,51 @@ bool VulkanBackend::CreateFixed() {
     if (vkCreatePipelineLayout(dev_, &pl, nullptr, &layout_) != VK_SUCCESS) return false;
     // the ray traced passes': the same, and the acceleration structure
     if (rt_ok_) {
-        VkDescriptorSetLayoutBinding rb[kBindRtTris + 1]{};
+        VkDescriptorSetLayoutBinding rb[kBindRtMats + 1]{};
         std::memcpy(rb, b, sizeof(VkDescriptorSetLayoutBinding) * (kBindCapture + 1));
         rb[kBindTlas] = {kBindTlas, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_ALL_GRAPHICS, nullptr};
         rb[kBindRtVerts] = {kBindRtVerts, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         rb[kBindRtTris] = {kBindRtTris, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        rb[kBindRtMats] = {kBindRtMats, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo rdl = dl;
-        rdl.bindingCount = kBindRtTris + 1;
+        rdl.bindingCount = kBindRtMats + 1;
         rdl.pBindings = rb;
+        // set 1: the frame's textures and their sampler (repeating, linear)
+        VkDescriptorSetLayoutBinding tb[2] = {
+            {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kRtTextures, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+        VkDescriptorSetLayoutCreateInfo tdl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        tdl.bindingCount = 2;
+        tdl.pBindings = tb;
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.maxLod = VK_LOD_CLAMP_NONE;
+        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kRtTextures * kFramesInFlight},
+                                      {VK_DESCRIPTOR_TYPE_SAMPLER, kFramesInFlight}};
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = kFramesInFlight;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = ps;
+        VkDescriptorSetLayout sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
         VkPipelineLayoutCreateInfo rpl = pl;
-        rpl.pSetLayouts = &rt_set_layout_;
-        if (vkCreateDescriptorSetLayout(dev_, &rdl, nullptr, &rt_set_layout_) != VK_SUCCESS ||
-            vkCreatePipelineLayout(dev_, &rpl, nullptr, &rt_layout_) != VK_SUCCESS) {
+        rpl.setLayoutCount = 2;
+        rpl.pSetLayouts = sets;
+        bool made = vkCreateDescriptorSetLayout(dev_, &rdl, nullptr, &rt_set_layout_) == VK_SUCCESS &&
+                    vkCreateDescriptorSetLayout(dev_, &tdl, nullptr, &rt_tex_layout_) == VK_SUCCESS &&
+                    vkCreateSampler(dev_, &sci, nullptr, &rt_sampler_) == VK_SUCCESS &&
+                    vkCreateDescriptorPool(dev_, &dpi, nullptr, &rt_pool_) == VK_SUCCESS;
+        sets[0] = rt_set_layout_, sets[1] = rt_tex_layout_;
+        for (RtFrame& f : rt_) {
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = rt_pool_;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &rt_tex_layout_;
+            made = made && vkAllocateDescriptorSets(dev_, &ai, &f.tex_set) == VK_SUCCESS;
+            f.tex_written = kRtTextures;  // all of them the dummy at the first frame
+        }
+        if (!made || vkCreatePipelineLayout(dev_, &rpl, nullptr, &rt_layout_) != VK_SUCCESS) {
             LOGW("vulkan: the ray traced passes' layout could not be made; no ray tracing");
             rt_ok_ = false;
             SetRayTracingSupported(false);
@@ -2590,6 +2813,9 @@ VulkanBackend::~VulkanBackend() {
     vkDestroyDescriptorSetLayout(dev_, set_layout_, nullptr);
     if (rt_layout_) vkDestroyPipelineLayout(dev_, rt_layout_, nullptr);
     if (rt_set_layout_) vkDestroyDescriptorSetLayout(dev_, rt_set_layout_, nullptr);
+    if (rt_tex_layout_) vkDestroyDescriptorSetLayout(dev_, rt_tex_layout_, nullptr);
+    if (rt_pool_) vkDestroyDescriptorPool(dev_, rt_pool_, nullptr);
+    if (rt_sampler_) vkDestroySampler(dev_, rt_sampler_, nullptr);
     if (swap_) DestroySwapchain();
     for (VkSemaphore s : acquire_sem_) vkDestroySemaphore(dev_, s, nullptr);
     vkDestroySemaphore(dev_, timeline_, nullptr);
@@ -3414,7 +3640,7 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
     v.height = -vp.height;
     vkCmdSetViewport(c, 0, 1, &v);
     vkCmdSetScissor(c, 0, 1, &sc);
-    VkWriteDescriptorSet w[1 + 4 + 4 + 3]{};
+    VkWriteDescriptorSet w[1 + 4 + 4 + 4]{};
     VkDescriptorBufferInfo bi{};
     VkDescriptorImageInfo ii[4]{}, si[4]{};
     uint32_t n = 0;
@@ -3436,7 +3662,7 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
                   VK_DESCRIPTOR_TYPE_SAMPLER, &si[i], nullptr, nullptr};
     }
     VkWriteDescriptorSetAccelerationStructureKHR wa{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
-    VkDescriptorBufferInfo rv{}, rtr{};
+    VkDescriptorBufferInfo rv{}, rtr{}, rm{};
     if (tlas) {
         wa.accelerationStructureCount = 1;
         wa.pAccelerationStructures = &tlas;
@@ -3450,6 +3676,10 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rv, nullptr};
         w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindRtTris, 0, 1,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rtr, nullptr};
+        rm = {f.mats.buf, 0, VK_WHOLE_SIZE};
+        w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindRtMats, 0, 1,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rm, nullptr};
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_layout_, 1, 1, &f.tex_set, 0, nullptr);
     }
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, tlas ? rt_layout_ : layout_, 0, n, w);
     vkCmdDraw(c, 3, 1, 0, 0);
@@ -4167,10 +4397,14 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (pk.wbuf) k.zbias = 0, k.zslope = 0;
     // ray tracing: an opaque draw of the 3D scene writes its vertices' places (its variants and mask draw do the same)
     uint32_t rt_push[4] = {};
-    rt_capturing_ = RtWanted() && RtCapture(s, a, sh, k, rt_push);
+    rt_capturing_ = RtWanted() && RtCapture(s, a, sh, k, stages.view[0], rt_push);
     VkPipeline p = EnsurePipeline(k);
     if (!p) {
-        if (rt_capturing_) rt_tris_.resize(rt_tris_.size() - rt_push[3]), rt_used_ -= rt_push[1];
+        if (rt_capturing_) {
+            rt_tris_.resize(rt_undo_.tris), rt_cut_.resize(rt_undo_.cut), rt_mats_.resize(rt_undo_.mats);
+            rt_cut_mats_.resize(rt_undo_.cut_mats), rt_gun_.resize(rt_undo_.gun), rt_gun_mats_.resize(rt_undo_.gun_mats);
+            rt_used_ = rt_undo_.used;
+        }
         rt_capturing_ = false;
         return;
     }
@@ -4421,17 +4655,39 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
 // a draw whose triangles go into this frame's acceleration structure: opaque, depth written, of the 3D scene, before
 // its scene pass; its vertex shader swapped for the capture variant (k.vs), its triangles listed. push: the capture
 // shader's base, count and least index, then (for the caller to undo) the indices listed
-bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, uint32_t push[4]) {
+// a captured draw's material word: its texture's slot in the frame's (bits 0-11, 0xFFF none), the alpha test's
+// reference (12-19) and comparison (20-22, Cmp() less 1), 23 a cut-out (alpha tested). The textures past
+// kRtTextures in a frame get none: such a cut-out is not traced
+uint32_t VulkanBackend::RtMaterial(const State& s, VkImageView tex, bool cut) {
+    uint32_t slot = 0xFFF;
+    if (tex) {
+        auto it = rt_view_slot_.find(tex);
+        if (it != rt_view_slot_.end()) {
+            slot = it->second;
+        } else if (rt_views_.size() < kRtTextures) {
+            slot = uint32_t(rt_views_.size());
+            rt_views_.push_back(tex);
+            rt_view_slot_[tex] = slot;
+        }
+    }
+    uint32_t ref = SimpleState(s, kMAlphaRef) & 0xFF, func = (uint32_t(Cmp(SimpleState(s, kMAlphaFunc))) - 1) & 7;
+    return slot | ref << 12 | func << 20 | (cut ? 1u << 23 : 0u);
+}
+
+bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, VkImageView tex,
+                              uint32_t push[4]) {
     if (draw_2d_ || post_done_ || !bound_rt_ || !bound_ds_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_ ||
         bound_ds_->w != bound_rt_->w || bound_ds_->h != bound_rt_->h)
         return rt_skips_[0]++, false;
-    // after the scene's depth was cleared mid-frame (RtKeepDepth): the gun and hands, in a view of their own
-    if (bound_ds_->rt_depth_frame == presents_ + 1) return rt_skips_[0]++, false;
+    // after the scene's depth was cleared mid-frame (RtKeepDepth): the gun and hands, an instance of their own
+    const bool gun = bound_ds_->rt_depth_frame == presents_ + 1;
     if (!k.zen || !k.zwrite) return rt_skips_[1]++, false;
     if (a.topology != Topology::Triangles || sh.quad || a.pretransformed) return rt_skips_[2]++, false;
-    // cut-outs (fences, leaves) would shade as whole quads
-    if (!(Opaque(k) || stage_solid_)) return rt_skips_[3]++, false;
-    if (SimpleState(s, kMAlphaTestEnable) && !stage_solid_) return rt_skips_[4]++, false;
+    // cut-outs (fences, leaves): alpha tested where a ray meets them, by their texture's alpha and the diffuse's
+    bool cut = SimpleState(s, kMAlphaTestEnable) && !stage_solid_;
+    if (!cut && !(Opaque(k) || stage_solid_)) return rt_skips_[3]++, false;  // blended: glass, smoke
+    uint32_t mat = RtMaterial(s, tex, cut);
+    if (cut && ((mat & 0xFFF) == 0xFFF || gun)) return rt_skips_[4]++, false;
     // the vertices it reads: SV_VertexID is an index plus the base vertex
     uint32_t n = a.index_count ? a.index_count : a.draw_count;
     if (n < 3) return false;
@@ -4454,7 +4710,7 @@ bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShad
         // the frame's first: the slot's buffer made (again, larger after a frame ran out)
         DropBuffer(f.verts);
         f.vert_cap = 0;
-        if (!MakeBuffer(f.verts, VkDeviceSize(rt_want_) * 16,
+        if (!MakeBuffer(f.verts, VkDeviceSize(rt_want_) * kRtVertBytes,
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
                         false)) {
@@ -4490,7 +4746,10 @@ bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShad
     }
     if (!vh) return false;
     // its triangles, as indices into the frame's vertices
-    size_t before = rt_tris_.size();
+    rt_undo_ = {rt_tris_.size(), rt_cut_.size(), rt_mats_.size(), rt_cut_mats_.size(), rt_gun_.size(),
+                rt_gun_mats_.size(), rt_used_};
+    std::vector<uint32_t>& tris = gun ? rt_gun_ : cut ? rt_cut_ : rt_tris_;
+    size_t before = tris.size();
     uint32_t base = rt_used_;
     auto at = [&](uint32_t i) { return base + uint32_t((a.index_count ? index(i) : int64_t(i)) - vmin); };
     if (a.strip) {
@@ -4498,17 +4757,18 @@ bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShad
             uint32_t i0 = at(i), i1 = at(i + 1), i2 = at(i + 2);
             if (i0 == i1 || i1 == i2 || i0 == i2) continue;
             if (i & 1) std::swap(i0, i1);
-            rt_tris_.insert(rt_tris_.end(), {i0, i1, i2});
+            tris.insert(tris.end(), {i0, i1, i2});
         }
     } else {
-        for (uint32_t i = 0; i + 2 < n; i += 3) rt_tris_.insert(rt_tris_.end(), {at(i), at(i + 1), at(i + 2)});
+        for (uint32_t i = 0; i + 2 < n; i += 3) tris.insert(tris.end(), {at(i), at(i + 1), at(i + 2)});
     }
+    (gun ? rt_gun_mats_ : cut ? rt_cut_mats_ : rt_mats_).resize(tris.size() / 3, mat);
     k.vs = vh;
     rt_used_ += uint32_t(count);
     push[0] = base;
     push[1] = uint32_t(count);
     push[2] = uint32_t(vmin);
-    push[3] = uint32_t(rt_tris_.size() - before);
+    push[3] = uint32_t(tris.size() - before);
     perf_rt_draws_++;
     return true;
 }
@@ -4538,9 +4798,10 @@ bool VulkanBackend::RtStorage(Buffer& mem, VkAccelerationStructureKHR& as, VkDev
 // assumed view's width) the top level; recorded after a barrier past the draws that wrote the places
 bool VulkanBackend::RtBuild(float aspect) {
     RtFrame& f = rt_[frame_slot_];
-    uint32_t tris = uint32_t(rt_tris_.size() / 3);
+    uint32_t opaque = uint32_t(rt_tris_.size() / 3), cut = uint32_t(rt_cut_.size() / 3),
+             gun = uint32_t(rt_gun_.size() / 3), tris = opaque + cut + gun;
     if (!tris || !f.verts.buf || !rt_used_) return false;
-    VkDeviceSize ibytes = VkDeviceSize(rt_tris_.size()) * 4;
+    VkDeviceSize ibytes = VkDeviceSize(tris) * 12, mbytes = VkDeviceSize(tris + 2) * 4;
     const VkBufferUsageFlags input = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                      VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
     if (f.tris.size < ibytes) {
@@ -4550,49 +4811,103 @@ bool VulkanBackend::RtBuild(float aspect) {
                         input | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true))
             return false;
     }
-    if (!f.inst.buf && !MakeBuffer(f.inst, sizeof(VkAccelerationStructureInstanceKHR), input, true)) return false;
-    if (!f.tris.mem.map || !f.inst.mem.map) return false;
-    std::memcpy(f.tris.mem.map, rt_tris_.data(), size_t(ibytes));
+    if (f.mats.size < mbytes) {
+        DropBuffer(f.mats);
+        if (!MakeBuffer(f.mats, std::max<VkDeviceSize>(mbytes + mbytes / 2, 1u << 18), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        true))
+            return false;
+    }
+    if (!f.inst.buf && !MakeBuffer(f.inst, 2 * sizeof(VkAccelerationStructureInstanceKHR), input, true)) return false;
+    if (!f.tris.mem.map || !f.mats.mem.map || !f.inst.mem.map) return false;
+    // the opaque triangles, then the cut-outs, then the gun's; their materials after two counts (rt_tri)
+    std::memcpy(f.tris.mem.map, rt_tris_.data(), rt_tris_.size() * 4);
+    std::memcpy(f.tris.mem.map + rt_tris_.size() * 4, rt_cut_.data(), rt_cut_.size() * 4);
+    std::memcpy(f.tris.mem.map + (rt_tris_.size() + rt_cut_.size()) * 4, rt_gun_.data(), rt_gun_.size() * 4);
+    uint32_t* mw = reinterpret_cast<uint32_t*>(f.mats.mem.map);
+    mw[0] = opaque, mw[1] = opaque + cut;
+    std::memcpy(mw + 2, rt_mats_.data(), rt_mats_.size() * 4);
+    std::memcpy(mw + 2 + opaque, rt_cut_mats_.data(), rt_cut_mats_.size() * 4);
+    std::memcpy(mw + 2 + opaque + cut, rt_gun_mats_.data(), rt_gun_mats_.size() * 4);
+    // the textures the materials name; those another frame wrote past them back to the dummy (they may be gone)
+    {
+        uint32_t used = uint32_t(rt_views_.size()), upto = std::max(used, f.tex_written);
+        std::vector<VkDescriptorImageInfo> ii(upto);
+        for (uint32_t i = 0; i < upto; i++) ii[i] = {VK_NULL_HANDLE, i < used ? rt_views_[i] : dummy_.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo si{rt_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        VkWriteDescriptorSet w[2]{};
+        uint32_t n = 0;
+        if (upto) w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, f.tex_set, 0, 0, upto,
+                            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ii.data(), nullptr, nullptr};
+        w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, f.tex_set, 1, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &si,
+                  nullptr, nullptr};
+        vkUpdateDescriptorSets(dev_, n, w, 0, nullptr);
+        f.tex_written = used;
+    }
 
-    // sizes
-    VkAccelerationStructureGeometryKHR bg{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
-    bg.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-    bg.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-    VkAccelerationStructureGeometryTrianglesDataKHR& tr = bg.geometry.triangles;
-    tr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-    tr.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-    tr.vertexData.deviceAddress = Address(f.verts);
-    tr.vertexStride = 16;
-    tr.maxVertex = rt_used_ - 1;
-    tr.indexType = VK_INDEX_TYPE_UINT32;
-    tr.indexData.deviceAddress = Address(f.tris);
-    VkAccelerationStructureBuildGeometryInfoKHR bb{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
-    bb.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    bb.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
-    bb.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-    bb.geometryCount = 1;
-    bb.pGeometries = &bg;
-    VkAccelerationStructureBuildSizesInfoKHR bs{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
-    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bb, &tris, &bs);
+    // two bottom levels: the world (its opaque triangles one geometry, the cut-outs, alpha tested by the passes'
+    // queries, another) and the gun and hands (drawn after the mid-frame depth clear: an instance of its own, mask 2,
+    // which rays from the world leave out, the gun reaching into walls)
+    struct Level {
+        VkAccelerationStructureGeometryKHR g[2];
+        uint32_t counts[2], ng;
+        VkAccelerationStructureBuildGeometryInfoKHR info;
+        VkAccelerationStructureBuildSizesInfoKHR sizes;
+    } lv[2]{};
+    auto geometry = [&](Level& l, uint32_t first, uint32_t count, bool opaque_geo) {
+        if (!count) return;
+        VkAccelerationStructureGeometryKHR& gg = l.g[l.ng];
+        gg.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        gg.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        gg.flags = opaque_geo ? VK_GEOMETRY_OPAQUE_BIT_KHR : VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
+        VkAccelerationStructureGeometryTrianglesDataKHR& tr = gg.geometry.triangles;
+        tr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        tr.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        tr.vertexData.deviceAddress = Address(f.verts);
+        tr.vertexStride = kRtVertBytes;
+        tr.maxVertex = rt_used_ - 1;
+        tr.indexType = VK_INDEX_TYPE_UINT32;
+        tr.indexData.deviceAddress = Address(f.tris) + VkDeviceSize(first) * 12;
+        l.counts[l.ng++] = count;
+    };
+    geometry(lv[0], 0, opaque, true);
+    geometry(lv[0], opaque, cut, false);
+    geometry(lv[1], opaque + cut, gun, true);
+    for (Level& l : lv) {
+        l.info = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+        l.info.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        l.info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+        l.info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        l.info.geometryCount = l.ng;
+        l.info.pGeometries = l.g;
+        l.sizes = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+        if (l.ng)
+            vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &l.info,
+                                                    l.counts, &l.sizes);
+    }
+    uint32_t instances = (lv[0].ng ? 1 : 0) + (lv[1].ng ? 1 : 0);
     VkAccelerationStructureGeometryKHR tg{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
     tg.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-    tg.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    tg.flags = 0;  // the cut-outs geometry is not opaque
     tg.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
     tg.geometry.instances.data.deviceAddress = Address(f.inst);
-    VkAccelerationStructureBuildGeometryInfoKHR tb = bb;
+    VkAccelerationStructureBuildGeometryInfoKHR tb = lv[0].info;
     tb.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tb.geometryCount = 1;
     tb.pGeometries = &tg;
     VkAccelerationStructureBuildSizesInfoKHR ts{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
-    const uint32_t one = 1;
-    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tb, &one, &ts);
+    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tb, &instances, &ts);
 
     // storage and scratch
-    if (!RtStorage(f.blas_mem, f.blas, bs.accelerationStructureSize, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) ||
+    if ((lv[0].ng && !RtStorage(f.blas_mem, f.blas, lv[0].sizes.accelerationStructureSize,
+                                VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)) ||
+        (lv[1].ng && !RtStorage(f.gun_blas_mem, f.gun_blas, lv[1].sizes.accelerationStructureSize,
+                                VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)) ||
         !RtStorage(f.tlas_mem, f.tlas, ts.accelerationStructureSize, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR)) {
         LOG_FIRST(1, "vulkan: no memory for ray tracing's acceleration structures; the scene is not ray traced");
         return false;
     }
-    VkDeviceSize scratch = std::max(bs.buildScratchSize, ts.buildScratchSize) + rt_scratch_align_;
+    VkDeviceSize scratch = std::max({lv[0].sizes.buildScratchSize, lv[1].sizes.buildScratchSize, ts.buildScratchSize}) +
+                           rt_scratch_align_;
     if (f.scratch.size < scratch) {
         DropBuffer(f.scratch);
         if (!MakeBuffer(f.scratch, scratch + scratch / 2,
@@ -4601,31 +4916,41 @@ bool VulkanBackend::RtBuild(float aspect) {
     }
     VkDeviceAddress sa = (Address(f.scratch) + rt_scratch_align_ - 1) & ~(rt_scratch_align_ - 1);
 
-    // the instance
-    VkAccelerationStructureInstanceKHR in{};
-    const float ty = 0.5774f;  // an assumed 60 degree vertical view, as the screen-space passes take it
-    in.transform.matrix[0][0] = ty * aspect;
-    in.transform.matrix[1][1] = ty;
-    in.transform.matrix[2][2] = 1;
-    in.mask = 0xFF;
-    in.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR | VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
-    VkAccelerationStructureDeviceAddressInfoKHR ai{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
-    ai.accelerationStructure = f.blas;
-    in.accelerationStructureReference = vkGetAccelerationStructureDeviceAddressKHR(dev_, &ai);
-    std::memcpy(f.inst.mem.map, &in, sizeof(in));
+    // the instances: the world custom index 0, mask 1; the gun 1, mask 2
+    VkAccelerationStructureInstanceKHR in[2]{};
+    uint32_t ni = 0;
+    for (uint32_t k = 0; k < 2; k++) {
+        if (!lv[k].ng) continue;
+        VkAccelerationStructureInstanceKHR& i = in[ni++];
+        const float ty = 0.5774f;  // an assumed 60 degree vertical view, as the screen-space passes take it
+        i.transform.matrix[0][0] = ty * aspect;
+        i.transform.matrix[1][1] = ty;
+        i.transform.matrix[2][2] = 1;
+        i.instanceCustomIndex = k;
+        i.mask = k ? 2 : 1;
+        i.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        VkAccelerationStructureDeviceAddressInfoKHR ai{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+        ai.accelerationStructure = k ? f.gun_blas : f.blas;
+        i.accelerationStructureReference = vkGetAccelerationStructureDeviceAddressKHR(dev_, &ai);
+    }
+    std::memcpy(f.inst.mem.map, in, sizeof(VkAccelerationStructureInstanceKHR) * ni);
 
-    // the builds: the bottom level once the draws wrote the places, the top level once it is done
+    // the builds: the bottom levels once the draws wrote the places (one after the other: one scratch), the top level
+    // once they are done
     End();
     Barrier();
-    bb.dstAccelerationStructure = f.blas;
-    bb.scratchData.deviceAddress = sa;
-    VkAccelerationStructureBuildRangeInfoKHR br{tris, 0, 0, 0};
-    const VkAccelerationStructureBuildRangeInfoKHR* pbr = &br;
-    vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &bb, &pbr);
-    Barrier();
+    for (uint32_t k = 0; k < 2; k++) {
+        if (!lv[k].ng) continue;
+        lv[k].info.dstAccelerationStructure = k ? f.gun_blas : f.blas;
+        lv[k].info.scratchData.deviceAddress = sa;
+        VkAccelerationStructureBuildRangeInfoKHR br[2] = {{lv[k].counts[0], 0, 0, 0}, {lv[k].counts[1], 0, 0, 0}};
+        const VkAccelerationStructureBuildRangeInfoKHR* pbr = br;
+        vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &lv[k].info, &pbr);
+        Barrier();
+    }
     tb.dstAccelerationStructure = f.tlas;
     tb.scratchData.deviceAddress = sa;
-    VkAccelerationStructureBuildRangeInfoKHR tr1{1, 0, 0, 0};
+    VkAccelerationStructureBuildRangeInfoKHR tr1{instances, 0, 0, 0};
     const VkAccelerationStructureBuildRangeInfoKHR* ptr = &tr1;
     vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &tb, &ptr);
     Barrier();
@@ -4638,8 +4963,8 @@ void VulkanBackend::RtPass(Target& rt, Target* ds) {
     const GraphicsStyle& st = Style();
     if (!ds || ds->w != rt.w || ds->h != rt.h) return;
     uint64_t vh, th, ch;
-    if (!Compile(kRtHlsl, "vs", "vs_6_5", vh) || !Compile(kRtHlsl, "trace", "ps_6_5", th) ||
-        !Compile(kRtHlsl, "comp", "ps_6_5", ch)) {
+    static const std::string src = std::string(kRtCommonHlsl) + kRtHlsl;
+    if (!Compile(src, "vs", "vs_6_5", vh) || !Compile(src, "trace", "ps_6_5", th) || !Compile(src, "comp", "ps_6_5", ch)) {
         LOG_FIRST(1, "vulkan: the ray traced passes did not compile; no ray tracing");
         return;
     }
@@ -4690,14 +5015,62 @@ void VulkanBackend::RtPass(Target& rt, Target* ds) {
     End();
     rt_drawn_ = true;
     if (test && presents_ % 300 == 0)
-        LOGR("vulkan: ray tracing: %llu draws traced, %llu triangles; skipped: %llu not the scene, %llu no depth write, "
+        LOGR("vulkan: ray tracing: %u cut-out and %u gun triangles this frame, %u textures; %llu draws traced, %llu triangles; skipped: %llu not the scene, %llu no depth write, "
              "%llu not triangles, %llu blended, %llu cut-outs",
-             (unsigned long long)perf_rt_draws_, (unsigned long long)perf_rt_tris_, (unsigned long long)rt_skips_[0],
+             uint32_t(rt_cut_.size() / 3), uint32_t(rt_gun_.size() / 3), uint32_t(rt_views_.size()),
+             (unsigned long long)perf_rt_draws_,
+             (unsigned long long)perf_rt_tris_, (unsigned long long)rt_skips_[0],
              (unsigned long long)rt_skips_[1], (unsigned long long)rt_skips_[2], (unsigned long long)rt_skips_[3],
              (unsigned long long)rt_skips_[4]);
     static bool said = false;
     if (!said) said = true, LOGR("vulkan: ray traced ambient occlusion drawn (%u triangles, %d rays, %.2f m)",
-                                 uint32_t(rt_tris_.size() / 3), st.rt_rays, st.rt_radius);
+                                 uint32_t((rt_tris_.size() + rt_cut_.size() + rt_gun_.size()) / 3), st.rt_rays, st.rt_radius);
+}
+
+// ray traced reflections over the scene (kRtReflectHlsl), where this frame's reflective draws made the mask: in place
+// of the style pass's screen-space ones
+void VulkanBackend::RtReflectPass(Target& rt, Target* ds) {
+    const GraphicsStyle& st = Style();
+    if (!ds || ds->w != rt.w || ds->h != rt.h || st.reflections == kReflectOff || st.mode == kStyleRetro ||
+        !rt.mask.img || rt.mask_frame != presents_ + 1)
+        return;
+    static const std::string src = std::string(kRtCommonHlsl) + kRtReflectHlsl;
+    uint64_t vh, ph;
+    if (!Compile(src, "vs", "vs_6_5", vh) || !Compile(src, "ps", "ps_6_5", ph)) {
+        LOG_FIRST(1, "vulkan: the ray traced reflections did not compile; the screen-space ones are drawn");
+        return;
+    }
+    PassKey pk{vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    pk.rt = 1;
+    VkPipeline pipe = PassPipeline(pk);
+    if (!pipe) return;
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    static const int test = [] {
+        const char* e = std::getenv("XBE_RT_TEST");
+        return e && *e == '4' ? 4 : 0;
+    }();
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    float c[12] = {1.0f / rt.w, 1.0f / rt.h, 0.5774f, float(rt.w) / float(rt.h),
+                   st.reflection_strength, scene_wbuf_ ? 1.0f : 0.0f, float(test), 2.0f,
+                   kept ? 1.0f : 0.0f, 0, 0, 0};
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[4] = {rt.fb.view, ds->res.view, rt.mask.view, kept ? ds->rt_depth.view : ds->res.view};
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 12, views, 4, rt_[frame_slot_].tlas);
+    End();
+    rt_reflected_ = true;
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: ray traced reflections drawn (strength %.2f)", st.reflection_strength);
 }
 
 void VulkanBackend::RtKeepDepth(Target& ds) {
@@ -4719,8 +5092,10 @@ void VulkanBackend::RtKeepDepth(Target& ds) {
 void VulkanBackend::DropRt(RtFrame& f) {
     if (f.blas) vkDestroyAccelerationStructureKHR(dev_, f.blas, nullptr);
     if (f.tlas) vkDestroyAccelerationStructureKHR(dev_, f.tlas, nullptr);
-    f.blas = f.tlas = VK_NULL_HANDLE;
-    DropBuffer(f.verts), DropBuffer(f.tris), DropBuffer(f.inst), DropBuffer(f.scratch);
+    if (f.gun_blas) vkDestroyAccelerationStructureKHR(dev_, f.gun_blas, nullptr);
+    f.blas = f.tlas = f.gun_blas = VK_NULL_HANDLE;
+    DropBuffer(f.gun_blas_mem);
+    DropBuffer(f.verts), DropBuffer(f.tris), DropBuffer(f.mats), DropBuffer(f.inst), DropBuffer(f.scratch);
     DropBuffer(f.blas_mem), DropBuffer(f.tlas_mem);
     f.vert_cap = 0;
 }
@@ -4820,7 +5195,7 @@ void VulkanBackend::LightPass(Target& rt, Target* ds) {
     bool traced = false;
     VkPipeline plt = VK_NULL_HANDLE;
     if (rt_built_ && st.rt_shadows) {
-        static const std::string src = std::string("#define RT 1\n") + kLightsHlsl;
+        static const std::string src = std::string("#define RT 1\n") + kRtCommonHlsl + kLightsHlsl;
         uint64_t tvh, th;
         if (Compile(src, "vs", "vs_6_5", tvh) && Compile(src, "light", "ps_6_5", th)) {
             PassKey k{tvh, th, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
@@ -5331,8 +5706,10 @@ void VulkanBackend::Present(const Surface& front) {
     }
     rt_full_ = false;
     rt_used_ = 0;
-    rt_tris_.clear();
+    rt_tris_.clear(), rt_cut_.clear(), rt_mats_.clear(), rt_cut_mats_.clear(), rt_gun_.clear(), rt_gun_mats_.clear();
+    rt_views_.clear(), rt_view_slot_.clear();
     rt_drawn_ = false;
+    rt_reflected_ = false;
     rt_built_ = false;
     uint32_t index = 0;
     bool acquired;
@@ -5484,6 +5861,7 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     Stamp(2);
     rt_built_ = RtWanted() && ds && ds->w == rt.w && ds->h == rt.h && RtBuild(float(rt.w) / float(rt.h));
     if (rt_built_ && Style().rt_ao > 0) RtPass(rt, ds);
+    if (rt_built_) RtReflectPass(rt, ds);
     if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds);
     if (Style().bounce_light && Style().mode != kStyleRetro) BouncePass(rt, ds);
     if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds);
@@ -5547,7 +5925,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
                    depth ? 1.0f : 0.0f, float(rt.w), float(rt.h), k};
     // reflections, when a reflective draw made this frame's mask; an assumed 60 degree vertical view
     bool mask = depth && rt.mask.img && rt.mask_frame == presents_ + 1 && st.reflections != kReflectOff &&
-                st.mode != kStyleRetro;
+                st.mode != kStyleRetro && !rt_reflected_;
     c[32] = mask ? st.reflection_strength : 0.0f;
     c[33] = st.reflections == kReflectHigh ? 48.0f : 20.0f;
     c[34] = 0.5774f;
