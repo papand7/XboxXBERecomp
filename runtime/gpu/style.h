@@ -17,6 +17,8 @@ enum Tonemap : int { kToneOff, kToneFilmic, kToneReinhard };
 enum Quality : int { kQualityLow, kQualityMedium, kQualityHigh, kQualityUltra, kQualityCustom, kQualities };
 // screen-space reflections on glass and the surfaces mods/reflections.toml lists: off, low (fewer ray steps), high
 enum Reflections : int { kReflectOff, kReflectLow, kReflectHigh, kReflectLevels };
+// depth of field: off, the distance blurred, focus on what is in the middle of the view
+enum DepthOfField : int { kDofOff, kDofDistance, kDofFocus, kDofModes };
 
 struct GraphicsStyle {
     std::string preset = "original";  // the preset the values came from ("" once edited)
@@ -81,6 +83,20 @@ struct GraphicsStyle {
     bool ground_detail = true;
     float detail_strength = 0.6f;   // 0 to 1
     float detail_distance = 14.0f;  // metres
+    // ray tracing (Vulkan, a GPU with ray queries: NVIDIA RTX, AMD RX 6000 and later, Intel Arc; every style but
+    // Retro): the 3D scene's triangles, as the vertex shaders place them, built into an acceleration structure each
+    // frame; ambient occlusion traced against it in place of the screen-space one, so what is hidden or off screen
+    // still shades
+    bool ray_tracing = false;
+    float rt_ao = 1.0f;      // 0 to 2
+    float rt_radius = 1.5f;  // metres an occlusion ray reaches
+    int rt_rays = 4;         // per pixel, 1 to 16
+    bool rt_shadows = true;  // effect lights (effect_lights) cast traced shadows
+    // depth of field (Vulkan; every style but Retro): the scene blurred by its distance from the focus, the gun and
+    // hands kept sharp; Distance: the far scenery alone, Focus: what is in the middle of the view sharp, nearer and
+    // farther blurred, more while aiming down the sights (SetAiming)
+    int dof = kDofOff;
+    float dof_strength = 1.0f;  // 0 to 2
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;
@@ -129,5 +145,10 @@ float QualityBloom(const GraphicsStyle& s);
 void DrawStyleSettings(bool vulkan);
 bool StyleRendererActive();  // the Vulkan renderer runs (set by it)
 void SetStyleRendererActive(bool on);
+bool RayTracingSupported();  // the Vulkan renderer's GPU has ray queries (set by it)
+void SetRayTracingSupported(bool on);
+// the player aims down the sights (the game's thread, each frame): depth of field's focus blurs more
+bool Aiming();
+void SetAiming(bool on);
 
 }  // namespace gpu

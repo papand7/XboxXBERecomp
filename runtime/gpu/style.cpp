@@ -28,6 +28,8 @@ uint64_t g_saved = 1;
 std::chrono::steady_clock::time_point g_changed;
 std::vector<StylePreset> g_presets;
 std::atomic<bool> g_vulkan{false};
+std::atomic<bool> g_ray_tracing{false};
+std::atomic<bool> g_aiming{false};
 std::filesystem::file_time_type g_file_time{};  // graphics.toml as last read or written
 std::chrono::steady_clock::time_point g_checked;
 
@@ -36,6 +38,7 @@ const char* kModeLabels[] = {"Original", "Enhanced", "Toon", "Retro"};
 const char* kFilters[] = {"game", "nearest", "anisotropic"};
 const char* kTonemaps[] = {"off", "filmic", "reinhard"};
 const char* kReflectNames[] = {"off", "low", "high"};
+const char* kDofNames[] = {"off", "distance", "focus"};
 
 std::filesystem::path StyleFile() { return app::ExeDir() / "graphics.toml"; }
 
@@ -73,6 +76,11 @@ void Clamp(GraphicsStyle& s) {
     s.surface_depth = std::clamp(s.surface_depth, 0.0f, 2.0f);
     s.detail_strength = std::clamp(s.detail_strength, 0.0f, 1.0f);
     s.detail_distance = std::clamp(s.detail_distance, 2.0f, 60.0f);
+    s.rt_ao = std::clamp(s.rt_ao, 0.0f, 2.0f);
+    s.rt_radius = std::clamp(s.rt_radius, 0.25f, 6.0f);
+    s.rt_rays = std::clamp(s.rt_rays, 1, 16);
+    s.dof = std::clamp(s.dof, 0, int(kDofModes) - 1);
+    s.dof_strength = std::clamp(s.dof_strength, 0.0f, 2.0f);
 }
 
 int Index(const std::string& v, const char* const* names, int n, int fallback) {
@@ -92,7 +100,9 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "reflections_auto", "soft_particles", "particle_fade",
                                   "effect_lights", "light_strength", "atmosphere", "shaft_strength", "fog_strength", "bounce_light", "bounce_strength",
                                   "materials", "material_strength", "surface_depth",
-                                  "ground_detail", "detail_strength", "detail_distance"};
+                                  "ground_detail", "detail_strength", "detail_distance",
+                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows",
+                                  "depth_of_field", "dof_strength"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -168,6 +178,13 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("ground_detail", s.ground_detail);
     num("detail_strength", s.detail_strength);
     num("detail_distance", s.detail_distance);
+    flag("ray_tracing", s.ray_tracing);
+    num("rt_ao", s.rt_ao);
+    num("rt_radius", s.rt_radius);
+    integer("rt_rays", s.rt_rays);
+    flag("rt_shadows", s.rt_shadows);
+    named("depth_of_field", s.dof, kDofNames, 3);
+    num("dof_strength", s.dof_strength);
     Clamp(s);
 }
 
@@ -221,7 +238,14 @@ toml::table Write(const GraphicsStyle& s) {
                        {"surface_depth", double(s.surface_depth)},
                        {"ground_detail", s.ground_detail},
                        {"detail_strength", double(s.detail_strength)},
-                       {"detail_distance", double(s.detail_distance)}};
+                       {"detail_distance", double(s.detail_distance)},
+                       {"ray_tracing", s.ray_tracing},
+                       {"rt_ao", double(s.rt_ao)},
+                       {"rt_radius", double(s.rt_radius)},
+                       {"rt_rays", int64_t(s.rt_rays)},
+                       {"rt_shadows", s.rt_shadows},
+                       {"depth_of_field", kDofNames[s.dof]},
+                       {"dof_strength", double(s.dof_strength)}};
 }
 
 // the built-in presets
@@ -342,6 +366,10 @@ void StyleChanged() {
 const std::vector<StylePreset>& StylePresets() { return g_presets; }
 bool StyleRendererActive() { return g_vulkan.load(); }
 void SetStyleRendererActive(bool on) { g_vulkan = on; }
+bool RayTracingSupported() { return g_ray_tracing.load(); }
+void SetRayTracingSupported(bool on) { g_ray_tracing = on; }
+bool Aiming() { return g_aiming.load(std::memory_order_relaxed); }
+void SetAiming(bool on) { g_aiming.store(on, std::memory_order_relaxed); }
 
 namespace {
 void LoadStyleOnce() {
@@ -430,6 +458,13 @@ void ApplyPreset(const StylePreset& p) {
     g_style.ground_detail = keep.ground_detail;
     g_style.detail_strength = keep.detail_strength;
     g_style.detail_distance = keep.detail_distance;
+    g_style.ray_tracing = keep.ray_tracing;
+    g_style.rt_ao = keep.rt_ao;
+    g_style.rt_radius = keep.rt_radius;
+    g_style.rt_rays = keep.rt_rays;
+    g_style.rt_shadows = keep.rt_shadows;
+    g_style.dof = keep.dof;
+    g_style.dof_strength = keep.dof_strength;
     StyleChanged();
 }
 
@@ -497,7 +532,8 @@ bool StylePassWanted() {
 }
 bool ScenePassWanted() {
     return StylePassWanted() ||
-           ((app::Get().smaa || g_style.effect_lights || g_style.atmosphere || g_style.bounce_light || app::FocusBlur() > 0) &&
+           ((app::Get().smaa || g_style.effect_lights || g_style.atmosphere || g_style.bounce_light || g_style.dof ||
+             (g_style.ray_tracing && g_ray_tracing.load())) &&
             g_style.mode != kStyleRetro);
 }
 float QualityAo(const GraphicsStyle& s) {
@@ -699,6 +735,27 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::SliderFloat("Shafts", &s.shaft_strength, 0.0f, 3.0f, "%.2f");
         changed |= ImGui::SliderFloat("Fog", &s.fog_strength, 0.0f, 1.0f, "%.2f");
         ImGui::TextDisabled("Rays from the sky and bright openings, distance fog in the sky's colour (Vulkan).");
+    }
+    if (ImGui::CollapsingHeader("Depth of field", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int d = s.dof;
+        if (ImGui::Combo("Depth of field", &d, "Off\0Distance\0Focus\0")) s.dof = d, changed = true;
+        changed |= ImGui::SliderFloat("Blur", &s.dof_strength, 0.0f, 2.0f, "%.2f");
+        ImGui::TextDisabled("Distance: far scenery soft. Focus: what the crosshair is on sharp, nearer and farther\n"
+                            "soft, more while aiming down the sights. The gun stays sharp (Vulkan; not in Retro).");
+    }
+    if (ImGui::CollapsingHeader("Ray tracing", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool rt = RayTracingSupported();
+        if (!rt) ImGui::BeginDisabled();
+        changed |= ImGui::Checkbox("Ray-traced ambient occlusion", &s.ray_tracing);
+        changed |= ImGui::SliderFloat("Occlusion strength", &s.rt_ao, 0.0f, 2.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Ray reach", &s.rt_radius, 0.25f, 6.0f, "%.2f m");
+        changed |= ImGui::SliderInt("Rays per pixel", &s.rt_rays, 1, 16);
+        changed |= ImGui::Checkbox("Ray-traced shadows from effect lights", &s.rt_shadows);
+        if (!rt) ImGui::EndDisabled();
+        ImGui::TextDisabled(rt ? "Traced against the scene's own triangles, so corners, crevices and what stands behind\n"
+                                 "or beside the view shade too. Replaces the screen-space AO. Not drawn in Retro."
+                               : "Needs the Vulkan renderer on a GPU with ray queries (NVIDIA RTX, AMD RX 6000 or\n"
+                                 "later, Intel Arc). The screen-space ambient occlusion stands in for it.");
     }
     if (ImGui::CollapsingHeader("Materials (PBR)", ImGuiTreeNodeFlags_DefaultOpen)) {
         changed |= ImGui::Checkbox("Normal and roughness maps", &s.materials);

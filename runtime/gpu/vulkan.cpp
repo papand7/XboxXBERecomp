@@ -165,13 +165,24 @@ namespace {
     X(vkCmdClearAttachments)        \
     X(vkCmdBeginQuery)              \
     X(vkCmdWriteTimestamp2)         \
-    X(vkCmdEndQuery)
+    X(vkCmdEndQuery)                \
+    X(vkCmdPushConstants)
+
+// ray tracing's, loaded when the GPU has ray queries (VulkanBackend::rt_ok_)
+#define VK_RT_FUNCS(X)                         \
+    X(vkGetBufferDeviceAddress)                \
+    X(vkCreateAccelerationStructureKHR)        \
+    X(vkDestroyAccelerationStructureKHR)       \
+    X(vkGetAccelerationStructureBuildSizesKHR) \
+    X(vkCmdBuildAccelerationStructuresKHR)     \
+    X(vkGetAccelerationStructureDeviceAddressKHR)
 
 #define VK_DECLARE(f) PFN_##f f = nullptr;
 VK_GLOBAL_FUNCS(VK_DECLARE)
 VK_INSTANCE_FUNCS(VK_DECLARE)
 VK_DEBUG_FUNCS(VK_DECLARE)
 VK_DEVICE_FUNCS(VK_DECLARE)
+VK_RT_FUNCS(VK_DECLARE)
 #undef VK_DECLARE
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
 VkInstance g_instance = VK_NULL_HANDLE;  // for ImGui's loader
@@ -185,6 +196,11 @@ constexpr uint32_t kQueries = 4096;             // occlusion queries
 constexpr VkFormat kBgra = VK_FORMAT_B8G8R8A8_UNORM;
 // descriptor bindings, set 0, as DXC's register shifts lay them out: b0 b1, t0-t3, s0-s3
 constexpr uint32_t kBindVsc = 0, kBindDc = 1, kBindTex = 2, kBindSmp = 6, kBindings = 10;
+// after them: u0, where a ray traced frame's vertex shaders write the scene's positions (VulkanBackend::RtCapture),
+// and the acceleration structure the ray traced passes read
+constexpr uint32_t kBindCapture = 10, kBindTlas = 11;
+// the ray traced passes' too: the frame's captured vertices and triangles (a hit's own triangle, its slope)
+constexpr uint32_t kBindRtVerts = 12, kBindRtTris = 13;
 
 const char* VkResultName(VkResult r) {
     switch (r) {
@@ -325,6 +341,13 @@ public:
         out.block = int(blocks_.size() - 1);
         return true;
     }
+    // a buffer whose device address is taken (ray tracing's): memory of its own, allocated for addresses
+    bool Addressable(const VkMemoryRequirements& r, VkMemoryPropertyFlags want, Mem& out) {
+        int type = Type(r.memoryTypeBits, want);
+        if (type < 0) return false;
+        bool host = (props_.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+        return Dedicated(r.size, uint32_t(type), host, out, true);
+    }
     void Free(Mem& m) {
         if (!m.mem) return;
         if (m.block < 0) {
@@ -361,8 +384,10 @@ private:
             if ((bits >> i & 1) && (props_.memoryTypes[i].propertyFlags & want) == want) return int(i);
         return -1;
     }
-    bool Dedicated(VkDeviceSize size, uint32_t type, bool host, Mem& out) {
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, size, type};
+    bool Dedicated(VkDeviceSize size, uint32_t type, bool host, Mem& out, bool address = false) {
+        VkMemoryAllocateFlagsInfo fi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        fi.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &fi : nullptr, size, type};
         if (vkAllocateMemory(dev_, &ai, nullptr, &out.mem) != VK_SUCCESS) return false;
         out.off = 0;
         out.size = size;
@@ -440,6 +465,10 @@ struct Target {
     // frame's first soft particle
     Image soft_depth;
     uint64_t soft_frame = 0;
+    // ray tracing: the scene's depth as it was when the game cleared it mid-frame (NightFire, before the gun and
+    // hands), which the traced passes take the nearer of with the depth at the end
+    Image rt_depth;
+    uint64_t rt_depth_frame = 0;
     // effect lights: what added (glowing) draws give off this frame (RGBA16F: their colour, a their brightness by
     // distance), cleared at the frame's first; the lights it makes, a tile each (RGBA32F: colour and brightness;
     // where, as the screen's fractions and the distance)
@@ -447,6 +476,9 @@ struct Target {
     Image atmo[5];  // light shafts and fog: a quarter of the scene's size, then each half the one before
     Image atmo_pick;  // their lights: each quarter's bright centre, the sky's colour
     Image bounce;     // bounced light: the gathered light, a quarter of the scene's size
+    Image rt_ao;      // ray traced ambient occlusion: what is open (r) and the distance (g), the scene's size
+    Image dof_focus[2];  // depth of field: the distance in focus (1 / metres), this frame's and the last's in turn
+    uint64_t dof_frame = 0;  // the frame (presents_ + 1) it was last drawn for
     uint64_t glow_frame = 0;
 };
 
@@ -878,22 +910,30 @@ float4 down(O i) : SV_Target {
     return s / 4;
 }
 // the lights: texel i (0-3) the bright centre of the picture's quarter i (field-weighted uv, its weight), texel 4 the
-// sky's colour over all of it; from the field (t0, p[1].zw its texel)
+// fog's colour: the sky's own as seen (every sky pixel alike, so a night sky stays dark; the lamps and windows that
+// light the shafts would bleach a night street), else, no sky in view, the picture's mean; from the field (t0, p[1].zw
+// its texel), at those places the depth (t1) and the scene (t2)
 float4 pick(O i) : SV_Target {
     int k = int(i.pos.x);
     uint fw = uint(1 / p[1].z + 0.5), fh = uint(1 / p[1].w + 0.5);
-    float4 acc = 0;
+    float4 acc = 0, skyacc = 0, all = 0;
     float2 best = 0.5;
     float most = 0;
     for (uint y = 0; y < fh; y++)
         for (uint x = 0; x < fw; x++) {
             float2 uv = (float2(x, y) + 0.5) * p[1].zw;
-            if (k < 4 && (uint(uv.x >= 0.5) != uint(k & 1) || uint(uv.y >= 0.5) != uint(k >> 1))) continue;
+            if (k == 4) {
+                float3 c = src4.SampleLevel(ls, uv, 0).rgb;
+                all += float4(c, 1);
+                if (depthtex.SampleLevel(pt, uv, 0) >= 0.99999) skyacc += float4(c, 1);
+                continue;
+            }
+            if (uint(uv.x >= 0.5) != uint(k & 1) || uint(uv.y >= 0.5) != uint(k >> 1)) continue;
             float4 s = t0.Load(int3(x, y, 0));
             acc += s;
             if (s.a > most) most = s.a, best = uv;
         }
-    if (k == 4) return float4(acc.a > 1e-4 ? acc.rgb / acc.a : float3(0.45, 0.5, 0.55), acc.a);
+    if (k == 4) return float4(skyacc.a > all.a * 0.02 ? skyacc.rgb / skyacc.a : all.rgb / max(all.a, 1), skyacc.a / max(all.a, 1));
     return float4(best, most, 0);  // the quarter's brightest spot: its light (a lamp, an opening, the sun's sky)
 }
 float4 comp(O i) : SV_Target {
@@ -923,9 +963,11 @@ float4 comp(O i) : SV_Target {
         }
         sh *= p[0].z * 1.6;
     }
-    // the fog: by distance, the sky's colour, not over the sky itself
+    // the fog: by distance, the sky's colour, not over the sky itself; only over a W-buffer, whose depth is the
+    // distance (a Z-buffer's, Driving.xbe's, is not metres without the projection: every pixel came out far, fogged
+    // to the full strength)
     float z = sky ? 0 : viewz(d);
-    float fog = sky ? 0 : (1 - exp(-z * p[2].x)) * p[0].w;
+    float fog = sky || p[1].x == 0 ? 0 : (1 - exp(-z * p[2].x)) * p[0].w;
     float3 orig = c;
     c = lerp(c, skyc, saturate(fog));
     c += sh * (sky ? 0.35 : 1.0) * (1 - luma(c) * 0.8);  // into the darks more than over what is bright already
@@ -934,56 +976,6 @@ float4 comp(O i) : SV_Target {
     if (test == 2) c = float3(saturate(fog), saturate(z / 200), sky ? 1 : 0);  // 2: the fog (r), distance / 200 (g)
     if (test == 3) c = sh;                               // 3: the shafts alone
     return float4(saturate(c), 1);
-}
-)";
-
-// focus blur (VulkanBackend::FocusPass, app::FocusBlur): what lies behind the point under the crosshair (the
-// distance at the picture's middle, five taps) blurred by how far behind it is, over a disc of 24 golden-angle taps,
-// a tap nearer than the point not taken (the gun and the target stay sharp). b1 p: [0] 1/width, 1/height, amount,
-// W-buffer; [1] the widest radius in pixels, the nearest a focus may be (the gun is nearer). t0 the scene, t1 its depth; s0 linear, s1 point
-const char* kFocusHlsl = R"(
-cbuffer P : register(b1) { float4 p[2]; };
-Texture2D scene : register(t0);
-Texture2D<float> depthtex : register(t1);
-SamplerState ls : register(s0);
-SamplerState pt : register(s1);
-struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-O vs(uint id : SV_VertexID) {
-    O o;
-    float2 t = float2((id << 1) & 2, id & 2);
-    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
-    o.uv = t;
-    return o;
-}
-float viewz(float d) { return d >= 0.99999 ? 1e6 : p[0].w != 0 ? d * 4096 : 1.0 / max(1.0 - d, 1e-6); }
-float zat(float2 uv) { return viewz(depthtex.SampleLevel(pt, uv, 0)); }
-float4 ps(O i) : SV_Target {
-    float2 uv = i.uv, px = p[0].xy;
-    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
-    // the point aimed at: the nearest of taps about the middle and just above it (the raised gun lies just below),
-    // not the gun itself (nearer than p[1].y)
-    float zf = 1e7;
-    [unroll] for (int t = 0; t < 7; t++) {
-        float2 q = float2(0.5 + float(t % 3 - 1) * 0.02, 0.5 - float(t / 3) * 0.025);
-        float zt = zat(q);
-        if (zt > p[1].y) zf = min(zf, zt);
-    }
-    if (zf > 1e6) return float4(c, 1);  // nothing but the gun or the sky ahead: nothing to focus on
-    zf = min(zf, 5000);
-    float z = zat(uv);
-    float coc = saturate((z - zf * 1.08) / (zf * 1.2)) * p[0].z;
-    if (coc < 0.02) return float4(c, 1);
-    float r = coc * p[1].x;
-    float3 sum = c;
-    float wsum = 1;
-    [unroll] for (int k = 1; k <= 24; k++) {
-        float a = k * 2.39996, rr = r * sqrt(k / 24.0);
-        float2 q = uv + float2(cos(a), sin(a)) * rr * px;
-        float w = zat(q) > zf * 1.04 ? 1 : 0;  // not the nearer things: no halo of the target or the gun
-        sum += scene.SampleLevel(ls, q, 0).rgb * w;
-        wsum += w;
-    }
-    return float4(sum / wsum, 1);
 }
 )";
 
@@ -1047,6 +1039,254 @@ float4 comp(O i) : SV_Target {
 }
 )";
 
+// depth of field (VulkanBackend::DofPass, GraphicsStyle::dof): focus, into a 1 x 1 image, eases the distance in focus
+// (as 1 / metres, so a near focus moves as quickly as a far one) toward the nearest of five points about the middle
+// of the view; blur gathers 32 golden-angle taps over a disc as wide as the pixel's blur, a tap nearer than the pixel
+// only as far as its own blur reaches (an object in focus casts no halo over the blurred distance behind it). The
+// world's distance is the depth kept at the game's mid-frame clear (RtKeepDepth); what was drawn after it (the gun
+// and hands) stays sharp and is not gathered. b1 p: [0] 1/width, 1/height, mode (1 distance, 2 focus), the most blur
+// in pixels; [1] distance mode's start and full (metres), focus's sharp band and gain; [2] W-buffer, the kept depth
+// is there, the last frame's focus is there, its ease; [3] test (XBE_DOF_TEST=1 the left half with it, 2 the blur:
+// white the most, blue the gun, red the focus point). t0 the scene, t1 its depth, t2 the kept depth, t3 the focus
+// (the last frame's for focus); s0 linear, s1 point
+const char* kDofHlsl = R"(
+cbuffer P : register(b1) { float4 p[4]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D<float> keptz : register(t2);
+Texture2D focustex : register(t3);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float viewz(float d) { return d >= 0.99999 ? 10000 : p[2].x != 0 ? d * 4096 : 1.0 / max(1.0 - d, 1e-6); }
+bool gun(float2 uv) { return p[2].y != 0 && depthtex.SampleLevel(pt, uv, 0) < keptz.SampleLevel(pt, uv, 0) - 1e-6; }
+// the world's distance: the depth kept at the clear, else the depth at the end
+float worldz(float2 uv) { return viewz(p[2].y != 0 ? keptz.SampleLevel(pt, uv, 0) : depthtex.SampleLevel(pt, uv, 0)); }
+float4 focus(O i) : SV_Target {
+    float z = worldz(float2(0.5, 0.5));
+    [unroll] for (int k = 0; k < 4; k++) {
+        float2 o = float2(k == 0 ? 1 : k == 1 ? -1 : 0, k == 2 ? 1 : k == 3 ? -1 : 0) * float2(0.01 * p[0].x / p[0].y, 0.01);
+        z = min(z, worldz(0.5 + o));
+    }
+    float want = 1 / clamp(z, 0.3, 2000), was = focustex.Load(int3(0, 0, 0)).x;
+    float f = p[2].z != 0 && was > 0 ? lerp(was, want, p[2].w) : want;
+    return float4(f, 1 / f, 0, 1);
+}
+// a distance's blur in pixels
+float blurof(float z) {
+    if (p[0].z < 1.5) return smoothstep(p[1].x, p[1].y, z) * p[0].w;
+    float f = 1 / focustex.Load(int3(0, 0, 0)).x;
+    return saturate((abs(1 - f / z) - p[1].z) * p[1].w) * p[0].w;
+}
+float4 blur(O i) : SV_Target {
+    float2 uv = i.uv, px = p[0].xy;
+    float3 c0 = scene.SampleLevel(pt, uv, 0).rgb;
+    int test = int(p[3].x);
+    if (test == 1 && uv.x > 0.5) return float4(c0, 1);
+    bool g0 = gun(uv);
+    float z0 = worldz(uv), r0 = g0 ? 0 : blurof(z0);
+    if (test == 2) {
+        float2 dc = (uv - 0.5) / px;
+        if (dot(dc, dc) < 36) return float4(1, 0, 0, 1);
+        return g0 ? float4(0, 0, 1, 1) : float4((r0 / max(p[0].w, 1)).xxx, 1);
+    }
+    if (r0 < 0.5) return float4(c0, 1);
+    float3 sum = c0;
+    float wsum = 1;
+    [loop] for (int k = 0; k < 32; k++) {
+        float a = k * 2.39996, rr = r0 * sqrt((k + 0.5) / 32);
+        float2 q = uv + float2(cos(a), sin(a)) * rr * px;
+        if (gun(q)) continue;
+        float z = worldz(q);
+        float w = z >= z0 * 0.97 ? 1 : saturate(blurof(z) - rr + 1);
+        sum += scene.SampleLevel(ls, q, 0).rgb * w;
+        wsum += w;
+    }
+    return float4(sum / wsum, 1);
+}
+)";
+
+// ray tracing's capture (VulkanBackend::RtCapture): the draw's own vertex shader (renamed game_main), then where the
+// vertex is in the view written to u0 at the push constant's base + its index less the draw's least one: its place on
+// the screen times its distance (the acceleration structure's instance scales x and y by the view's width), the
+// distance as the scene pass's viewz reads a depth. %s the shader's parameters, %s its argument.
+const char* kCaptureMain = R"(
+RWByteAddressBuffer rt_cap : register(u0);
+struct RtCap { uint base; uint count; int vmin; uint pad; };
+[[vk::push_constant]] RtCap rt_pc;
+VOut main(%s, uint rt_vid : SV_VertexID) {
+    VOut o = game_main(%s);
+    int slot = int(rt_vid) - rt_pc.vmin;
+    if (slot >= 0 && uint(slot) < rt_pc.count) {
+        float3 v;
+        if (hud.w != 0) {
+            float k = wdepth.w * wdepth.z * 4096;  // W-buffered: x y w scale to metres alike
+            v = float3(o.pos.xy, o.wlin) * k;
+        } else {
+            float w = abs(o.pos.w) > 1e-8 ? o.pos.w : 1e-8;
+            float z = 1 / max(1 - o.pos.z / w, 1e-6);
+            v = float3(o.pos.xy / w * z, z);
+        }
+        rt_cap.Store4((rt_pc.base + uint(slot)) * 16, asuint(float4(v, 1)));
+    }
+    return o;
+}
+)";
+
+// ray traced ambient occlusion (VulkanBackend::RtPass): trace, at half the scene's size, a pixel's rays (cosine
+// weighted over the hemisphere about its normal, which the depth's neighbours give) against the frame's acceleration
+// structure: r what is open, g its distance; comp, at the scene's size, the 4x4 traced pixels the rays' pattern
+// repeats over averaged by how near their distance is, the scene darkened by it. b1 p: [0] 1/width, 1/height, tan of half the vertical view, width / height; [1] reach (metres),
+// strength, rays, W-buffer; [2] test (XBE_RT_TEST=1 the left half with it, 2 the occlusion alone, 3 a ray from the
+// camera: green where it meets the depth, red nearer, blue farther), the kept depth is there, 1 / the traced size. t0 the scene, t1 its
+// depth, t2 the traced occlusion, t3 the depth kept at a mid-frame clear (RtKeepDepth); s1 point. Shader model 6.5.
+const char* kRtHlsl = R"(
+cbuffer P : register(b1) { float4 p[3]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D aotex : register(t2);
+Texture2D<float> keptz : register(t3);
+SamplerState pt : register(s1);
+[[vk::binding(11, 0)]] RaytracingAccelerationStructure tlas;
+[[vk::binding(12, 0)]] ByteAddressBuffer rt_verts;  // the captured places, 16 bytes each (RtCapture)
+[[vk::binding(13, 0)]] ByteAddressBuffer rt_tris;   // three indices into them a triangle
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+static const float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+float viewz(float d) { return p[1].w != 0 ? d * 4096 : 1.0 / max(1.0 - d, 1e-6); }
+// the scene's depth: the nearer of the end's and the one kept when the game cleared it (p[2].y)
+float depthat(float2 uv) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    return p[2].y != 0 ? min(d, keptz.SampleLevel(pt, uv, 0)) : d;
+}
+// drawn after the mid-frame clear (the gun and hands): nearer than the world kept there, not traced nor darkened
+bool aftertheclear(float2 uv) {
+    return p[2].y != 0 && depthtex.SampleLevel(pt, uv, 0) < keptz.SampleLevel(pt, uv, 0) - 1e-6;
+}
+// the view space the captured triangles are in: x right, y up, z ahead, in metres for a W-buffer
+float3 viewpos(float2 uv) {
+    float z = viewz(depthat(uv));
+    return float3((uv.x * 2 - 1) * p[0].z * p[0].w, (1 - uv.y * 2) * p[0].z, 1) * z;
+}
+float4 trace(O i) : SV_Target {
+    float2 uv = i.uv, px = p[0].xy;
+    float d = depthat(uv);
+    if (d >= 0.99999) return float4(1, 0, 0, 1);
+    float3 P = viewpos(uv);
+    if (aftertheclear(uv)) return float4(1, P.z, 0, 1);
+    if (int(p[2].x) == 3) {
+        RayDesc pr;
+        pr.Origin = 0;
+        pr.Direction = normalize(P);
+        pr.TMin = 0;
+        pr.TMax = 1e5;
+        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q0;
+        q0.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, pr);
+        q0.Proceed();
+        if (q0.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return float4(0, 0, 0, 1);
+        float e = (q0.CommittedRayT() - length(P)) / length(P);
+        return float4(saturate(-e * 20), saturate(1 - abs(e) * 20), saturate(e * 20), 1);
+    }
+    // the surface's own triangle, where a ray from the camera meets it about the depth's place: its exact place and
+    // slope (the depth's neighbours give a wrong one where the depth steps, flat ground far off, and rays from it
+    // then meet the ground they leave: dark lines across it)
+    float3 n = 0;
+    {
+        float lp = length(P);
+        RayDesc pr;
+        pr.Origin = 0;
+        pr.Direction = P / lp;
+        pr.TMin = lp * 0.9;
+        pr.TMax = lp * 1.1;
+        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q1;
+        q1.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, pr);
+        q1.Proceed();
+        if (q1.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            uint3 tri = rt_tris.Load3(q1.CommittedPrimitiveIndex() * 12);
+            float3 s = float3(p[0].z * p[0].w, p[0].z, 1);  // the instance's scale (RtBuild)
+            float3 v0 = asfloat(rt_verts.Load3(tri.x * 16)) * s, v1 = asfloat(rt_verts.Load3(tri.y * 16)) * s,
+                   v2 = asfloat(rt_verts.Load3(tri.z * 16)) * s;
+            n = cross(v1 - v0, v2 - v0);
+            P = pr.Direction * q1.CommittedRayT();
+        }
+    }
+    if (dot(n, n) < 1e-20) {
+        // not traced (a draw left out): the slope from the nearer neighbour each way (an edge's far side would bend it)
+        float3 l = viewpos(uv - float2(px.x, 0)), r = viewpos(uv + float2(px.x, 0));
+        float3 u = viewpos(uv - float2(0, px.y)), b = viewpos(uv + float2(0, px.y));
+        float3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;
+        float3 dy = abs(b.z - P.z) < abs(P.z - u.z) ? b - P : P - u;
+        n = cross(dx, dy);
+    }
+    if (dot(n, n) < 1e-20) return float4(1, P.z, 0, 1);
+    n = normalize(n);
+    if (dot(n, P) > 0) n = -n;  // toward the camera, at the origin
+    float3 t = normalize(cross(abs(n.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0), n));
+    float3 bt = cross(n, t);
+    float3 o = P + n * (0.01 + 0.002 * P.z);
+    uint2 ip = uint2(i.pos.xy);
+    // two 4x4 patterns, so any 4x4 pixels (what comp averages) hold the same set of directions: no pattern left
+    float a0 = (bayer[(ip.y & 3) * 4 + (ip.x & 3)] + 0.5) / 16.0;
+    float b0 = (bayer[((ip.x + 2) & 3) * 4 + ((ip.y + 1) & 3)] + 0.5) / 16.0;
+    int rays = int(p[1].z);
+    float reach = p[1].x, occ = 0;
+    [loop] for (int k = 0; k < rays; k++) {
+        float phi = 6.2831853 * frac(a0 + k * 0.618034);
+        float r2 = frac(b0 + float(k) / rays);
+        float sr = sqrt(r2);
+        RayDesc ray;
+        ray.Origin = o;
+        ray.Direction = t * (cos(phi) * sr) + bt * (sin(phi) * sr) + n * sqrt(1 - r2);
+        ray.TMin = 0;
+        ray.TMax = reach;
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+        q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+        q.Proceed();
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            float f = q.CommittedRayT() / reach;
+            occ += 1 - f * f;
+        }
+    }
+    return float4(1 - occ / rays, P.z, 0, 1);
+}
+float4 comp(O i) : SV_Target {
+    float2 uv = i.uv, px = p[0].xy;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    float d = depthat(uv);
+    int test = int(p[2].x);
+    if (d >= 0.99999) return test >= 2 ? float4(1, 1, 1, 1) : float4(c, 1);
+    if (aftertheclear(uv) && test != 3) return test == 2 ? float4(1, 1, 1, 1) : float4(c, 1);
+    float z = viewz(d), sum = 0, wsum = 0;
+    [unroll] for (int y = -2; y < 2; y++) {
+        [unroll] for (int x = -2; x < 2; x++) {
+            float4 a = aotex.SampleLevel(pt, uv + (float2(x, y) + 0.5) * p[2].zw, 0);
+            float w = saturate(1 - abs(a.g - z) / (z * 0.04 + 0.02));
+            sum += a.r * w;
+            wsum += w;
+        }
+    }
+    float ao = wsum > 0 ? sum / wsum : 1;
+    ao = pow(saturate(ao), 2 * p[1].y);  // contact shading that reads at a glance: half open at strength 1 is a quarter
+    if (test == 3) return aotex.SampleLevel(pt, uv, 0);
+    if (test == 2) return float4(ao.xxx, 1);
+    if (test == 1 && uv.x > 0.5) return float4(c, 1);
+    return float4(c * ao, 1);
+}
+)";
+
 // the reflection mask (VulkanBackend::DrawMask, RGBA16F): the draw's own pixel shader (renamed game_main) for its
 // coverage, out r its strength (DrawConstants::style z; w 1 for a surface drawn opaque, all of it covered) by that,
 // g b how its distance changes a pixel across and down (in parts of it: the surface's slope, exact where the depth
@@ -1091,6 +1331,11 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
 // test view; p[3] 1 / width, 1 / height, the lights' power. t0 the scene (or the glow), t1 its depth, t2 t3 the tiles.
 const char* kLightsHlsl = R"(
 cbuffer P : register(b1) { float4 p[4]; };
+#ifdef RT
+// ray traced (GraphicsStyle::rt_shadows): each light's ray from the surface, against the frame's acceleration
+// structure; the depth as the plain pass reads it, so only shadows change
+[[vk::binding(11, 0)]] RaytracingAccelerationStructure tlas;
+#endif
 Texture2D t0 : register(t0);
 Texture2D<float> t1 : register(t1);
 Texture2D t2 : register(t2);
@@ -1176,7 +1421,23 @@ float4 light(O i) : SV_Target {
             float3 D = viewpos(b.xy, zl) - P;
             float d2 = dot(D, D) + zl * zl * 0.004;
             float ndl = saturate((dot(N, D * rsqrt(d2)) + 0.15) / 1.15);
-            E += a.rgb * (omega * zl * zl / d2 * ndl);
+            float3 e = a.rgb * (omega * zl * zl / d2 * ndl);
+#ifdef RT
+            // a shadow: anything between the surface and the light (only for a light that shows)
+            if (dot(e, float3(0.3, 0.59, 0.11)) * p[1].x * p[3].z > 0.004) {
+                float dl = length(D);
+                RayDesc ray;
+                ray.Origin = P + N * (0.01 + 0.002 * P.z);
+                ray.Direction = D / dl;
+                ray.TMin = 0;
+                ray.TMax = dl * 0.92;
+                RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+                q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+                q.Proceed();
+                if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) e = 0;
+            }
+#endif
+            E += e;
         }
     E = min(E * p[3].z * p[1].x, 1.5);
     if (p[2].w == 1) return float4(E / (1 + E), 1);  // XBE_LIGHT_TEST=1: the light alone
@@ -1306,6 +1567,7 @@ constexpr uint64_t kDetailKeySalt = 0x64657461696C7321ull;  // "details!"
 constexpr uint64_t kSoftKeySalt = 0x736F667470617274ull;  // "softpart"
 constexpr uint64_t kMaskKeySalt = 0x6D61736B6D61736Cull;
 constexpr uint64_t kGlowKeySalt = 0x676C6F776C696768ull;  // "glowligh"
+constexpr uint64_t kCaptureKeySalt = 0x7274636170747572ull;  // "rtcaptur"
 constexpr uint32_t kLightTilesX = 16, kLightTilesY = 9, kLights = 32;
 constexpr VkFormat kMaskFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr uint32_t kMaskRtFmt = 0x4D41534Bu;  // PsoKey::rtfmt of the mask's pipelines  // "maskmask": the mask's pixel shaders apart from the game's
@@ -1398,6 +1660,7 @@ private:
         VkFormat color, depth;
         uint32_t blend;  // 0 opaque, 1 premultiplied over
         uint32_t zmode;  // 0 none, 1 depth always written
+        uint32_t rt = 0, pad = 0;  // 1: rt_layout_ (reads the acceleration structure)
     };
 
     // Init, in order
@@ -1464,7 +1727,8 @@ private:
     VkShaderModule Module(uint64_t hash);
     VkPipeline PassPipeline(const PassKey& k);
     void FullScreen(VkPipeline p, const Attachments& a, const VkViewport& vp, const VkRect2D& sc, const float* cb,
-                    uint32_t cb_floats, const VkImageView* views, uint32_t n_views);
+                    uint32_t cb_floats, const VkImageView* views, uint32_t n_views,
+                    VkAccelerationStructureKHR tlas = VK_NULL_HANDLE);
     void Blit(VkImageView src, const Attachments& a, const VkViewport& vp, const VkRect2D& sc, const float uvrect[4],
               const BlitOptions& o, VkFormat fmt = kBgra);
     void BlitWhole(VkImageView src, const Image& dst, const BlitOptions& o);
@@ -1605,8 +1869,47 @@ private:
     void ScenePass(Target& rt, Target* ds);
     void StylePass(Target& rt, Target* ds);  // the style's own pass (StylePassWanted)
     void AtmospherePass(Target& rt, Target* ds);  // light shafts and fog (GraphicsStyle::atmosphere)
-    void FocusPass(Target& rt, Target* ds);       // focus blur as a player aims (app::FocusBlur)
     void BouncePass(Target& rt, Target* ds);      // bounced light (GraphicsStyle::bounce_light)
+    void DofPass(Target& rt, Target* ds);         // depth of field (GraphicsStyle::dof)
+    bool DofWanted() const { return Style().dof != kDofOff && Style().mode != kStyleRetro; }
+    float dof_aim_ = 0;          // aiming down the sights, eased 0 to 1
+    uint32_t scene_zwrites_ = 0;  // the frame's 3D draws that wrote the scene's depth
+    // ray tracing (GraphicsStyle::ray_tracing): the 3D scene's opaque draws write their vertices' places in the view
+    // (RtCapture); the scene pass builds them into a bottom level acceleration structure, one instance of it the top
+    // level, and traces against it (RtPass). A frame slot's buffers and structures, used again once its frame is done.
+    struct RtFrame {
+        Buffer verts;  // float4 places, written by the capture shaders (device)
+        Buffer tris;   // the triangles, indices into verts (host)
+        Buffer inst;   // the top level's one instance (host)
+        Buffer scratch, blas_mem, tlas_mem;
+        VkAccelerationStructureKHR blas = VK_NULL_HANDLE, tlas = VK_NULL_HANDLE;
+        uint32_t vert_cap = 0;
+    };
+    bool RtWanted() const { return rt_ok_ && Style().ray_tracing && Style().mode != kStyleRetro; }
+    bool rt_built_ = false;  // this frame's acceleration structure is built (the scene pass, before its passes)
+    bool RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, uint32_t push[4]);
+    bool RtBuild(float aspect);
+    void RtKeepDepth(Target& ds);
+    void RtPass(Target& rt, Target* ds);
+    bool RtStorage(Buffer& mem, VkAccelerationStructureKHR& as, VkDeviceSize need, VkAccelerationStructureTypeKHR type);
+    VkDeviceAddress Address(const Buffer& b) const {
+        VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, b.buf};
+        return vkGetBufferDeviceAddress(dev_, &ai);
+    }
+    void DropRt(RtFrame& f);
+    RtFrame rt_[kFramesInFlight];
+    bool rt_ok_ = false;  // the GPU has ray queries, and they are turned on
+    VkDeviceSize rt_scratch_align_ = 256;
+    VkDescriptorSetLayout rt_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout rt_layout_ = VK_NULL_HANDLE;
+    bool rt_capturing_ = false;  // the draw being recorded writes its places (PushDescriptors adds u0)
+    uint32_t rt_used_ = 0;       // vertices captured this frame
+    uint32_t rt_want_ = 1u << 20;  // the capture buffers' size in vertices: doubled after a frame that ran out
+    bool rt_full_ = false;
+    bool rt_drawn_ = false;  // this frame's occlusion was traced: the screen-space one is left out
+    std::vector<uint32_t> rt_tris_;
+    uint64_t perf_rt_draws_ = 0, perf_rt_tris_ = 0;
+    uint64_t rt_skips_[5] = {};  // draws not traced: not the scene, depth not written, not triangles, blended, cut-out
     // SMAA over the scene: its shaders (vs, edges, weights, blend) and lookup textures, made at the first use
     void SmaaPass(Target& rt);
     bool EnsureSmaa();
@@ -1635,6 +1938,10 @@ private:
     uint64_t MaterialShader(const DrawShaders& sh, const PixelKey& pk, int slot);
     bool EnsureMask(Target& t);
     int Emitter(const PsoKey& k);
+    // effect lights: the geometry the 3D scene's solid draws used this frame (their indices', else their first
+    // buffer's, guest address), so a model drawn again added (NightFire's weapon pickups' shimmer) lights nothing
+    std::unordered_set<const void*> solid_geom_;
+    uint64_t solid_geom_frame_ = 0;
     void DrawGlow(const Assembled& a, PsoKey k, const DrawShaders& sh, const PixelKey& pk, const DrawTextures& stages,
                   const VkSampler smp[4], const float bf[4], uint32_t sref, const VkViewport& vp, const VkRect2D& sc,
                   int mode);
@@ -1645,6 +1952,8 @@ private:
         DropImage(t.smaa_edges), DropImage(t.smaa_weights), DropImage(t.mask), DropImage(t.mask_ds);
         DropImage(t.soft_depth);
         DropImage(t.glow), DropImage(t.light_a), DropImage(t.light_b), DropImage(t.light_list);
+        DropImage(t.rt_ao), DropImage(t.rt_depth);
+        DropImage(t.dof_focus[0]), DropImage(t.dof_focus[1]);
     }
     // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
     // mod, read again when it changes), else the built-in kScenePostHlsl
@@ -1839,11 +2148,21 @@ bool VulkanBackend::CreateDevice() {
     std::vector<const char*> want = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
     bool robust2 = HasExtension(ext, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     bool border = HasExtension(ext, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    // ray tracing: ray queries from any shader (Khronos', not a vendor's: NVIDIA, AMD and Intel GPUs alike)
+    static const bool rt_off = [] {
+        const char* e = std::getenv("XBE_NO_RT");
+        return e && *e && *e != '0';
+    }();
+    bool rt_exts = !rt_off && HasExtension(ext, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+                   HasExtension(ext, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+                   HasExtension(ext, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     if (HasExtension(ext, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)) want.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
 
     // what the device offers
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceRobustness2FeaturesEXT robust_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR as_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    VkPhysicalDeviceRayQueryFeaturesKHR rq_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -1852,6 +2171,7 @@ bool VulkanBackend::CreateDevice() {
     void** tail = &f13.pNext;
     if (robust2) *tail = &robust_f, tail = &robust_f.pNext;
     if (border) *tail = &border_f, tail = &border_f.pNext;
+    if (rt_exts) *tail = &as_f, as_f.pNext = &rq_f, tail = &rq_f.pNext;
     vkGetPhysicalDeviceFeatures2(pd_, &f2);
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
         LOGE("vulkan: the GPU lacks dynamic rendering, synchronization2 or timeline semaphores");
@@ -1861,6 +2181,8 @@ bool VulkanBackend::CreateDevice() {
     // what is turned on
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceRobustness2FeaturesEXT robust_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR as_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    VkPhysicalDeviceRayQueryFeaturesKHR rq_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceVulkan13Features on13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features on12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -1899,6 +2221,20 @@ bool VulkanBackend::CreateDevice() {
         *tail = &border_on, tail = &border_on.pNext;
         custom_border_ = true;
     }
+    // ray tracing: the vertex shaders write the scene's positions (stores), acceleration structures are built from
+    // buffers' addresses, ray queries read them
+    if (rt_exts && as_f.accelerationStructure && rq_f.rayQuery && f12.bufferDeviceAddress &&
+        f2.features.vertexPipelineStoresAndAtomics) {
+        want.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        want.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        want.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+        as_on.accelerationStructure = VK_TRUE;
+        rq_on.rayQuery = VK_TRUE;
+        on12.bufferDeviceAddress = VK_TRUE;
+        on.features.vertexPipelineStoresAndAtomics = VK_TRUE;
+        *tail = &as_on, as_on.pNext = &rq_on, tail = &rq_on.pNext;
+        rt_ok_ = true;
+    }
     float prio = 1;
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = family_;
@@ -1927,6 +2263,22 @@ bool VulkanBackend::CreateDevice() {
     }
     VK_DEVICE_FUNCS(VK_CHECK_LOADED)
 #undef VK_CHECK_LOADED
+    if (rt_ok_) {
+#define VK_LOAD_RT(f) f = reinterpret_cast<PFN_##f>(vkGetDeviceProcAddr(dev_, #f)), rt_ok_ = rt_ok_ && f;
+        VK_RT_FUNCS(VK_LOAD_RT)
+#undef VK_LOAD_RT
+        if (!rt_ok_) LOGW("vulkan: the driver lists ray queries but not all their entry points; no ray tracing");
+    }
+    if (rt_ok_) {
+        VkPhysicalDeviceAccelerationStructurePropertiesKHR ap{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &ap;
+        if (auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(vkGetInstanceProcAddr(instance_, "vkGetPhysicalDeviceProperties2")))
+            get(pd_, &p2);
+        rt_scratch_align_ = std::max<VkDeviceSize>(ap.minAccelerationStructureScratchOffsetAlignment, 256);
+    }
+    SetRayTracingSupported(rt_ok_);
+    LOGR("vulkan: ray tracing (ray queries) %s", rt_ok_ ? "available" : rt_off ? "turned off (XBE_NO_RT)" : "not offered by this GPU or driver");
     vkGetDeviceQueue(dev_, family_, 0, &queue_);
     alloc_.Init(pd_, dev_);
     // D24S8 where the GPU has it (it keeps the console's depth bias units), else D32 with stencil
@@ -2046,7 +2398,7 @@ bool VulkanBackend::CreateFixed() {
     for (auto& s : acquire_sem_) vkCreateSemaphore(dev_, &bci, nullptr, &s);
 
     // one layout for every draw and pass: two constant buffers, four textures, four samplers, pushed per draw
-    VkDescriptorSetLayoutBinding b[kBindings]{};
+    VkDescriptorSetLayoutBinding b[kBindCapture + 1]{};
     for (uint32_t i = 0; i < kBindings; i++) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
@@ -2055,15 +2407,38 @@ bool VulkanBackend::CreateFixed() {
                               : i < kBindSmp ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
                                              : VK_DESCRIPTOR_TYPE_SAMPLER;
     }
+    b[kBindCapture] = {kBindCapture, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-    dl.bindingCount = kBindings;
+    dl.bindingCount = kBindCapture + 1;
     dl.pBindings = b;
     if (vkCreateDescriptorSetLayout(dev_, &dl, nullptr, &set_layout_) != VK_SUCCESS) return false;
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 16};  // RtCapture's: where a draw's positions go
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &set_layout_;
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(dev_, &pl, nullptr, &layout_) != VK_SUCCESS) return false;
+    // the ray traced passes': the same, and the acceleration structure
+    if (rt_ok_) {
+        VkDescriptorSetLayoutBinding rb[kBindRtTris + 1]{};
+        std::memcpy(rb, b, sizeof(VkDescriptorSetLayoutBinding) * (kBindCapture + 1));
+        rb[kBindTlas] = {kBindTlas, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_ALL_GRAPHICS, nullptr};
+        rb[kBindRtVerts] = {kBindRtVerts, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        rb[kBindRtTris] = {kBindRtTris, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo rdl = dl;
+        rdl.bindingCount = kBindRtTris + 1;
+        rdl.pBindings = rb;
+        VkPipelineLayoutCreateInfo rpl = pl;
+        rpl.pSetLayouts = &rt_set_layout_;
+        if (vkCreateDescriptorSetLayout(dev_, &rdl, nullptr, &rt_set_layout_) != VK_SUCCESS ||
+            vkCreatePipelineLayout(dev_, &rpl, nullptr, &rt_layout_) != VK_SUCCESS) {
+            LOGW("vulkan: the ray traced passes' layout could not be made; no ray tracing");
+            rt_ok_ = false;
+            SetRayTracingSupported(false);
+        }
+    }
 
     // the pipeline cache kept beside the exe
     std::vector<char> cache_data;
@@ -2194,6 +2569,8 @@ VulkanBackend::~VulkanBackend() {
     DropImage(dummy_);
     for (Chunk& c : chunks_) DropBuffer(c.b);
     DropBuffer(readback_);
+    if (rt_ok_)
+        for (RtFrame& f : rt_) DropRt(f);
     for (auto& [k, l] : late_)
         for (Buffer& b : l.staging) DropBuffer(b);
     if (cmd_) Submit();
@@ -2211,6 +2588,8 @@ VulkanBackend::~VulkanBackend() {
     vkDestroyPipelineCache(dev_, cache_, nullptr);
     vkDestroyPipelineLayout(dev_, layout_, nullptr);
     vkDestroyDescriptorSetLayout(dev_, set_layout_, nullptr);
+    if (rt_layout_) vkDestroyPipelineLayout(dev_, rt_layout_, nullptr);
+    if (rt_set_layout_) vkDestroyDescriptorSetLayout(dev_, rt_set_layout_, nullptr);
     if (swap_) DestroySwapchain();
     for (VkSemaphore s : acquire_sem_) vkDestroySemaphore(dev_, s, nullptr);
     vkDestroySemaphore(dev_, timeline_, nullptr);
@@ -2482,7 +2861,8 @@ bool VulkanBackend::MakeBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags 
     VkMemoryPropertyFlags prefer = host ? (usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT
                                                                                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
                                         : 0;
-    if (!alloc_.Alloc(req, want, prefer, true, b.mem) ||
+    bool address = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
+    if (!(address ? alloc_.Addressable(req, want, b.mem) : alloc_.Alloc(req, want, prefer, true, b.mem)) ||
         vkBindBufferMemory(dev_, b.buf, b.mem.mem, b.mem.off) != VK_SUCCESS) {
         vkDestroyBuffer(dev_, b.buf, nullptr);
         b.buf = VK_NULL_HANDLE;
@@ -2910,11 +3290,16 @@ VkShaderModule VulkanBackend::Compile(const std::string& source, const char* ent
     } else {
         if (!dxc_.Load()) return modules_[hash] = VK_NULL_HANDLE;
         std::wstring wentry(entry, entry + std::strlen(entry));
-        std::wstring target = std::wstring(1, wchar_t(profile[0])) + L"s_6_0";
+        // a 6.x profile (ray queries: 6.5) as it is, on Vulkan 1.2's SPIR-V; the D3D 5 ones at 6.0
+        bool sm6 = profile[3] == '6';
+        std::wstring target = sm6 ? std::wstring(profile, profile + std::strlen(profile))
+                                  : std::wstring(1, wchar_t(profile[0])) + L"s_6_0";
         std::vector<const wchar_t*> args = {L"-E", wentry.c_str(), L"-T", target.c_str(), L"-spirv", L"-HV", L"2018",
-                                            L"-fspv-target-env=vulkan1.1", L"-fvk-use-dx-layout", L"-O1",
+                                            sm6 ? L"-fspv-target-env=vulkan1.2" : L"-fspv-target-env=vulkan1.1",
+                                            L"-fvk-use-dx-layout", L"-O1",
                                             L"-fvk-b-shift", L"0", L"0", L"-fvk-t-shift", L"2", L"0",
-                                            L"-fvk-s-shift", L"6", L"0", L"-fspv-entrypoint-name=main"};
+                                            L"-fvk-s-shift", L"6", L"0", L"-fvk-u-shift", L"10", L"0",
+                                            L"-fspv-entrypoint-name=main"};
         if (profile[0] == 'p') args.push_back(L"-fvk-use-dx-position-w");
         DxcBuffer buf{src.data(), src.size(), DXC_CP_UTF8};
         ComPtr<IDxcResult> res;
@@ -3008,9 +3393,9 @@ VkPipeline VulkanBackend::PassPipeline(const PassKey& k) {
     pi.pDepthStencilState = &ds;
     pi.pColorBlendState = &cb;
     pi.pDynamicState = &dy;
-    pi.layout = layout_;
+    pi.layout = k.rt ? rt_layout_ : layout_;
     VkPipeline p = VK_NULL_HANDLE;
-    if (!st[0].module || !st[1].module) return pass_pipelines_[h] = VK_NULL_HANDLE;
+    if (!st[0].module || !st[1].module || !pi.layout) return pass_pipelines_[h] = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines(dev_, cache_, 1, &pi, nullptr, &p) != VK_SUCCESS)
         LOG_FIRST(8, "vulkan: a pass pipeline could not be made");
     return pass_pipelines_[h] = p;
@@ -3018,7 +3403,8 @@ VkPipeline VulkanBackend::PassPipeline(const PassKey& k) {
 
 // the full screen triangle with cb at b1, views from t0, the pass samplers
 void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewport& vp, const VkRect2D& sc,
-                               const float* cb, uint32_t cb_floats, const VkImageView* views, uint32_t n_views) {
+                               const float* cb, uint32_t cb_floats, const VkImageView* views, uint32_t n_views,
+                               VkAccelerationStructureKHR tlas) {
     if (!p) return;
     Begin(a);
     VkCommandBuffer c = cmd_;
@@ -3028,7 +3414,7 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
     v.height = -vp.height;
     vkCmdSetViewport(c, 0, 1, &v);
     vkCmdSetScissor(c, 0, 1, &sc);
-    VkWriteDescriptorSet w[1 + 4 + 4]{};
+    VkWriteDescriptorSet w[1 + 4 + 4 + 3]{};
     VkDescriptorBufferInfo bi{};
     VkDescriptorImageInfo ii[4]{}, si[4]{};
     uint32_t n = 0;
@@ -3049,7 +3435,23 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
         w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindSmp + i, 0, 1,
                   VK_DESCRIPTOR_TYPE_SAMPLER, &si[i], nullptr, nullptr};
     }
-    vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, n, w);
+    VkWriteDescriptorSetAccelerationStructureKHR wa{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+    VkDescriptorBufferInfo rv{}, rtr{};
+    if (tlas) {
+        wa.accelerationStructureCount = 1;
+        wa.pAccelerationStructures = &tlas;
+        w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &wa, VK_NULL_HANDLE, kBindTlas, 0, 1,
+                  VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr};
+        // the structure's own vertices and triangles (this frame's, as tlas is)
+        const RtFrame& f = rt_[frame_slot_];
+        rv = {f.verts.buf, 0, VK_WHOLE_SIZE};
+        rtr = {f.tris.buf, 0, VK_WHOLE_SIZE};
+        w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindRtVerts, 0, 1,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rv, nullptr};
+        w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindRtTris, 0, 1,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rtr, nullptr};
+    }
+    vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, tlas ? rt_layout_ : layout_, 0, n, w);
     vkCmdDraw(c, 3, 1, 0, 0);
     ForgetDrawState();
 }
@@ -3157,6 +3559,10 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
         }
         // pixels the CPU wrote before this clear go in first, a later upload would paint over the clear
         if (!t->depth && LatchCpuWrite(*t)) UploadTarget(*t, s.rt);
+        // the scene's depth cleared after its traced draws (for the gun): kept for the ray traced passes
+        if (t == ds && (flags & kClearZ) && t == scene_ds_ && !post_done_ &&
+            ((rt_used_ && RtWanted()) || (scene_zwrites_ && DofWanted())))
+            RtKeepDepth(*t);
         ClearRects(*t, rs, flags, col, std::clamp(z, 0.0f, 1.0f), stencil);
         t->drawn = true;
     }
@@ -3653,7 +4059,7 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k) {
 }
 
 void VulkanBackend::PushDescriptors(const Stretch& vsc, const Stretch& dc, const DrawTextures& stages, const VkSampler smp[4]) {
-    VkWriteDescriptorSet w[kBindings]{};
+    VkWriteDescriptorSet w[kBindCapture + 1]{};
     VkDescriptorBufferInfo bi[2] = {{vsc.buf, vsc.off, sizeof(State::vsc)}, {dc.buf, dc.off, sizeof(DrawConstants)}};
     VkDescriptorImageInfo ii[4]{}, si[4]{};
     uint32_t n = 0;
@@ -3670,6 +4076,10 @@ void VulkanBackend::PushDescriptors(const Stretch& vsc, const Stretch& dc, const
         w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindSmp + i, 0, 1,
                   VK_DESCRIPTOR_TYPE_SAMPLER, &si[i], nullptr, nullptr};
     }
+    VkDescriptorBufferInfo cap{rt_[frame_slot_].verts.buf, 0, VK_WHOLE_SIZE};
+    if (rt_capturing_)
+        w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindCapture, 0, 1,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cap, nullptr};
     vkCmdPushDescriptorSetKHR(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, n, w);
 }
 
@@ -3755,8 +4165,15 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     float wdepth[4] = {float(k.zbias) * s.zscale / kDepth24Max, k.zslope, 1.0f / (s.zscale + 1.0f),
                        sh.prog ? 1.0f : s.zscale * s.inv_wfar};
     if (pk.wbuf) k.zbias = 0, k.zslope = 0;
+    // ray tracing: an opaque draw of the 3D scene writes its vertices' places (its variants and mask draw do the same)
+    uint32_t rt_push[4] = {};
+    rt_capturing_ = RtWanted() && RtCapture(s, a, sh, k, rt_push);
     VkPipeline p = EnsurePipeline(k);
-    if (!p) return;
+    if (!p) {
+        if (rt_capturing_) rt_tris_.resize(rt_tris_.size() - rt_push[3]), rt_used_ -= rt_push[1];
+        rt_capturing_ = false;
+        return;
+    }
 
     // constants
     GuestExtent size;
@@ -3797,6 +4214,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (!draw_2d_ && bound_ds_) {
             scene_rt_ = bound_rt_;
             scene_ds_ = bound_ds_;
+            scene_zwrites_ += k.zwrite ? 1 : 0;
         } else if (draw_2d_ && !post_done_ && scene_rt_ == bound_rt_) {
             ScenePass(*scene_rt_, scene_ds_);
         }
@@ -3931,6 +4349,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
     if (ds_.pipeline != p) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ds_.pipeline = p);
     PushDescriptors(last_vsc_, last_dc_, stages, smp);
+    if (rt_capturing_) vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, rt_push);
     float bf[4];
     BlendFactor(s, bf);
     if (std::memcmp(ds_.bf, bf, sizeof(bf))) {
@@ -3985,7 +4404,325 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         counted_.push_back({q, serial_ + 1, SamplesPerPixel()});
     }
     if (refl > 0) DrawMask(a, k, sh, pk, stages, smp, bf, sref, vp, sc), perf_reflect_++;
-    if (int em = Emitter(k)) DrawGlow(a, k, sh, pk, stages, smp, bf, sref, vp, sc, em);
+    if (!draw_2d_) {
+        if (solid_geom_frame_ != presents_ + 1) solid_geom_frame_ = presents_ + 1, solid_geom_.clear();
+        const void* geom = a.index_src ? a.index_src : a.buffers[0].src;
+        if (!k.blend && k.zwrite) {
+            if (geom) solid_geom_.insert(geom);
+        } else if (int em = Emitter(k); em && !(geom && solid_geom_.count(geom))) {
+            DrawGlow(a, k, sh, pk, stages, smp, bf, sref, vp, sc, em);
+        }
+    }
+    rt_capturing_ = false;
+}
+
+// ---- ray tracing
+
+// a draw whose triangles go into this frame's acceleration structure: opaque, depth written, of the 3D scene, before
+// its scene pass; its vertex shader swapped for the capture variant (k.vs), its triangles listed. push: the capture
+// shader's base, count and least index, then (for the caller to undo) the indices listed
+bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, uint32_t push[4]) {
+    if (draw_2d_ || post_done_ || !bound_rt_ || !bound_ds_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_ ||
+        bound_ds_->w != bound_rt_->w || bound_ds_->h != bound_rt_->h)
+        return rt_skips_[0]++, false;
+    // after the scene's depth was cleared mid-frame (RtKeepDepth): the gun and hands, in a view of their own
+    if (bound_ds_->rt_depth_frame == presents_ + 1) return rt_skips_[0]++, false;
+    if (!k.zen || !k.zwrite) return rt_skips_[1]++, false;
+    if (a.topology != Topology::Triangles || sh.quad || a.pretransformed) return rt_skips_[2]++, false;
+    // cut-outs (fences, leaves) would shade as whole quads
+    if (!(Opaque(k) || stage_solid_)) return rt_skips_[3]++, false;
+    if (SimpleState(s, kMAlphaTestEnable) && !stage_solid_) return rt_skips_[4]++, false;
+    // the vertices it reads: SV_VertexID is an index plus the base vertex
+    uint32_t n = a.index_count ? a.index_count : a.draw_count;
+    if (n < 3) return false;
+    int64_t vmin = 0, vmax = int64_t(a.draw_count) - 1;
+    auto index = [&](uint32_t i) -> int64_t {
+        return int64_t(a.index16 ? static_cast<const uint16_t*>(a.index_src)[i] : static_cast<const uint32_t*>(a.index_src)[i]) +
+               a.base_vertex;
+    };
+    if (a.index_count) {
+        vmin = INT64_MAX, vmax = INT64_MIN;
+        for (uint32_t i = 0; i < n; i++) {
+            int64_t v = index(i);
+            vmin = std::min(vmin, v), vmax = std::max(vmax, v);
+        }
+    }
+    if (vmin < 0 || vmax < vmin) return false;
+    uint64_t count = uint64_t(vmax - vmin + 1);
+    RtFrame& f = rt_[frame_slot_];
+    if (!rt_used_ && f.vert_cap < rt_want_) {
+        // the frame's first: the slot's buffer made (again, larger after a frame ran out)
+        DropBuffer(f.verts);
+        f.vert_cap = 0;
+        if (!MakeBuffer(f.verts, VkDeviceSize(rt_want_) * 16,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                        false)) {
+            LOG_FIRST(1, "vulkan: no memory for ray tracing's %u vertices; the scene is not ray traced", rt_want_);
+            return false;
+        }
+        f.vert_cap = rt_want_;
+    }
+    if (rt_used_ + count > f.vert_cap) {
+        rt_full_ = true;
+        return false;
+    }
+    // the capture variant of its vertex shader
+    uint64_t key = sh.vkey ^ kCaptureKeySalt;
+    uint64_t vh = 0;
+    if (auto it = shader_src_.find(key); it != shader_src_.end()) {
+        vh = it->second;
+    } else {
+        std::string src = VertexHlsl(s, a, sh);
+        size_t at = src.find("VOut main(");
+        size_t close = at == std::string::npos ? at : src.find(')', at);
+        if (close != std::string::npos) {
+            std::string params = src.substr(at + 10, close - at - 10);
+            std::string arg = params.substr(params.find_last_of(' ') + 1);
+            src.replace(at, 10, "VOut game_main(");
+            char tail[2048];
+            std::snprintf(tail, sizeof(tail), kCaptureMain, params.c_str(), arg.c_str());
+            src += tail;
+            if (!Compile(src, "main", "vs_5_0", vh)) vh = 0;
+        }
+        if (!vh) LOG_FIRST(4, "vulkan: a vertex shader's ray tracing variant could not be made; its draws are not traced");
+        shader_src_[key] = vh;
+    }
+    if (!vh) return false;
+    // its triangles, as indices into the frame's vertices
+    size_t before = rt_tris_.size();
+    uint32_t base = rt_used_;
+    auto at = [&](uint32_t i) { return base + uint32_t((a.index_count ? index(i) : int64_t(i)) - vmin); };
+    if (a.strip) {
+        for (uint32_t i = 0; i + 2 < n; i++) {
+            uint32_t i0 = at(i), i1 = at(i + 1), i2 = at(i + 2);
+            if (i0 == i1 || i1 == i2 || i0 == i2) continue;
+            if (i & 1) std::swap(i0, i1);
+            rt_tris_.insert(rt_tris_.end(), {i0, i1, i2});
+        }
+    } else {
+        for (uint32_t i = 0; i + 2 < n; i += 3) rt_tris_.insert(rt_tris_.end(), {at(i), at(i + 1), at(i + 2)});
+    }
+    k.vs = vh;
+    rt_used_ += uint32_t(count);
+    push[0] = base;
+    push[1] = uint32_t(count);
+    push[2] = uint32_t(vmin);
+    push[3] = uint32_t(rt_tris_.size() - before);
+    perf_rt_draws_++;
+    return true;
+}
+
+// an acceleration structure's storage, made (again, larger) when it needs more
+bool VulkanBackend::RtStorage(Buffer& mem, VkAccelerationStructureKHR& as, VkDeviceSize need,
+                              VkAccelerationStructureTypeKHR type) {
+    if (as && mem.size >= need) return true;
+    if (as) {
+        VkAccelerationStructureKHR old = as;
+        Retire([this, old] { vkDestroyAccelerationStructureKHR(dev_, old, nullptr); });
+        as = VK_NULL_HANDLE;
+    }
+    DropBuffer(mem);
+    VkDeviceSize size = (need + need / 2 + 0xFFFF) & ~VkDeviceSize(0xFFFF);
+    if (!MakeBuffer(mem, size, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                    false))
+        return false;
+    VkAccelerationStructureCreateInfoKHR ci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+    ci.buffer = mem.buf;
+    ci.size = size;
+    ci.type = type;
+    return vkCreateAccelerationStructureKHR(dev_, &ci, nullptr, &as) == VK_SUCCESS;
+}
+
+// this frame's triangles built into the slot's bottom level structure, one instance of it (x and y scaled by the
+// assumed view's width) the top level; recorded after a barrier past the draws that wrote the places
+bool VulkanBackend::RtBuild(float aspect) {
+    RtFrame& f = rt_[frame_slot_];
+    uint32_t tris = uint32_t(rt_tris_.size() / 3);
+    if (!tris || !f.verts.buf || !rt_used_) return false;
+    VkDeviceSize ibytes = VkDeviceSize(rt_tris_.size()) * 4;
+    const VkBufferUsageFlags input = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    if (f.tris.size < ibytes) {
+        DropBuffer(f.tris);
+        // read by the traced passes too (a hit's triangle)
+        if (!MakeBuffer(f.tris, std::max<VkDeviceSize>(ibytes + ibytes / 2, 1u << 20),
+                        input | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true))
+            return false;
+    }
+    if (!f.inst.buf && !MakeBuffer(f.inst, sizeof(VkAccelerationStructureInstanceKHR), input, true)) return false;
+    if (!f.tris.mem.map || !f.inst.mem.map) return false;
+    std::memcpy(f.tris.mem.map, rt_tris_.data(), size_t(ibytes));
+
+    // sizes
+    VkAccelerationStructureGeometryKHR bg{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    bg.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    bg.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    VkAccelerationStructureGeometryTrianglesDataKHR& tr = bg.geometry.triangles;
+    tr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    tr.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    tr.vertexData.deviceAddress = Address(f.verts);
+    tr.vertexStride = 16;
+    tr.maxVertex = rt_used_ - 1;
+    tr.indexType = VK_INDEX_TYPE_UINT32;
+    tr.indexData.deviceAddress = Address(f.tris);
+    VkAccelerationStructureBuildGeometryInfoKHR bb{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    bb.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    bb.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+    bb.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    bb.geometryCount = 1;
+    bb.pGeometries = &bg;
+    VkAccelerationStructureBuildSizesInfoKHR bs{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bb, &tris, &bs);
+    VkAccelerationStructureGeometryKHR tg{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    tg.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tg.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    tg.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    tg.geometry.instances.data.deviceAddress = Address(f.inst);
+    VkAccelerationStructureBuildGeometryInfoKHR tb = bb;
+    tb.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tb.pGeometries = &tg;
+    VkAccelerationStructureBuildSizesInfoKHR ts{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    const uint32_t one = 1;
+    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tb, &one, &ts);
+
+    // storage and scratch
+    if (!RtStorage(f.blas_mem, f.blas, bs.accelerationStructureSize, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) ||
+        !RtStorage(f.tlas_mem, f.tlas, ts.accelerationStructureSize, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR)) {
+        LOG_FIRST(1, "vulkan: no memory for ray tracing's acceleration structures; the scene is not ray traced");
+        return false;
+    }
+    VkDeviceSize scratch = std::max(bs.buildScratchSize, ts.buildScratchSize) + rt_scratch_align_;
+    if (f.scratch.size < scratch) {
+        DropBuffer(f.scratch);
+        if (!MakeBuffer(f.scratch, scratch + scratch / 2,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false))
+            return false;
+    }
+    VkDeviceAddress sa = (Address(f.scratch) + rt_scratch_align_ - 1) & ~(rt_scratch_align_ - 1);
+
+    // the instance
+    VkAccelerationStructureInstanceKHR in{};
+    const float ty = 0.5774f;  // an assumed 60 degree vertical view, as the screen-space passes take it
+    in.transform.matrix[0][0] = ty * aspect;
+    in.transform.matrix[1][1] = ty;
+    in.transform.matrix[2][2] = 1;
+    in.mask = 0xFF;
+    in.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR | VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+    VkAccelerationStructureDeviceAddressInfoKHR ai{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+    ai.accelerationStructure = f.blas;
+    in.accelerationStructureReference = vkGetAccelerationStructureDeviceAddressKHR(dev_, &ai);
+    std::memcpy(f.inst.mem.map, &in, sizeof(in));
+
+    // the builds: the bottom level once the draws wrote the places, the top level once it is done
+    End();
+    Barrier();
+    bb.dstAccelerationStructure = f.blas;
+    bb.scratchData.deviceAddress = sa;
+    VkAccelerationStructureBuildRangeInfoKHR br{tris, 0, 0, 0};
+    const VkAccelerationStructureBuildRangeInfoKHR* pbr = &br;
+    vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &bb, &pbr);
+    Barrier();
+    tb.dstAccelerationStructure = f.tlas;
+    tb.scratchData.deviceAddress = sa;
+    VkAccelerationStructureBuildRangeInfoKHR tr1{1, 0, 0, 0};
+    const VkAccelerationStructureBuildRangeInfoKHR* ptr = &tr1;
+    vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &tb, &ptr);
+    Barrier();
+    perf_rt_tris_ += tris;
+    return true;
+}
+
+// ray traced ambient occlusion over the scene (kRtHlsl): traced at half its size, then the scene darkened by it
+void VulkanBackend::RtPass(Target& rt, Target* ds) {
+    const GraphicsStyle& st = Style();
+    if (!ds || ds->w != rt.w || ds->h != rt.h) return;
+    uint64_t vh, th, ch;
+    if (!Compile(kRtHlsl, "vs", "vs_6_5", vh) || !Compile(kRtHlsl, "trace", "ps_6_5", th) ||
+        !Compile(kRtHlsl, "comp", "ps_6_5", ch)) {
+        LOG_FIRST(1, "vulkan: the ray traced passes did not compile; no ray tracing");
+        return;
+    }
+    constexpr VkFormat kRtFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    PassKey tk{vh, th, kRtFormat, VK_FORMAT_UNDEFINED, 0, 0};
+    tk.rt = 1;
+    VkPipeline pt = PassPipeline(tk);
+    PassKey ck{vh, ch, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    ck.rt = 1;
+    VkPipeline pc = PassPipeline(ck);
+    if (!pt || !pc) return;
+    uint32_t hw = std::max<uint32_t>(rt.w / 2, 1), hh = std::max<uint32_t>(rt.h / 2, 1);
+    if (rt.rt_ao.img && (rt.rt_ao.w != hw || rt.rt_ao.h != hh)) DropImage(rt.rt_ao);
+    if (!rt.rt_ao.img && !MakeImage(rt.rt_ao, VK_IMAGE_TYPE_2D, kRtFormat, hw, hh, 1, 1, 1,
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        return;
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    float aspect = float(rt.w) / float(rt.h);
+    static const int test = [] {
+        const char* e = std::getenv("XBE_RT_TEST");
+        return e && *e >= '1' && *e <= '3' ? *e - '0' : 0;
+    }();
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    float c[12] = {1.0f / rt.w, 1.0f / rt.h, 0.5774f, aspect,
+                   st.rt_radius, st.rt_ao, float(st.rt_rays), scene_wbuf_ ? 1.0f : 0.0f,
+                   float(test), kept ? 1.0f : 0.0f, 1.0f / hw, 1.0f / hh};
+    VkImageView keptv = kept ? ds->rt_depth.view : ds->res.view;
+    VkViewport hvp{0, 0, float(hw), float(hh), 0, 1};
+    VkRect2D hsc{{0, 0}, {hw, hh}};
+    VkImageView tv[4] = {rt.fb.view, ds->res.view, VK_NULL_HANDLE, keptv};
+    FullScreen(pt, {rt.rt_ao.att, VK_NULL_HANDLE, hw, hh}, hvp, hsc, c, 12, tv, 4, rt_[frame_slot_].tlas);
+    End();
+    Barrier();
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[4] = {rt.fb.view, ds->res.view, rt.rt_ao.view, keptv};
+    FullScreen(pc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 12, views, 4, rt_[frame_slot_].tlas);
+    End();
+    rt_drawn_ = true;
+    if (test && presents_ % 300 == 0)
+        LOGR("vulkan: ray tracing: %llu draws traced, %llu triangles; skipped: %llu not the scene, %llu no depth write, "
+             "%llu not triangles, %llu blended, %llu cut-outs",
+             (unsigned long long)perf_rt_draws_, (unsigned long long)perf_rt_tris_, (unsigned long long)rt_skips_[0],
+             (unsigned long long)rt_skips_[1], (unsigned long long)rt_skips_[2], (unsigned long long)rt_skips_[3],
+             (unsigned long long)rt_skips_[4]);
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: ray traced ambient occlusion drawn (%u triangles, %d rays, %.2f m)",
+                                 uint32_t(rt_tris_.size() / 3), st.rt_rays, st.rt_radius);
+}
+
+void VulkanBackend::RtKeepDepth(Target& ds) {
+    if (ds.rt_depth.img && (ds.rt_depth.w != ds.w || ds.rt_depth.h != ds.h)) DropImage(ds.rt_depth);
+    if (!ds.rt_depth.img && !MakeImage(ds.rt_depth, VK_IMAGE_TYPE_2D, depth_fmt_, ds.w, ds.h, 1, 1, 1,
+                                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    if (ds.rt_depth_frame == presents_ + 1) return;  // the first clear's: the world's
+    ds.rt_depth_frame = presents_ + 1;
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    cp.extent = {ds.w, ds.h, 1};
+    vkCmdCopyImage(Cmd(), ds.res.img, VK_IMAGE_LAYOUT_GENERAL, ds.rt_depth.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+}
+
+void VulkanBackend::DropRt(RtFrame& f) {
+    if (f.blas) vkDestroyAccelerationStructureKHR(dev_, f.blas, nullptr);
+    if (f.tlas) vkDestroyAccelerationStructureKHR(dev_, f.tlas, nullptr);
+    f.blas = f.tlas = VK_NULL_HANDLE;
+    DropBuffer(f.verts), DropBuffer(f.tris), DropBuffer(f.inst), DropBuffer(f.scratch);
+    DropBuffer(f.blas_mem), DropBuffer(f.tlas_mem);
+    f.vert_cap = 0;
 }
 
 // a glowing effect, what lights its surroundings: added over the 3D scene (its colour, 2, or by its alpha, 1), depth
@@ -4079,11 +4816,25 @@ void VulkanBackend::LightPass(Target& rt, Target* ds) {
         LOG_FIRST(1, "vulkan: the effect lights' passes did not compile; effects light nothing");
         return;
     }
+    // ray traced shadows: the light pass's traced variant
+    bool traced = false;
+    VkPipeline plt = VK_NULL_HANDLE;
+    if (rt_built_ && st.rt_shadows) {
+        static const std::string src = std::string("#define RT 1\n") + kLightsHlsl;
+        uint64_t tvh, th;
+        if (Compile(src, "vs", "vs_6_5", tvh) && Compile(src, "light", "ps_6_5", th)) {
+            PassKey k{tvh, th, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+            k.rt = 1;
+            plt = PassPipeline(k);
+        }
+        if (!plt) LOG_FIRST(1, "vulkan: the effect lights' traced shadows did not compile; lights cast none");
+        traced = plt != VK_NULL_HANDLE;
+    }
     constexpr VkFormat kTileFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
     VkPipeline pa = PassPipeline({vh, ah, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
     VkPipeline pb = PassPipeline({vh, bh, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
     VkPipeline pk = PassPipeline({vh, kh, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
-    VkPipeline pl = PassPipeline({vh, lh, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pl = traced ? plt : PassPipeline({vh, lh, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
     if (!pa || !pb || !pk || !pl) return;
     const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -4124,7 +4875,8 @@ void VulkanBackend::LightPass(Target& rt, Target* ds) {
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
     VkImageView views[4] = {rt.fb.view, ds->res.view, rt.light_list.view, VK_NULL_HANDLE};
-    FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4);
+    FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4,
+               traced ? rt_[frame_slot_].tlas : VK_NULL_HANDLE);
     End();
 }
 
@@ -4571,6 +5323,17 @@ void VulkanBackend::Present(const Surface& front) {
     }
     scene_rt_ = scene_ds_ = nullptr;
     post_done_ = false;
+    scene_zwrites_ = 0;
+    // ray tracing: the next frame captures from its first vertex, into buffers twice as large after one ran out
+    if (rt_full_ && rt_want_ < (16u << 20)) {
+        rt_want_ *= 2;
+        LOGR("vulkan: ray tracing's scene outgrew its buffers, now %u vertices", rt_want_);
+    }
+    rt_full_ = false;
+    rt_used_ = 0;
+    rt_tris_.clear();
+    rt_drawn_ = false;
+    rt_built_ = false;
     uint32_t index = 0;
     bool acquired;
     {
@@ -4719,12 +5482,14 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     post_done_ = true;
     End();
     Stamp(2);
+    rt_built_ = RtWanted() && ds && ds->w == rt.w && ds->h == rt.h && RtBuild(float(rt.w) / float(rt.h));
+    if (rt_built_ && Style().rt_ao > 0) RtPass(rt, ds);
     if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds);
     if (Style().bounce_light && Style().mode != kStyleRetro) BouncePass(rt, ds);
     if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds);
     if (StylePassWanted()) StylePass(rt, ds);
-    if (app::FocusBlur() > 0 && Style().mode != kStyleRetro) FocusPass(rt, ds);
     if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt);
+    if (DofWanted()) DofPass(rt, ds);
     End();
     Stamp(3);
     ForgetDrawState();  // the draw that asked for it goes on with its targets
@@ -4769,7 +5534,8 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
         g.exposure = neutral.exposure, g.tonemap = kToneOff, g.contrast = 1, g.saturation = 1, g.temperature = 0;
         g.sharpen = 0, g.vignette = 0, g.grain = 0, g.bloom_threshold = 0.85f;
     }
-    float ao = QualityAo(st), bloom = st.mode == kStyleOriginal || st.mode == kStyleEnhanced ? QualityBloom(st) : 0.0f;
+    float ao = rt_drawn_ ? 0.0f : QualityAo(st),
+          bloom = st.mode == kStyleOriginal || st.mode == kStyleEnhanced ? QualityBloom(st) : 0.0f;
     if (st.mode == kStyleOriginal && st.quality_bloom) g.bloom_threshold = 0.85f;
     float c[40] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
                    g.exposure, float(g.tonemap), g.contrast, g.saturation,
@@ -4855,19 +5621,33 @@ void VulkanBackend::BouncePass(Target& rt, Target* ds) {
     if (!said) said = true, LOGR("vulkan: bounced light drawn (strength %.2f)", st.bounce_strength);
 }
 
-// focus blur over the scene (kFocusHlsl): what lies behind the crosshair's point, by app::FocusBlur
-void VulkanBackend::FocusPass(Target& rt, Target* ds) {
+// depth of field over the finished scene (kDofHlsl): the distance in focus eased in a 1 x 1 image, then the blur
+void VulkanBackend::DofPass(Target& rt, Target* ds) {
+    const GraphicsStyle& st = Style();
     if (!ds || ds->w != rt.w || ds->h != rt.h) return;
-    uint64_t vh, ph;
-    if (!Compile(kFocusHlsl, "vs", "vs_5_0", vh) || !Compile(kFocusHlsl, "ps", "ps_5_0", ph)) {
-        LOG_FIRST(1, "vulkan: the focus blur's pass did not compile; no focus blur");
+    uint64_t vh, fh, bh;
+    if (!Compile(kDofHlsl, "vs", "vs_5_0", vh) || !Compile(kDofHlsl, "focus", "ps_5_0", fh) ||
+        !Compile(kDofHlsl, "blur", "ps_5_0", bh)) {
+        LOG_FIRST(1, "vulkan: the depth of field's passes did not compile; no depth of field");
         return;
     }
-    VkPipeline pipe = PassPipeline({vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
-    if (!pipe) return;
+    constexpr VkFormat kFocusFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkPipeline pf = PassPipeline({vh, fh, kFocusFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pb = PassPipeline({vh, bh, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pf || !pb) return;
+    for (Image& im : rt.dof_focus)
+        if (!im.img && !MakeImage(im, VK_IMAGE_TYPE_2D, kFocusFormat, 1, 1, 1, 1, 1,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+            return;
     if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return;
+    static const int test = [] {
+        const char* e = std::getenv("XBE_DOF_TEST");
+        return e && *e >= '1' && *e <= '2' ? *e - '0' : 0;
+    }();
+    // aiming down the sights: the focus's blur eased in and out with the gun
+    dof_aim_ += ((Aiming() ? 1.0f : 0.0f) - dof_aim_) * 0.15f;
     End();
     if (dirty_) Barrier();
     VkImageCopy cp{};
@@ -4876,15 +5656,32 @@ void VulkanBackend::FocusPass(Target& rt, Target* ds) {
     vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     dirty_ = true;
     Barrier();
-    float k = float(rt.h) / float(rt.gh);  // host pixels per console pixel
-    float c[8] = {1.0f / rt.w, 1.0f / rt.h, app::FocusBlur(), scene_wbuf_ ? 1.0f : 0.0f, 7.0f * k, 2.0f, 0, 0};
+    bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    bool last = rt.dof_frame == presents_;  // drawn the frame before: its focus eases on
+    rt.dof_frame = presents_ + 1;
+    Image& now = rt.dof_focus[presents_ & 1];
+    const Image& was = rt.dof_focus[(presents_ + 1) & 1];
+    bool focus = st.dof == kDofFocus;
+    float most = st.dof_strength * float(rt.h) * (focus ? 0.006f + 0.006f * dof_aim_ : 0.005f);
+    float c[16] = {1.0f / rt.w, 1.0f / rt.h, float(st.dof), most,
+                   20.0f, 120.0f, 0.15f - 0.10f * dof_aim_, 1.2f + 0.3f * dof_aim_,
+                   scene_wbuf_ ? 1.0f : 0.0f, kept ? 1.0f : 0.0f, last ? 1.0f : 0.0f, 0.12f,
+                   float(test), 0, 0, 0};
+    VkImageView keptv = kept ? ds->rt_depth.view : ds->res.view;
+    VkViewport fvp{0, 0, 1, 1, 0, 1};
+    VkRect2D fsc{{0, 0}, {1, 1}};
+    VkImageView fv[4] = {rt.fb.view, ds->res.view, keptv, last ? was.view : dummy_.view};
+    FullScreen(pf, {now.att, VK_NULL_HANDLE, 1, 1}, fvp, fsc, c, 16, fv, 4);
+    End();
+    Barrier();
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
-    VkImageView views[2] = {rt.fb.view, ds->res.view};
-    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 8, views, 2);
+    VkImageView views[4] = {rt.fb.view, ds->res.view, keptv, now.view};
+    FullScreen(pb, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4);
     End();
     static bool said = false;
-    if (!said) said = true, LOGR("vulkan: focus blur drawn (aiming down the sights)");
+    if (!said) said = true, LOGR("vulkan: depth of field drawn (%s, blur %.2f, %s)", focus ? "focus" : "distance",
+                                 st.dof_strength, kept ? "the gun kept sharp" : "no mid-frame clear seen");
 }
 
 // light shafts and fog over the scene: what lights the air at a quarter size, halved four times to a field that
@@ -4949,12 +5746,15 @@ void VulkanBackend::AtmospherePass(Target& rt, Target* ds) {
     for (int k = 1; k < 5; k++) pass(pd, rt.atmo[k], &rt.atmo[k - 1].view, 1, 1.0f / rt.atmo[k - 1].w, 1.0f / rt.atmo[k - 1].h);
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
-    pass(pk, rt.atmo_pick, &field.view, 1, 1.0f / field.w, 1.0f / field.h);
+    VkImageView pv[3] = {field.view, ds->res.view, rt.fb.view};
+    pass(pk, rt.atmo_pick, pv, 3, 1.0f / field.w, 1.0f / field.h);
     VkImageView views[4] = {rt.fb.view, ds->res.view, rt.atmo[0].view, rt.atmo_pick.view};
     FullScreen(pc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4);
     End();
     static bool said = false;
     if (!said) said = true, LOGR("vulkan: light shafts and fog drawn (shafts %.2f, fog %.2f)", st.shaft_strength, st.fog_strength);
+    static int wbuf_said = -1;
+    if (wbuf_said != int(scene_wbuf_)) wbuf_said = scene_wbuf_, LOGR("vulkan: fog over a %s-buffered scene", scene_wbuf_ ? "W" : "Z");
 }
 
 // SMAA's shaders and lookup textures, once
