@@ -2238,6 +2238,12 @@ private:
     bool RtWanted() const { return rt_ok_ && Style().ray_tracing && Style().mode != kStyleRetro; }
     bool rt_built_ = false;  // this frame's acceleration structure is built (the scene pass, before its passes)
     bool RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, VkImageView tex, uint32_t push[4]);
+    // a W-buffered scene's sky draw (SkyDraw): the frame's own count, the result kept for the draw
+    struct SkyCheck { bool sky = false, eye = false, cam_ok = false; float cam[3][4] = {}; };
+    SkyCheck SkyDraw(const State& s, const Assembled& a, const DrawShaders& sh);
+    SkyCheck sky_;
+    uint64_t sky_draw_ = ~0ull, draw_seq_ = 0;  // the draw sky_ was worked out for, the draws so far
+    bool sky_keeps_game_ = false;               // this draw is the sky: no pack picture for it
     bool RtBuild(float aspect);
     void RtKeepDepth(Target& ds);
     void RtPass(Target& rt, Target* ds);
@@ -4194,7 +4200,7 @@ void VulkanBackend::UploadTexture(Tex& tx, const TextureDesc& d, const uint8_t* 
 
 VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const TextureDesc& d, const FormatInfo& fi,
                                             DrawTextures& stages) {
-    if (!d.cube && d.depth == 1 && !fi.depth) {
+    if (!d.cube && d.depth == 1 && !fi.depth && !sky_keeps_game_) {
         auto r = FindReplacement(d.data);
         if (r && ((r->sharpened && !app::Get().sharp_2d) || !ReplacementFits(*r, d))) r = nullptr;
         if (VkImageView v = r ? BindReplacement(*r, d, stages.levels[stage]) : VK_NULL_HANDLE) {
@@ -4555,6 +4561,10 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     draw_ds_ = bound_ds_;
     draw_2d_ = a.pretransformed || ScreenDraw(s);
     stage_seen_ = false;
+    // the sky keeps the game's own pictures: a pack's are upscaled each apart, so a sky box's faces no longer meet
+    // (a thin line at each edge of The Exchange's moon box)
+    draw_seq_++;
+    sky_keeps_game_ = !draw_2d_ && Style().texture_pack && SkyDraw(s, a, sh).sky;
     for (int i = 0; i < 4; i++) stages.view[i] = BindTexture(s, i, stages);
     draw_env_ = false;
     for (int i = 0; i < 4; i++) draw_env_ |= stages.view[i] && stages.info[i].kind == kTexCube;
@@ -4651,7 +4661,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     c.style[3] = Opaque(k) || stage_solid_ ? 1.0f : 0.0f;
     // materials: a pack picture's normal and roughness, read from a stage the draw leaves free
     int mat_slot = -1;
-    if (st.materials && st.mode != kStyleRetro && !draw_2d_ && stage_seen_ && stage_key_ && stages.replaced[0] &&
+    // not on the sky: its box's faces bumped and their edges seamed (The Exchange's moon box)
+    const bool sky = !draw_2d_ && (st.materials || st.ground_detail) && SkyDraw(s, a, sh).sky;
+    if (st.materials && st.mode != kStyleRetro && !draw_2d_ && !sky && stage_seen_ && stage_key_ && stages.replaced[0] &&
         bound_rt_ && k.zen && (Opaque(k) || stage_solid_)) {
         int slot = -1;
         for (int i = 3; i >= 1 && slot < 0; i--)
@@ -4678,7 +4690,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         perf_det_[0]++;
         if (!(Opaque(k) || stage_solid_)) perf_det_[1]++;
     }
-    if (mat_slot < 0 && st.ground_detail && st.mode != kStyleRetro && !draw_2d_ && stage_seen_ && stage_detail_ &&
+    if (mat_slot < 0 && st.ground_detail && st.mode != kStyleRetro && !draw_2d_ && !sky && stage_seen_ && stage_detail_ &&
         stage_detail_ < kDetailKinds && bound_rt_ && k.zen && (Opaque(k) || stage_solid_)) {
         int slot = -1;
         for (int i = 3; i >= 1 && slot < 0; i--)
@@ -4862,6 +4874,58 @@ uint32_t VulkanBackend::RtMaterial(const State& s, VkImageView tex, bool cut) {
     return slot | ref << 12 | func << 20 | (cut ? 1u << 23 : 0u);
 }
 
+// a W-buffered scene's sky (NightFire's): a fixed function draw (the scene's own are vertex programs), its camera at
+// the world's middle (drawn about the eye), fog off where the level is fogged (an outdoor level's dome and clouds,
+// its far mountains' ring), or hundreds of units before and behind the eye. Its camera: c0-c3 a world place to the
+// clip's, then the console's viewport (c-38, c-37, c21) to the screen, which the capture makes the ray traced view's
+// (kCaptureMain: the screen's place times w, w). Worked out once a draw (the ray tracing capture and the materials ask)
+VulkanBackend::SkyCheck VulkanBackend::SkyDraw(const State& s, const Assembled& a, const DrawShaders& sh) {
+    if (sky_draw_ == draw_seq_) return sky_;
+    sky_draw_ = draw_seq_;
+    sky_ = {};
+    if (!scene_wbuf_ || draw_2d_ || !bound_rt_) return sky_;
+    if (!sh.prog) return sky_.sky = true, sky_;
+    uint32_t n = a.index_count ? a.index_count : a.draw_count;
+    const auto& v = s.vsc;
+    const float sw = float(bound_rt_->gw), sh2 = float(bound_rt_->gh), unit = 4096.0f / (s.zscale + 1.0f);
+    const float ox = v[59][0] + v[117][0], oy = v[59][1] + v[117][1];
+    for (int i = 0; i < 4; i++) {
+        sky_.cam[0][i] = unit * (2 * (v[58][0] * v[96][i] + ox * v[99][i]) / sw - v[99][i]);
+        sky_.cam[1][i] = unit * (v[99][i] - 2 * (v[58][1] * v[97][i] + oy * v[99][i]) / sh2);
+        sky_.cam[2][i] = unit * v[99][i];
+    }
+    sky_.cam_ok = true;
+    if (std::abs(sky_.cam[0][3]) + std::abs(sky_.cam[1][3]) + std::abs(sky_.cam[2][3]) < 1e-3f * unit)
+        return sky_.eye = sky_.sky = true, sky_;
+    uint32_t fogged = s.rs[kRsFogEnable] ? 1 : 0;
+    rt_fog_tris_[fogged] += n / 3;
+    if (!fogged && rt_fogged_ > 0.7f) return sky_.sky = true, sky_;
+    const VertexElement& el = a.elements[0];
+    const VertexBuffer& vb = a.buffers[el.buffer];
+    uint32_t regs = 0;
+    for (uint32_t m = a.regs; m; m &= m - 1) regs++;
+    const bool raw = a.vertices.empty() && el.format == DXGI_FORMAT_R32G32B32_FLOAT && vb.src;
+    if (raw || !a.vertices.empty()) {
+        float zmin = 1e30f, zmax = -1e30f;
+        const uint32_t step = std::max<uint32_t>(1, n / 96);
+        for (uint32_t i = 0; i < n; i += step) {
+            int64_t vi = a.index_count ? int64_t(a.index16 ? static_cast<const uint16_t*>(a.index_src)[i]
+                                                           : static_cast<const uint32_t*>(a.index_src)[i]) +
+                                             a.base_vertex
+                                       : int64_t(i);
+            const float* q = nullptr;
+            if (!raw && vi >= 0 && uint64_t(vi) < a.vertex_count) q = &a.vertices[size_t(vi) * regs * 4];
+            else if (raw && vi >= 0 && uint64_t(vi) * vb.stride + el.offset + 12 <= vb.bytes)
+                q = reinterpret_cast<const float*>(vb.src + size_t(vi) * vb.stride + el.offset);
+            if (!q) continue;
+            float z = sky_.cam[2][0] * q[0] + sky_.cam[2][1] * q[1] + sky_.cam[2][2] * q[2] + sky_.cam[2][3];
+            zmin = std::min(zmin, z), zmax = std::max(zmax, z);
+        }
+        if (zmin < -300.0f && zmax > 300.0f) sky_.sky = true;
+    }
+    return sky_;
+}
+
 bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, VkImageView tex,
                               uint32_t push[4]) {
     if (draw_2d_ || post_done_ || !bound_rt_ || !bound_ds_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_ ||
@@ -4879,53 +4943,16 @@ bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShad
     // the vertices it reads: SV_VertexID is an index plus the base vertex
     uint32_t n = a.index_count ? a.index_count : a.draw_count;
     if (n < 3) return false;
-    // relit: a fixed function draw of the scene (the sky) left out, so the sun's rays reach past it
+    // relit: the sky left out, so the sun's rays reach past it; a camera at the world's middle never (SkyDraw)
+    if (!gun && scene_wbuf_) {
+        const SkyCheck sky = SkyDraw(s, a, sh);
+        if (sky.eye || (sky.sky && Style().rt_lighting)) return rt_skips_[2]++, false;
+    }
     if (!gun && !sh.prog && Style().rt_lighting) return rt_skips_[2]++, false;
     if (!gun && sh.prog && scene_wbuf_) {
-        // its camera: c0-c3 a world place to the clip's, then the console's viewport (c-38, c-37, c21) to the
-        // screen, which the capture makes the ray traced view's (kCaptureMain: the screen's place times w, w)
-        const auto& v = s.vsc;
-        const float sw = float(bound_rt_->gw), sh2 = float(bound_rt_->gh), unit = 4096.0f / (s.zscale + 1.0f);
-        const float ox = v[59][0] + v[117][0], oy = v[59][1] + v[117][1];
+        const SkyCheck sky = SkyDraw(s, a, sh);
         RtCam cam;
-        for (int i = 0; i < 4; i++) {
-            cam.r[0][i] = unit * (2 * (v[58][0] * v[96][i] + ox * v[99][i]) / sw - v[99][i]);
-            cam.r[1][i] = unit * (v[99][i] - 2 * (v[58][1] * v[97][i] + oy * v[99][i]) / sh2);
-            cam.r[2][i] = unit * v[99][i];
-        }
-        // a camera at the world's middle: the sky (drawn about the eye), which would shadow the sun
-        if (std::abs(cam.r[0][3]) + std::abs(cam.r[1][3]) + std::abs(cam.r[2][3]) < 1e-3f * unit)
-            return rt_skips_[2]++, false;
-        // the sky (relit: it would shadow the sun): drawn about the eye, hundreds of units before and behind it, or
-        // with fog off where the level is fogged (an outdoor level's dome and clouds, its far mountains' ring)
-        if (Style().rt_lighting) {
-            uint32_t fogged = s.rs[kRsFogEnable] ? 1 : 0;
-            rt_fog_tris_[fogged] += n / 3;
-            if (!fogged && rt_fogged_ > 0.7f) return rt_skips_[2]++, false;
-            const VertexElement& el = a.elements[0];
-            const VertexBuffer& vb = a.buffers[el.buffer];
-            uint32_t regs = 0;
-            for (uint32_t m = a.regs; m; m &= m - 1) regs++;
-            const bool raw = a.vertices.empty() && el.format == DXGI_FORMAT_R32G32B32_FLOAT && vb.src;
-            if (raw || !a.vertices.empty()) {
-                float zmin = 1e30f, zmax = -1e30f;
-                const uint32_t step = std::max<uint32_t>(1, n / 96);
-                for (uint32_t i = 0; i < n; i += step) {
-                    int64_t vi = a.index_count ? int64_t(a.index16 ? static_cast<const uint16_t*>(a.index_src)[i]
-                                                                   : static_cast<const uint32_t*>(a.index_src)[i]) +
-                                                     a.base_vertex
-                                               : int64_t(i);
-                    const float* q = nullptr;
-                    if (!raw && vi >= 0 && uint64_t(vi) < a.vertex_count) q = &a.vertices[size_t(vi) * regs * 4];
-                    else if (raw && vi >= 0 && uint64_t(vi) * vb.stride + el.offset + 12 <= vb.bytes)
-                        q = reinterpret_cast<const float*>(vb.src + size_t(vi) * vb.stride + el.offset);
-                    if (!q) continue;
-                    float z = cam.r[2][0] * q[0] + cam.r[2][1] * q[1] + cam.r[2][2] * q[2] + cam.r[2][3];
-                    zmin = std::min(zmin, z), zmax = std::max(zmax, z);
-                }
-                if (zmin < -300.0f && zmax > 300.0f) return rt_skips_[2]++, false;
-            }
-        }
+        std::memcpy(cam.r, sky.cam, sizeof(cam.r));
         RtCam& seen = rt_cams_[Hash(cam.r, sizeof(cam.r))];
         if (!seen.tris) std::memcpy(seen.r, cam.r, sizeof(cam.r));
         seen.tris += n / 3;
