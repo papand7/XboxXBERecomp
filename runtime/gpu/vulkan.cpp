@@ -502,6 +502,7 @@ struct Target {
     // HDR tone mapping: the scene in 16 bit float and its copy (swapped with res and fb while the passes draw), the
     // brightness metered on a 64 x 36 grid, the exposure this frame and the last in turn
     Image hdr_res, hdr_fb, tone_meter, tone_exp[2];
+    Image bloom_down[6], bloom_up[5];  // HDR bloom: each half the one before, from half the scene's size
     uint64_t tone_frame = 0;
     uint64_t hdr_frame = 0;
 };
@@ -1456,10 +1457,43 @@ float3 aces(float3 a) {
     a *= 0.72;
     return saturate((a * (2.51 * a + 0.03)) / (a * (2.43 * a + 0.59) + 0.14));
 }
+// HDR bloom: the exposed scene's light past white (a soft knee about 1) halved six times (13 taps each, Jimenez's
+// downsample), then each level up again with a tent and its own added; the resolve adds the top level. p[3].zw the
+// source's texel; p[3].y the bloom's share
+float3 knee(float3 x) {
+    float br = max(x.r, max(x.g, x.b)), k = 0.5, th = 1.0;
+    float soft = clamp(br - th + k, 0, 2 * k);
+    soft = soft * soft / (4 * k + 1e-4);
+    return x * (max(soft, br - th) / max(br, 1e-4));
+}
+float3 down13(Texture2D t, float2 uv, float2 px, bool first, float e) {
+    float3 s = 0;
+    const float2 o[13] = {float2(0, 0), float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1), float2(-2, -2),
+                          float2(0, -2), float2(2, -2), float2(-2, 0), float2(2, 0), float2(-2, 2), float2(0, 2), float2(2, 2)};
+    const float w[13] = {0.125, 0.125, 0.125, 0.125, 0.125, 0.03125, 0.0625, 0.03125, 0.0625, 0.0625, 0.03125, 0.0625, 0.03125};
+    [unroll] for (int k = 0; k < 13; k++) {
+        float3 c = t.SampleLevel(ls, uv + o[k] * px, 0).rgb;
+        s += (first ? lin(c) * e : c) * w[k];
+    }
+    return first ? knee(s) : s;
+}
+float exposure() { return p[0].w * (p[1].x != 0 ? nowexp.Load(int3(0, 0, 0)).r : 1); }
+float4 bdown0(O i) : SV_Target { return float4(down13(scene, i.uv, p[3].zw, true, exposure()), 1); }
+float4 bdown(O i) : SV_Target { return float4(down13(scene, i.uv, p[3].zw, false, 1), 1); }
+// t0 the level below's (smaller) result, t1 this level's own downsample
+float4 bup(O i) : SV_Target {
+    float2 px = p[3].zw;
+    float3 s = 0;
+    [unroll] for (int y = -1; y <= 1; y++)
+        [unroll] for (int x = -1; x <= 1; x++)
+            s += scene.SampleLevel(ls, i.uv + float2(x, y) * px, 0).rgb * ((x == 0 ? 2 : 1) * (y == 0 ? 2 : 1) / 16.0);
+    return float4(s + meterz.SampleLevel(ls, i.uv, 0).rgb, 1);
+}
 float4 resolve(O i) : SV_Target {
     float3 c = scene.SampleLevel(pt, i.uv, 0).rgb;
-    float e = p[0].w * (p[1].x != 0 ? nowexp.Load(int3(0, 0, 0)).r : 1);
+    float e = exposure();
     float3 x = lin(c) * e;
+    if (p[3].y > 0) x = lerp(x, lastexp.SampleLevel(ls, i.uv, 0).rgb, p[3].y);  // the bloom (t2 in the resolve)
     float3 y = p[0].z == 1 ? agx(x) : aces(x);
     int test = int(p[1].w);
     if (test == 1 && i.uv.x > 0.5) y = lin(saturate(c));  // XBE_TONE_TEST=1: the right half as before
@@ -2977,6 +3011,7 @@ private:
     // it back with the exposure (auto exposure's eased in Target::tone_exp) and AgX or ACES
     VkFormat scene_fmt_ = kBgra;
     bool tone_drawn_ = false;  // this frame's scene was tone mapped: the style pass's own tone map left out
+    bool hdr_bloom_drawn_ = false;  // and bloomed from the float scene: the style pass's own bloom left out
     std::chrono::steady_clock::time_point tone_time_{};
     bool ToneBegin(Target& rt);
     void ToneResolve(Target& rt);
@@ -3066,6 +3101,8 @@ private:
         DropImage(t.hdr_scene);
         DropImage(t.hdr_res), DropImage(t.hdr_fb), DropImage(t.tone_meter);
         DropImage(t.tone_exp[0]), DropImage(t.tone_exp[1]);
+        for (Image& im : t.bloom_down) DropImage(im);
+        for (Image& im : t.bloom_up) DropImage(im);
     }
     // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
     // mod, read again when it changes), else the built-in kScenePostHlsl
@@ -7546,6 +7583,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
           bloom = st.mode == kStyleOriginal || st.mode == kStyleEnhanced ? QualityBloom(st) : 0.0f;
     if (st.mode == kStyleOriginal && st.quality_bloom) g.bloom_threshold = 0.85f;
     if (tone_drawn_) g.tonemap = kToneOff, g.exposure = 1;
+    if (tone_drawn_ && hdr_bloom_drawn_) bloom = 0;
     float c[44] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
                    g.exposure, float(g.tonemap), g.contrast, g.saturation,
                    g.temperature, g.sharpen, bloom, g.bloom_threshold,
@@ -7977,9 +8015,57 @@ void VulkanBackend::ToneResolve(Target& rt) {
         End();
         Barrier();
     }
+    // HDR bloom (the Bloom setting or the style's): the float scene's light past white, down six levels and up again
+    hdr_bloom_drawn_ = false;
+    const float bloom = st.mode == kStyleOriginal || st.mode == kStyleEnhanced ? QualityBloom(st) : 0.0f;
+    if (bloom > 0) {
+        uint64_t d0h, dh, uh;
+        VkPipeline pd0 = VK_NULL_HANDLE, pd = VK_NULL_HANDLE, pu = VK_NULL_HANDLE;
+        if (Compile(kToneHlsl, "bdown0", "ps_5_0", d0h) && Compile(kToneHlsl, "bdown", "ps_5_0", dh) &&
+            Compile(kToneHlsl, "bup", "ps_5_0", uh)) {
+            pd0 = PassPipeline({vh, d0h, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+            pd = PassPipeline({vh, dh, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+            pu = PassPipeline({vh, uh, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+        }
+        bool made = pd0 && pd && pu;
+        uint32_t bw[6], bh[6];
+        for (int l = 0; l < 6 && made; l++) {
+            bw[l] = std::max(1u, rt.w >> (l + 1)), bh[l] = std::max(1u, rt.h >> (l + 1));
+            for (Image* im : {&rt.bloom_down[l], l < 5 ? &rt.bloom_up[l] : nullptr}) {
+                if (!im) continue;
+                if (im->img && (im->w != bw[l] || im->h != bh[l])) DropImage(*im);
+                made = made && (im->img || MakeImage(*im, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, bw[l], bh[l],
+                                                     1, 1, 1, u));
+            }
+        }
+        if (made) {
+            auto pass = [&](VkPipeline p, Image& dst, VkImageView a, VkImageView b, float sw, float sh) {
+                float cb[16];
+                std::memcpy(cb, c, sizeof(cb));
+                cb[14] = 1.0f / sw, cb[15] = 1.0f / sh;
+                VkViewport bvp{0, 0, float(dst.w), float(dst.h), 0, 1};
+                VkRect2D bsc{{0, 0}, {dst.w, dst.h}};
+                VkImageView bv[4] = {a, b, dummy_.view, st.auto_exposure ? now.view : dummy_.view};
+                FullScreen(p, {dst.att, VK_NULL_HANDLE, dst.w, dst.h}, bvp, bsc, cb, 16, bv, 4);
+                End();
+                Barrier();
+            };
+            pass(pd0, rt.bloom_down[0], rt.hdr_res.view, dummy_.view, float(rt.w), float(rt.h));
+            for (int l = 1; l < 6; l++)
+                pass(pd, rt.bloom_down[l], rt.bloom_down[l - 1].view, dummy_.view, float(bw[l - 1]), float(bh[l - 1]));
+            for (int l = 4; l >= 0; l--) {
+                const Image& below = l == 4 ? rt.bloom_down[5] : rt.bloom_up[l + 1];
+                pass(pu, rt.bloom_up[l], below.view, rt.bloom_down[l].view, float(below.w), float(below.h));
+            }
+            hdr_bloom_drawn_ = true;
+        }
+    }
+    // the bloom's share: the setting's 0.2 a gentle 4%
+    c[13] = hdr_bloom_drawn_ ? std::min(0.5f, bloom * 0.2f) : 0.0f;
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
-    VkImageView rv[4] = {rt.hdr_res.view, rt.tone_meter.view, dummy_.view, st.auto_exposure ? now.view : dummy_.view};
+    VkImageView rv[4] = {rt.hdr_res.view, rt.tone_meter.view, hdr_bloom_drawn_ ? rt.bloom_up[0].view : dummy_.view,
+                         st.auto_exposure ? now.view : dummy_.view};
     FullScreen(pr, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, rv, 4);
     End();
     dirty_ = true;
