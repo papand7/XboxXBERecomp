@@ -1083,10 +1083,36 @@ float4 ps(O i) : SV_Target {
     int test = int(p[10].x);
     if (test == 1) c *= 0.15;
     // the footprints
+    float3 W = toworld(viewpos(uv, zs));
+    // snow: bright, and no warmer or greener than it is blue (a moonlit snow is a deep blue; grass, dirt and wood are
+    // greener or warmer than blue)
+    float mx = max(c.r, max(c.g, c.b));
+    float snowy = saturate((luma(c) - 0.3) * 4) * saturate(1.2 - max(max(c.r, c.g) - c.b, 0) / max(mx, 1e-3) * 8);
+    // snow sparkle: a glint maybe in each cell of 1.5 cm fixed in the world, each a facet turned its own way that shows
+    // only when the view is near its mirror direction, so they twinkle as the view moves; on snowy ground facing up,
+    // within 25 m, outdoors, by how lit the snow is (past white: the bloom takes them)
+    if (!sky && !gun && p[10].y > 0 && snowy > 0 && zs < 25 && outdoors > 0) {
+        float3 N = normalize(cross(ddx(W), ddy(W)));
+        const float3 upw = float3(0, 1, 0);  // the world's up
+        float3 Vw = normalize(float3(p[2].w, p[3].w, p[4].w) - W);
+        if (dot(N, Vw) < 0) N = -N;
+        if (dot(N, upw) > 0.7) {
+            // cells across the ground (x and z), a point in each
+            float cs = 0.015 / unit;
+            float3 cell = float3(floor(W.xz / cs), 0).xzy;
+            float3 h = hash3(cell + 7919);
+            if (h.x < 0.5) {
+                float3 g = normalize(N * 3 + (hash3(cell * 5 + 31) * 2 - 1));  // the facet, about the surface's
+                float3 Hv = normalize(Vw + upw);  // half way between the view and the light from above
+                float glint = pow(saturate(dot(g, Hv)), 200);
+                float2 at = (cell.xz + 0.2 + 0.6 * hash3(cell * 7 + 101).xy) * cs;
+                float rm = max(0.003, zs * 2 * p[0].z * p[0].y * 1.3);  // a point: a few mm, or about two pixels far off
+                float pt = saturate(1 - length(W.xz - at) * unit / rm);
+                c += glint * pt * (1.5 + 6.0 * saturate(luma(c))) * float3(0.9, 0.95, 1.0) * outdoors * snowy;
+            }
+        }
+    }
     if (!sky && !gun && p[9].w > 0) {
-        float3 W = toworld(viewpos(uv, zs));
-        float mx = max(c.r, max(c.g, c.b)), mn = min(c.r, min(c.g, c.b));
-        float snowy = saturate((luma(c) - 0.3) * 4) * saturate(1.2 - (mx - mn) / max(mx, 1e-3) * 5);
         if (test == 2) snowy = 1;
         float m = 0, rim = 0, wall = 0;
         if (snowy > 0) {
@@ -1175,7 +1201,7 @@ float4 ps(O i) : SV_Target {
             c = lerp(c, snowc * 0.75, haze);
         }
     }
-    return float4(saturate(c), 1);
+    return float4(max(c, 0), 1);  // past white kept (the HDR scene; an 8 bit target clamps it)
 }
 )";
 
@@ -7725,7 +7751,7 @@ void VulkanBackend::WeatherPass(Target& rt, Target* ds) {
                                 m[2][0], m[2][1], m[2][2], m[2][3],
                                 wind * std::cos(around), wind * std::sin(around), 1.1f + 0.4f * std::max(0.0f, st.snow_amount - 1.0f), outdoors,
                                 bright * 0.95f, bright * 0.97f, bright, float(np),
-                                float(test), 0, 0, 0};
+                                float(test), st.snow_sparkle ? 1.0f : 0.0f, 0, 0};
     std::memcpy(cb.data(), head, sizeof(head));
     for (uint32_t i = 0; i < np; i++) std::memcpy(&cb[(16 + i) * 4], nearby[i].v, sizeof(nearby[i].v));
     End();

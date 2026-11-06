@@ -118,6 +118,7 @@ struct GraphicsStyle {
     int weather = 0;           // 0 off, 1 on snowy levels (their ground mostly snow), 2 everywhere outdoors
     float snow_amount = 1.0f;  // 0.25 to 3 (3 a blizzard)
     bool footprints = true;
+    bool snow_sparkle = true;  // tiny glints on the snowy ground near the view, twinkling as it moves
     // blood (every style and renderer, drawn over the picture: app/blood.cpp): a spray where a player's shot hits a
     // character, and red at the edges of a player's view as they are hit, fading
     bool blood = false;

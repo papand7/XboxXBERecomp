@@ -110,7 +110,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "effect_lights", "light_strength", "atmosphere", "shaft_strength", "fog_strength", "bounce_light", "bounce_strength",
                                   "materials", "material_strength", "surface_depth", "relief_high", "displacement", "displace_depth",
                                   "ground_detail", "detail_strength", "detail_distance",
-                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "blood",
+                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "snow_sparkle", "blood",
                                   "depth_of_field", "dof_strength", "hdr_tonemap", "auto_exposure",
                                   "motion_blur", "motion_blur_strength"};
     for (auto&& [k, v] : t) {
@@ -205,6 +205,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     integer("weather", s.weather);
     num("snow_amount", s.snow_amount);
     flag("footprints", s.footprints);
+    flag("snow_sparkle", s.snow_sparkle);
     flag("blood", s.blood);
     named("depth_of_field", s.dof, kDofNames, 3);
     num("dof_strength", s.dof_strength);
@@ -283,6 +284,7 @@ toml::table Write(const GraphicsStyle& s) {
                        {"weather", s.weather},
                        {"snow_amount", double(s.snow_amount)},
                        {"footprints", s.footprints},
+                       {"snow_sparkle", s.snow_sparkle},
                        {"blood", s.blood},
                        {"depth_of_field", kDofNames[s.dof]},
                        {"dof_strength", double(s.dof_strength)},
@@ -569,6 +571,7 @@ void ApplyPreset(const StylePreset& p) {
     g_style.weather = keep.weather;
     g_style.snow_amount = keep.snow_amount;
     g_style.footprints = keep.footprints;
+    g_style.snow_sparkle = keep.snow_sparkle;
     g_style.blood = keep.blood;
     g_style.dof = keep.dof;
     g_style.dof_strength = keep.dof_strength;
@@ -893,6 +896,7 @@ void DrawStyleSettings(bool vulkan) {
         if (ImGui::Combo("Snow", &w, "Off\0Snowy levels\0Everywhere outdoors\0")) s.weather = w, changed = true;
         changed |= ImGui::SliderFloat("Snowfall", &s.snow_amount, 0.25f, 3.0f, "%.2f");
         changed |= ImGui::Checkbox("Footprints in the snow", &s.footprints);
+        changed |= ImGui::Checkbox("Snow sparkle", &s.snow_sparkle);
         ImGui::TextDisabled("Falling snow and footprints (Vulkan; kept from under roofs with ray tracing).");
     }
     if (ImGui::CollapsingHeader("Materials (PBR)", ImGuiTreeNodeFlags_DefaultOpen)) {
