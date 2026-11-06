@@ -991,13 +991,15 @@ float4 comp(O i) : SV_Target {
 // averages the scene's colour over a disc about each pixel (16 golden-angle taps, about 2 m across at its distance),
 // each tap by how near its distance is to the pixel's; comp lights the scene by it in its colour (the gathered light's
 // own brightness mostly taken out, so a room takes its colour more than it brightens). b1 p: [0] 1/width, 1/height,
-// strength, W-buffer; [1] aspect, seconds, test (XBE_GI_TEST=1 the left half with it, 2 the gathered light alone).
-// t0 the scene, t1 its depth, t2 the gathered light; s0 linear, s1 point
+// strength, W-buffer; [1] aspect, seconds, test (XBE_GI_TEST=1 the left half with it, 2 the gathered light alone),
+// the kept depth is there. t0 the scene, t1 its depth, t2 the gathered light, t3 the depth kept at a mid-frame clear
+// (RtKeepDepth: the world's, the end's holds the gun alone); s0 linear, s1 point
 const char* kBounceHlsl = R"(
 cbuffer P : register(b1) { float4 p[2]; };
 Texture2D scene : register(t0);
 Texture2D<float> depthtex : register(t1);
 Texture2D gathered : register(t2);
+Texture2D<float> keptz : register(t3);
 SamplerState ls : register(s0);
 SamplerState pt : register(s1);
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -1010,10 +1012,14 @@ O vs(uint id : SV_VertexID) {
 }
 float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 float viewz(float d) { return p[0].w != 0 ? d * 4096 : 1.0 / max(1.0 - d, 1e-6); }
+float depthat(float2 uv) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    return p[1].w != 0 ? min(d, keptz.SampleLevel(pt, uv, 0)) : d;
+}
 float noise(float2 v) { return frac(sin(dot(v, float2(12.9898, 78.233))) * 43758.5453); }
 float4 gather(O i) : SV_Target {
     float2 uv = i.uv;
-    float d = depthtex.SampleLevel(pt, uv, 0);
+    float d = depthat(uv);
     if (d >= 0.99999) return 0;
     float z = viewz(d);
     float r = clamp(0.866 * 1.0 / max(z, 0.1), 0.015, 0.22);  // a 1 m radius on screen (60 degrees tall)
@@ -1024,7 +1030,7 @@ float4 gather(O i) : SV_Target {
         float a = (k + j) * 2.39996, rr = r * sqrt((k + 0.5) / 16);
         float2 q = uv + float2(cos(a) / p[1].x, sin(a)) * rr;
         if (any(q < 0) || any(q > 1)) continue;
-        float ds = depthtex.SampleLevel(pt, q, 0);
+        float ds = depthat(q);
         if (ds >= 0.99999) continue;
         float w = saturate(1 - abs(viewz(ds) - z) / (z * 0.5 + 0.5));
         sum += scene.SampleLevel(ls, q, 0).rgb * w;
@@ -1035,7 +1041,7 @@ float4 gather(O i) : SV_Target {
 float4 comp(O i) : SV_Target {
     float2 uv = i.uv;
     float3 c = scene.SampleLevel(pt, uv, 0).rgb;
-    float d = depthtex.SampleLevel(pt, uv, 0);
+    float d = depthat(uv);
     int test = int(p[1].z);
     float3 g = gathered.SampleLevel(ls, uv, 0).rgb;
     if (test == 2) return float4(g, 1);
@@ -1506,7 +1512,9 @@ float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {
 // light grows with its distance squared (what covers a tile far away is larger), falls off with the square of the
 // distance to the surface; the scene's own colour is what it lights. p[0] the glow's size, the lights listed (w); p[1] strength,
 // tan of half the vertical view, width / height, W-buffer; p[2] the tiles across and down, the least brightness, the
-// test view; p[3] 1 / width, 1 / height, the lights' power. t0 the scene (or the glow), t1 its depth, t2 t3 the tiles.
+// test view; p[3] 1 / width, 1 / height, the lights' power, the kept depth is there. t0 the scene (or the glow), t1
+// its depth, t2 t3 the tiles (light: t3 the depth kept at a mid-frame clear, RtKeepDepth: the world's, the end's holds
+// the gun alone).
 const char* kLightsHlsl = R"(
 cbuffer P : register(b1) { float4 p[4]; };
 // RT (GraphicsStyle::rt_shadows; kRtCommonHlsl before it): each light's ray from the surface, against the frame's
@@ -1563,11 +1571,15 @@ float4 pick(O i) : SV_Target {
 }
 float viewz(float d) { return p[1].w != 0 ? d * 4096 : 1.0 / max(1.0 - d, 1e-6); }
 float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[1].z, -1) * p[1].y * z, z); }
-float3 at(float2 uv) { return viewpos(uv, viewz(t1.SampleLevel(pt, uv, 0))); }
+float depthat(float2 uv) {
+    float d = t1.SampleLevel(pt, uv, 0);
+    return p[3].w != 0 ? min(d, t3.SampleLevel(pt, uv, 0).r) : d;
+}
+float3 at(float2 uv) { return viewpos(uv, viewz(depthat(uv))); }
 float4 light(O i) : SV_Target {
     float2 uv = i.uv, px = p[3].xy;
     float3 c = t0.SampleLevel(pt, uv, 0).rgb;
-    float d = t1.SampleLevel(pt, uv, 0);
+    float d = depthat(uv);
     if (p[2].w == 2) {  // XBE_LIGHT_TEST=2: the listed lights as dots where they are
         float3 m = 0;
         [loop] for (int n = 0; n < int(p[0].w); n++) {
@@ -1607,7 +1619,9 @@ float4 light(O i) : SV_Target {
                 ray.TMin = 0;
                 ray.TMax = dl * 0.92;
                 RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-                q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+                // the world's rays leave the gun out (it reaches into walls), the gun's meet it (masks: world 1, gun 2)
+                bool gun = p[3].w != 0 && t1.SampleLevel(pt, uv, 0) < t3.SampleLevel(pt, uv, 0).r - 1e-6;
+                q.TraceRayInline(tlas, RAY_FLAG_NONE, gun ? 0xFF : 1, ray);
                 RT_PROCEED(q)
                 if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) e = 0;
             }
@@ -2047,6 +2061,11 @@ private:
     void BouncePass(Target& rt, Target* ds);      // bounced light (GraphicsStyle::bounce_light)
     void DofPass(Target& rt, Target* ds);         // depth of field (GraphicsStyle::dof)
     bool DofWanted() const { return Style().dof != kDofOff && Style().mode != kStyleRetro; }
+    // the scene's passes that read the world's distance (the depth kept at the mid-frame clear, RtKeepDepth)
+    bool KeptDepthWanted() const {
+        const GraphicsStyle& st = Style();
+        return DofWanted() || (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light));
+    }
     float dof_aim_ = 0;          // aiming down the sights, eased 0 to 1
     uint32_t scene_zwrites_ = 0;  // the frame's 3D draws that wrote the scene's depth
     // ray tracing (GraphicsStyle::ray_tracing): the 3D scene's opaque draws write their vertices' places in the view
@@ -3791,7 +3810,7 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
         if (!t->depth && LatchCpuWrite(*t)) UploadTarget(*t, s.rt);
         // the scene's depth cleared after its traced draws (for the gun): kept for the ray traced passes
         if (t == ds && (flags & kClearZ) && t == scene_ds_ && !post_done_ &&
-            ((rt_used_ && RtWanted()) || (scene_zwrites_ && DofWanted())))
+            ((rt_used_ && RtWanted()) || (scene_zwrites_ && KeptDepthWanted())))
             RtKeepDepth(*t);
         ClearRects(*t, rs, flags, col, std::clamp(z, 0.0f, 1.0f), stencil);
         t->drawn = true;
@@ -5227,6 +5246,8 @@ void VulkanBackend::LightPass(Target& rt, Target* ds) {
                    st.light_strength, 0.5774f, float(rt.w) / float(rt.h), scene_wbuf_ ? 1.0f : 0.0f,
                    float(kLightTilesX), float(kLightTilesY), 0.002f, float(test),
                    1.0f / rt.w, 1.0f / rt.h, 3000.0f, 0};
+    bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    c[15] = kept ? 1.0f : 0.0f;
     End();
     if (dirty_) Barrier();
     VkViewport tv{0, 0, float(kLightTilesX), float(kLightTilesY), 0, 1};
@@ -5249,7 +5270,7 @@ void VulkanBackend::LightPass(Target& rt, Target* ds) {
     dirty_ = true;
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
-    VkImageView views[4] = {rt.fb.view, ds->res.view, rt.light_list.view, VK_NULL_HANDLE};
+    VkImageView views[4] = {rt.fb.view, ds->res.view, rt.light_list.view, kept ? ds->rt_depth.view : ds->res.view};
     FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4,
                traced ? rt_[frame_slot_].tlas : VK_NULL_HANDLE);
     End();
@@ -5982,18 +6003,20 @@ void VulkanBackend::BouncePass(Target& rt, Target* ds) {
     vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     dirty_ = true;
     Barrier();
+    bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    VkImageView keptv = kept ? ds->rt_depth.view : ds->res.view;
     float c[8] = {1.0f / rt.w, 1.0f / rt.h, st.bounce_strength, scene_wbuf_ ? 1.0f : 0.0f,
-                  float(rt.w) / float(rt.h), float(presents_ % 3600) / 60.0f, float(test), 0};
-    VkImageView gv[2] = {rt.fb.view, ds->res.view};
+                  float(rt.w) / float(rt.h), float(presents_ % 3600) / 60.0f, float(test), kept ? 1.0f : 0.0f};
+    VkImageView gv[4] = {rt.fb.view, ds->res.view, dummy_.view, keptv};
     VkViewport gvp{0, 0, float(gw), float(gh2), 0, 1};
     VkRect2D gsc{{0, 0}, {gw, gh2}};
-    FullScreen(pg, {rt.bounce.att, VK_NULL_HANDLE, gw, gh2}, gvp, gsc, c, 8, gv, 2);
+    FullScreen(pg, {rt.bounce.att, VK_NULL_HANDLE, gw, gh2}, gvp, gsc, c, 8, gv, 4);
     End();
     Barrier();
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
-    VkImageView views[3] = {rt.fb.view, ds->res.view, rt.bounce.view};
-    FullScreen(pc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 8, views, 3);
+    VkImageView views[4] = {rt.fb.view, ds->res.view, rt.bounce.view, keptv};
+    FullScreen(pc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 8, views, 4);
     End();
     static bool said = false;
     if (!said) said = true, LOGR("vulkan: bounced light drawn (strength %.2f)", st.bounce_strength);
