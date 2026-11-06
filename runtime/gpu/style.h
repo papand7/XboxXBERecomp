@@ -19,6 +19,7 @@ enum Quality : int { kQualityLow, kQualityMedium, kQualityHigh, kQualityUltra, k
 enum Reflections : int { kReflectOff, kReflectLow, kReflectHigh, kReflectLevels };
 // depth of field: off, the distance blurred, focus on what is in the middle of the view
 enum DepthOfField : int { kDofOff, kDofDistance, kDofFocus, kDofModes };
+enum HdrTonemap : int { kHdrToneOff, kHdrToneAgx, kHdrToneAces, kHdrTones };
 
 struct GraphicsStyle {
     std::string preset = "original";  // the preset the values came from ("" once edited)
@@ -125,6 +126,12 @@ struct GraphicsStyle {
     // farther blurred, more while aiming down the sights (SetAiming)
     int dof = kDofOff;
     float dof_strength = 1.0f;  // 0 to 2
+    // HDR tone mapping (Vulkan; every style but Retro): the scene's effects (ray traced and effect lights, bounce,
+    // fog, snow) drawn in 16 bit float, so what they light past white is kept, then brought to the screen by AgX or
+    // ACES (the Enhanced style's own tone map then left out); auto exposure eases the exposure toward the scene's
+    // brightness, as an eye adapts (only partly: a night stays darker than a day)
+    int hdr_tonemap = kHdrToneOff;
+    bool auto_exposure = false;
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;

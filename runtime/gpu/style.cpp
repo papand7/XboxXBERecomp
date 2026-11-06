@@ -39,6 +39,7 @@ const char* kFilters[] = {"game", "nearest", "anisotropic"};
 const char* kTonemaps[] = {"off", "filmic", "reinhard"};
 const char* kReflectNames[] = {"off", "low", "high"};
 const char* kDofNames[] = {"off", "distance", "focus"};
+const char* kHdrToneNames[] = {"off", "agx", "aces"};
 
 std::filesystem::path StyleFile() { return app::ExeDir() / "graphics.toml"; }
 
@@ -87,6 +88,7 @@ void Clamp(GraphicsStyle& s) {
     s.snow_amount = std::clamp(s.snow_amount, 0.25f, 3.0f);
     s.dof = std::clamp(s.dof, 0, int(kDofModes) - 1);
     s.dof_strength = std::clamp(s.dof_strength, 0.0f, 2.0f);
+    s.hdr_tonemap = std::clamp(s.hdr_tonemap, 0, int(kHdrTones) - 1);
 }
 
 int Index(const std::string& v, const char* const* names, int n, int fallback) {
@@ -108,7 +110,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "materials", "material_strength", "surface_depth", "relief_high", "displacement", "displace_depth",
                                   "ground_detail", "detail_strength", "detail_distance",
                                   "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "blood",
-                                  "depth_of_field", "dof_strength"};
+                                  "depth_of_field", "dof_strength", "hdr_tonemap", "auto_exposure"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -204,6 +206,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("blood", s.blood);
     named("depth_of_field", s.dof, kDofNames, 3);
     num("dof_strength", s.dof_strength);
+    named("hdr_tonemap", s.hdr_tonemap, kHdrToneNames, 3);
+    flag("auto_exposure", s.auto_exposure);
     Clamp(s);
 }
 
@@ -277,7 +281,9 @@ toml::table Write(const GraphicsStyle& s) {
                        {"footprints", s.footprints},
                        {"blood", s.blood},
                        {"depth_of_field", kDofNames[s.dof]},
-                       {"dof_strength", double(s.dof_strength)}};
+                       {"dof_strength", double(s.dof_strength)},
+                       {"hdr_tonemap", kHdrToneNames[s.hdr_tonemap]},
+                       {"auto_exposure", s.auto_exposure}};
 }
 
 // the built-in presets
@@ -560,6 +566,8 @@ void ApplyPreset(const StylePreset& p) {
     g_style.blood = keep.blood;
     g_style.dof = keep.dof;
     g_style.dof_strength = keep.dof_strength;
+    g_style.hdr_tonemap = keep.hdr_tonemap;
+    g_style.auto_exposure = keep.auto_exposure;
     StyleChanged();
 }
 
@@ -628,7 +636,7 @@ bool StylePassWanted() {
 bool ScenePassWanted() {
     return StylePassWanted() ||
            ((app::Get().smaa || g_style.effect_lights || g_style.atmosphere || g_style.bounce_light || g_style.dof ||
-             g_style.weather ||
+             g_style.weather || g_style.hdr_tonemap ||
              (g_style.ray_tracing && g_ray_tracing.load())) &&
             g_style.mode != kStyleRetro);
 }
@@ -838,6 +846,13 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::SliderFloat("Blur", &s.dof_strength, 0.0f, 2.0f, "%.2f");
         ImGui::TextDisabled("Distance: far scenery soft. Focus: what the crosshair is on sharp, nearer and farther\n"
                             "soft, more while aiming down the sights. The gun stays sharp (Vulkan; not in Retro).");
+    }
+    if (ImGui::CollapsingHeader("HDR tone mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int h = s.hdr_tonemap;
+        if (ImGui::Combo("Tone mapping (HDR)", &h, "Off\0AgX\0ACES\0")) s.hdr_tonemap = h, changed = true;
+        changed |= ImGui::Checkbox("Auto exposure", &s.auto_exposure);
+        ImGui::TextDisabled("The effects' light kept past white, then rolled off by AgX or ACES; auto exposure\n"
+                            "adapts to the scene's brightness (Vulkan; not in Retro).");
     }
     changed |= ImGui::Checkbox("Blood where shots hit, and at the view's edges when you are hit", &s.blood);
     if (ImGui::CollapsingHeader("Ray tracing", ImGuiTreeNodeFlags_DefaultOpen)) {

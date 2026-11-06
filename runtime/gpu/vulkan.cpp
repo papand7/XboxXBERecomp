@@ -164,6 +164,7 @@ namespace {
     X(vkCmdCopyBufferToImage)       \
     X(vkCmdCopyImageToBuffer)       \
     X(vkCmdCopyImage)               \
+    X(vkCmdBlitImage)               \
     X(vkCmdClearAttachments)        \
     X(vkCmdBeginQuery)              \
     X(vkCmdWriteTimestamp2)         \
@@ -497,6 +498,10 @@ struct Target {
     uint64_t dof_frame = 0;  // the frame (presents_ + 1) it was last drawn for
     uint64_t glow_frame = 0;
     Image hdr_scene;  // HDR: the scene as the scene pass left it (before the HUD), of the frame hdr_frame
+    // HDR tone mapping: the scene in 16 bit float and its copy (swapped with res and fb while the passes draw), the
+    // brightness metered on a 64 x 36 grid, the exposure this frame and the last in turn
+    Image hdr_res, hdr_fb, tone_meter, tone_exp[2];
+    uint64_t tone_frame = 0;
     uint64_t hdr_frame = 0;
 };
 
@@ -998,12 +1003,12 @@ float4 comp(O i) : SV_Target {
     float fog = sky || p[1].x == 0 ? 0 : (1 - exp(-z * p[2].x)) * p[0].w;
     float3 orig = c;
     c = lerp(c, skyc, saturate(fog));
-    c += sh * (sky ? 0.35 : 1.0) * (1 - luma(c) * 0.8);  // into the darks more than over what is bright already
+    c += sh * (sky ? 0.35 : 1.0) * (1 - saturate(luma(c)) * 0.8);  // into the darks more than over what is bright already
     int test = int(p[3].x);
     if (test == 1 && uv.x > 0.5) c = orig;              // XBE_ATMO_TEST=1: the left half with them, the right without
     if (test == 2) c = float3(saturate(fog), saturate(z / 200), sky ? 1 : 0);  // 2: the fog (r), distance / 200 (g)
     if (test == 3) c = sh;                               // 3: the shafts alone
-    return float4(saturate(c), 1);
+    return float4(max(c, 0), 1);
 }
 )";
 
@@ -1360,7 +1365,7 @@ float4 comp(O i) : SV_Target {
     // the surroundings' light in their colour, their brightness mostly taken out: a tint, a little light
     float3 tint = g - luma(g) * 0.7;
     float3 lit = c * (1 + tint * 2.2 * p[0].z) + c * luma(g) * 0.25 * p[0].z;
-    return float4(saturate(lit), 1);
+    return float4(max(lit, 0), 1);
 }
 )";
 
@@ -1374,6 +1379,94 @@ float4 comp(O i) : SV_Target {
 // is there, the last frame's focus is there, its ease; [3] test (XBE_DOF_TEST=1 the left half with it, 2 the blur:
 // white the most, blue the gun, red the focus point). t0 the scene, t1 its depth, t2 the kept depth, t3 the focus
 // (the last frame's for focus); s0 linear, s1 point
+// HDR tone mapping (GraphicsStyle::hdr_tonemap): the scene as the passes left it in 16 bit float (the game's
+// colours, gamma encoded, past 1 where the effects lit them so), metered, exposed and brought to the screen.
+// b1 p[4]: [0] 1/width, 1/height, curve (1 AgX, 2 ACES), exposure; [1] auto exposure, a last exposure, the ease
+// (0 to 1), test; [2] the meter's width and height, how much of the way to mid grey, the darkest exposure; [3] the
+// brightest. t0 the scene, t1 the meter, t2 the last exposure, t3 this frame's.
+const char* kToneHlsl = R"(
+cbuffer P : register(b1) { float4 p[4]; };
+Texture2D scene : register(t0);
+Texture2D meterz : register(t1);
+Texture2D lastexp : register(t2);
+Texture2D nowexp : register(t3);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+float3 lin(float3 c) { return pow(max(c, 0), 2.2); }
+// a cell's brightness: the mean of 16 samples' log2
+float4 meter(O i) : SV_Target {
+    float2 cell = floor(i.uv * p[2].xy);
+    float s = 0;
+    [unroll] for (int y = 0; y < 4; y++)
+        [unroll] for (int x = 0; x < 4; x++)
+            s += log2(max(luma(lin(scene.SampleLevel(ls, (cell + (float2(x, y) + 0.5) / 4) / p[2].xy, 0).rgb)), 1e-4));
+    return float4(s / 16, 0, 0, 1);
+}
+// the exposure: toward what brings the scene's mean (its middle counting most) part of the way to mid grey, eased
+float4 adapt(O i) : SV_Target {
+    int2 n = int2(p[2].xy);
+    float s = 0, ws = 0;
+    for (int y = 0; y < n.y; y++)
+        for (int x = 0; x < n.x; x++) {
+            float2 uv = (float2(x, y) + 0.5) / p[2].xy;
+            float w = max(1.6 - 2 * length((uv - 0.5) * float2(1, 0.8)), 0.2);
+            s += meterz.Load(int3(x, y, 0)).r * w;
+            ws += w;
+        }
+    float mean = s / ws;
+    float want = clamp(exp2((log2(0.18) - mean) * p[2].z), p[2].w, p[3].x);
+    float was = p[1].y != 0 ? lastexp.Load(int3(0, 0, 0)).r : want;
+    float e = exp2(lerp(log2(max(was, 1e-3)), log2(want), p[1].z));
+    return float4(e, exp2(mean), want, 1);
+}
+// AgX (Sobotka's, the minimal fit): into its space, log2 between its bounds, the curve, back out
+float3 agxcurve(float3 x) {
+    float3 x2 = x * x, x4 = x2 * x2;
+    return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+}
+float3 agx(float3 v) {
+    const float3x3 into = float3x3(0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+                                   0.0784335999999992, 0.878468636469772, 0.0784336,
+                                   0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+    const float3x3 back = float3x3(1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+                                   -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+                                   -0.0990297440797205, -0.0989611768448433, 1.15107367264116);
+    const float lo = -12.47393, hi = 4.026069;
+    v = mul(max(v, 1e-10), into);
+    v = (clamp(log2(v), lo, hi) - lo) / (hi - lo);
+    v = agxcurve(v);
+    // a little more contrast and colour than AgX's base: the game's look is a saturated one
+    float l = luma(v);
+    v = pow(max(v, 0), 1.1);
+    v = l + (v - l) * 1.15;
+    return lin(mul(v, back));
+}
+// ACES (Narkowicz's fit), mid grey kept where it was
+float3 aces(float3 a) {
+    a *= 0.72;
+    return saturate((a * (2.51 * a + 0.03)) / (a * (2.43 * a + 0.59) + 0.14));
+}
+float4 resolve(O i) : SV_Target {
+    float3 c = scene.SampleLevel(pt, i.uv, 0).rgb;
+    float e = p[0].w * (p[1].x != 0 ? nowexp.Load(int3(0, 0, 0)).r : 1);
+    float3 x = lin(c) * e;
+    float3 y = p[0].z == 1 ? agx(x) : aces(x);
+    int test = int(p[1].w);
+    if (test == 1 && i.uv.x > 0.5) y = lin(saturate(c));  // XBE_TONE_TEST=1: the right half as before
+    if (test == 2 && i.uv.x > 0.5) y = saturate(lin(c) - 1) * 0.5;  // 2: the right half what is past white
+    return float4(pow(saturate(y), 1.0 / 2.2), 1);
+}
+)";
+
 const char* kDofHlsl = R"(
 cbuffer P : register(b1) { float4 p[4]; };
 Texture2D scene : register(t0);
@@ -2042,7 +2135,7 @@ float4 volc(O i) : SV_Target {
     b = wsum > 0 ? b / wsum : gitex.SampleLevel(pt, uv, 0).rgb;
     if (int(p[1].z) == 8) return float4(saturate(b * 2), 1);
     float T = exp(-kVolDensity * p[6].w * 0.5 * tmax);
-    return float4(saturate(c * T + b), 1);
+    return float4(max(c * T + b, 0), 1);
 }
 float4 ps(O i) : SV_Target {
     float2 uv = i.uv;
@@ -2102,7 +2195,7 @@ float4 ps(O i) : SV_Target {
     float3 fogc = p[4].rgb;
     float3 L = saturate((c - fogc * (1 - f)) / f);
     float3 relit = L * ratio;
-    return float4(saturate(lerp(fogc, relit, f)), 1);
+    return float4(max(lerp(fogc, relit, f), 0), 1);
 }
 )";
 
@@ -2750,6 +2843,14 @@ private:
     bool rt_full_ = false;
     bool rt_drawn_ = false;  // this frame's occlusion was traced: the screen-space one is left out
     bool gtao_drawn_ = false;  // this frame's ground truth occlusion was drawn: the style pass's left out
+    // HDR tone mapping (GraphicsStyle::hdr_tonemap): the scene's passes from the relighting to the weather draw into
+    // a 16 bit float copy (Target::hdr_res, swapped in for res), scene_fmt_ its format meanwhile; ToneResolve brings
+    // it back with the exposure (auto exposure's eased in Target::tone_exp) and AgX or ACES
+    VkFormat scene_fmt_ = kBgra;
+    bool tone_drawn_ = false;  // this frame's scene was tone mapped: the style pass's own tone map left out
+    std::chrono::steady_clock::time_point tone_time_{};
+    bool ToneBegin(Target& rt);
+    void ToneResolve(Target& rt);
     // snow (GraphicsStyle::weather): the frame's world triangles and those on snow (how snowy the level looks, eased),
     // the footprints made (in the world's units) and each player's last step
     bool WeatherWanted() const { return Style().weather != 0 && Style().mode != kStyleRetro; }
@@ -2827,6 +2928,8 @@ private:
         DropImage(t.rt_ao), DropImage(t.rt_depth), DropImage(t.rt_gi), DropImage(t.rt_vol), DropImage(t.gtao);
         DropImage(t.dof_focus[0]), DropImage(t.dof_focus[1]);
         DropImage(t.hdr_scene);
+        DropImage(t.hdr_res), DropImage(t.hdr_fb), DropImage(t.tone_meter);
+        DropImage(t.tone_exp[0]), DropImage(t.tone_exp[1]);
     }
     // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
     // mod, read again when it changes), else the built-in kScenePostHlsl
@@ -5905,7 +6008,7 @@ void VulkanBackend::RtPass(Target& rt, Target* ds) {
     PassKey tk{vh, th, kRtFormat, VK_FORMAT_UNDEFINED, 0, 0};
     tk.rt = 1;
     VkPipeline pt = PassPipeline(tk);
-    PassKey ck{vh, ch, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    PassKey ck{vh, ch, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0};
     ck.rt = 1;
     VkPipeline pc = PassPipeline(ck);
     if (!pt || !pc) return;
@@ -5914,7 +6017,7 @@ void VulkanBackend::RtPass(Target& rt, Target* ds) {
     if (!rt.rt_ao.img && !MakeImage(rt.rt_ao, VK_IMAGE_TYPE_2D, kRtFormat, hw, hh, 1, 1, 1,
                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
         return;
-    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return;
     float aspect = float(rt.w) / float(rt.h);
@@ -5973,11 +6076,11 @@ void VulkanBackend::RtReflectPass(Target& rt, Target* ds) {
         LOG_FIRST(1, "vulkan: the ray traced reflections did not compile; the screen-space ones are drawn");
         return;
     }
-    PassKey pk{vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    PassKey pk{vh, ph, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0};
     pk.rt = 1;
     VkPipeline pipe = PassPipeline(pk);
     if (!pipe) return;
-    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return;
     static const int test = [] {
@@ -6016,11 +6119,11 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
         LOG_FIRST(1, "vulkan: the ray traced level lighting did not compile; the level keeps its own");
         return;
     }
-    PassKey kp{vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    PassKey kp{vh, ph, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0};
     kp.rt = 1;
     VkPipeline pl = PassPipeline(kp);
     if (!pl) return;
-    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return;
     static const int test = [] {
@@ -6055,7 +6158,7 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
         if (!Compile(src, "vol", "ps_6_5", volh) || !Compile(src, "volc", "ps_6_5", volch)) {
             LOG_FIRST(1, "vulkan: the ray traced volumetric light did not compile; none drawn");
         } else {
-            PassKey kv{vh, volh, kGiFormat, VK_FORMAT_UNDEFINED, 0, 0}, kc{vh, volch, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+            PassKey kv{vh, volh, kGiFormat, VK_FORMAT_UNDEFINED, 0, 0}, kc{vh, volch, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0};
             kv.rt = kc.rt = 1;
             pvol = PassPipeline(kv);
             pvolc = PassPipeline(kc);
@@ -6337,7 +6440,7 @@ void VulkanBackend::LightPass(Target& rt, Target* ds) {
         static const std::string src = std::string("#define RT 1\n") + kRtCommonHlsl + kLightsHlsl;
         uint64_t tvh, th;
         if (Compile(src, "vs", "vs_6_5", tvh) && Compile(src, "light", "ps_6_5", th)) {
-            PassKey k{tvh, th, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+            PassKey k{tvh, th, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0};
             k.rt = 1;
             plt = PassPipeline(k);
         }
@@ -6348,14 +6451,14 @@ void VulkanBackend::LightPass(Target& rt, Target* ds) {
     VkPipeline pa = PassPipeline({vh, ah, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
     VkPipeline pb = PassPipeline({vh, bh, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
     VkPipeline pk = PassPipeline({vh, kh, kTileFormat, VK_FORMAT_UNDEFINED, 0, 0});
-    VkPipeline pl = traced ? plt : PassPipeline({vh, lh, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pl = traced ? plt : PassPipeline({vh, lh, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0});
     if (!pa || !pb || !pk || !pl) return;
     const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if ((!rt.light_a.img && !MakeImage(rt.light_a, VK_IMAGE_TYPE_2D, kTileFormat, kLightTilesX, kLightTilesY, 1, 1, 1, u)) ||
         (!rt.light_b.img && !MakeImage(rt.light_b, VK_IMAGE_TYPE_2D, kTileFormat, kLightTilesX, kLightTilesY, 1, 1, 1, u)) ||
         (!rt.light_list.img && !MakeImage(rt.light_list, VK_IMAGE_TYPE_2D, kTileFormat, kLights * 2, 1, 1, 1, 1, u)) ||
-        (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+        (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
         return;
     static const int test = [] {
@@ -7161,6 +7264,7 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     Stamp(2);
     rt_built_ = RtWanted() && ds && ds->w == rt.w && ds->h == rt.h && RtBuild(float(rt.w) / float(rt.h));
     rt_gi_drawn_ = false;
+    tone_drawn_ = Style().hdr_tonemap && Style().mode != kStyleRetro && ToneBegin(rt);
     if (rt_built_ && Style().rt_lighting) RtRelightPass(rt, ds);
     if (rt_built_ && Style().rt_ao > 0) RtPass(rt, ds);
     if (rt_built_) RtReflectPass(rt, ds);
@@ -7170,6 +7274,7 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     if (Style().bounce_light && Style().mode != kStyleRetro && !rt_gi_drawn_) BouncePass(rt, ds);
     if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds);
     if (WeatherWanted()) WeatherPass(rt, ds);
+    if (tone_drawn_) ToneResolve(rt);
     if (StylePassWanted()) StylePass(rt, ds);
     if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt);
     if (DofWanted()) DofPass(rt, ds);
@@ -7232,6 +7337,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
     float ao = rt_drawn_ || gtao_drawn_ ? 0.0f : QualityAo(st),
           bloom = st.mode == kStyleOriginal || st.mode == kStyleEnhanced ? QualityBloom(st) : 0.0f;
     if (st.mode == kStyleOriginal && st.quality_bloom) g.bloom_threshold = 0.85f;
+    if (tone_drawn_) g.tonemap = kToneOff, g.exposure = 1;
     float c[44] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
                    g.exposure, float(g.tonemap), g.contrast, g.saturation,
                    g.temperature, g.sharpen, bloom, g.bloom_threshold,
@@ -7281,11 +7387,11 @@ void VulkanBackend::WeatherPass(Target& rt, Target* ds) {
         LOG_FIRST(1, "vulkan: the snow did not compile; none drawn");
         return;
     }
-    PassKey kp{vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    PassKey kp{vh, ph, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0};
     kp.rt = traced ? 1 : 0;
     VkPipeline pl = PassPipeline(kp);
     if (!pl) return;
-    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return;
     // the level's camera (the most triangles), the world to the view (rows x, y, distance; RtRelightPass's place)
@@ -7412,14 +7518,14 @@ void VulkanBackend::GtaoPass(Target& rt, Target* ds) {
     }
     constexpr VkFormat kAoFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     VkPipeline pg = PassPipeline({vh, gh, kAoFormat, VK_FORMAT_UNDEFINED, 0, 0});
-    VkPipeline pc = PassPipeline({vh, ch, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pc = PassPipeline({vh, ch, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0});
     if (!pg || !pc) return;
     const uint32_t aw = std::max<uint32_t>(rt.w / 2, 1), ah = std::max<uint32_t>(rt.h / 2, 1);
     if (rt.gtao.img && (rt.gtao.w != aw || rt.gtao.h != ah)) DropImage(rt.gtao);
     if (!rt.gtao.img && !MakeImage(rt.gtao, VK_IMAGE_TYPE_2D, kAoFormat, aw, ah, 1, 1, 1,
                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
         return;
-    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return;
     static const int test = [] {
@@ -7469,14 +7575,14 @@ void VulkanBackend::BouncePass(Target& rt, Target* ds) {
     }
     constexpr VkFormat kBounceFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     VkPipeline pg = PassPipeline({vh, gh, kBounceFormat, VK_FORMAT_UNDEFINED, 0, 0});
-    VkPipeline pc = PassPipeline({vh, ch, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pc = PassPipeline({vh, ch, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0});
     if (!pg || !pc) return;
     uint32_t gw = std::max<uint32_t>(rt.w / 4, 1), gh2 = std::max<uint32_t>(rt.h / 4, 1);
     if (rt.bounce.img && (rt.bounce.w != gw || rt.bounce.h != gh2)) DropImage(rt.bounce);
     if (!rt.bounce.img && !MakeImage(rt.bounce, VK_IMAGE_TYPE_2D, kBounceFormat, gw, gh2, 1, 1, 1,
                                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
         return;
-    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return;
     static const int test = [] {
@@ -7573,6 +7679,107 @@ void VulkanBackend::DofPass(Target& rt, Target* ds) {
                                  st.dof_strength, kept ? "the gun kept sharp" : "no mid-frame clear seen");
 }
 
+// HDR tone mapping: the scene copied into 16 bit float (a blit converts) and swapped in for the target's own, so the
+// passes after draw there; false (the scene left as it is) when the images cannot be made
+bool VulkanBackend::ToneBegin(Target& rt) {
+    constexpr VkFormat kHdr = VK_FORMAT_R16G16B16A16_SFLOAT;
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    for (Image* im : {&rt.hdr_res, &rt.hdr_fb})
+        if (im->img && (im->w != rt.w || im->h != rt.h)) DropImage(*im);
+    if ((!rt.hdr_res.img && !MakeImage(rt.hdr_res, VK_IMAGE_TYPE_2D, kHdr, rt.w, rt.h, 1, 1, 1, u)) ||
+        (!rt.hdr_fb.img && !MakeImage(rt.hdr_fb, VK_IMAGE_TYPE_2D, kHdr, rt.w, rt.h, 1, 1, 1, u)))
+        return false;
+    End();
+    if (dirty_) Barrier();
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[1] = b.dstOffsets[1] = {int32_t(rt.w), int32_t(rt.h), 1};
+    vkCmdBlitImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.hdr_res.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                   VK_FILTER_NEAREST);
+    dirty_ = true;
+    std::swap(rt.res, rt.hdr_res);
+    std::swap(rt.fb, rt.hdr_fb);
+    scene_fmt_ = kHdr;
+    return true;
+}
+
+// the float scene back into the target: metered (auto exposure), exposed and tone mapped (kToneHlsl)
+void VulkanBackend::ToneResolve(Target& rt) {
+    End();
+    std::swap(rt.res, rt.hdr_res);
+    std::swap(rt.fb, rt.hdr_fb);
+    scene_fmt_ = kBgra;
+    const GraphicsStyle& st = Style();
+    uint64_t vh, mh, ah, rh;
+    if (!Compile(kToneHlsl, "vs", "vs_5_0", vh) || !Compile(kToneHlsl, "meter", "ps_5_0", mh) ||
+        !Compile(kToneHlsl, "adapt", "ps_5_0", ah) || !Compile(kToneHlsl, "resolve", "ps_5_0", rh)) {
+        LOG_FIRST(1, "vulkan: the tone mapping's passes did not compile; the scene is not tone mapped");
+        tone_drawn_ = false;
+        return;
+    }
+    constexpr VkFormat kMeterFormat = VK_FORMAT_R16G16B16A16_SFLOAT, kExpFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+    constexpr uint32_t kMw = 64, kMh = 36;
+    VkPipeline pm = PassPipeline({vh, mh, kMeterFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pa = PassPipeline({vh, ah, kExpFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pr = PassPipeline({vh, rh, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    bool ok = pm && pa && pr && (rt.tone_meter.img || MakeImage(rt.tone_meter, VK_IMAGE_TYPE_2D, kMeterFormat, kMw, kMh, 1, 1, 1, u));
+    for (Image& im : rt.tone_exp) ok = ok && (im.img || MakeImage(im, VK_IMAGE_TYPE_2D, kExpFormat, 1, 1, 1, 1, 1, u));
+    if (!ok) {
+        // the float scene copied back as it is
+        if (dirty_) Barrier();
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = b.dstOffsets[1] = {int32_t(rt.w), int32_t(rt.h), 1};
+        vkCmdBlitImage(Cmd(), rt.hdr_res.img, VK_IMAGE_LAYOUT_GENERAL, rt.res.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                       VK_FILTER_NEAREST);
+        dirty_ = true;
+        tone_drawn_ = false;
+        return;
+    }
+    static const int test = [] {
+        const char* e = std::getenv("XBE_TONE_TEST");
+        return e && *e >= '1' && *e <= '2' ? *e - '0' : 0;
+    }();
+    // the ease a frame: about a second and a half to most of the way, whatever the frame rate
+    auto now_t = std::chrono::steady_clock::now();
+    float dt = std::clamp(std::chrono::duration<float>(now_t - tone_time_).count(), 0.0f, 0.25f);
+    tone_time_ = now_t;
+    bool last = rt.tone_frame == presents_;
+    rt.tone_frame = presents_ + 1;
+    Image& now = rt.tone_exp[presents_ & 1];
+    const Image& was = rt.tone_exp[(presents_ + 1) & 1];
+    float c[16] = {1.0f / rt.w, 1.0f / rt.h, float(st.hdr_tonemap), st.exposure,
+                   st.auto_exposure ? 1.0f : 0.0f, last ? 1.0f : 0.0f, 1.0f - std::exp(-dt * 1.5f), float(test),
+                   float(kMw), float(kMh), 0.25f, 0.7f,
+                   1.3f, 0, 0, 0};
+    Barrier();
+    if (st.auto_exposure) {
+        VkViewport mvp{0, 0, float(kMw), float(kMh), 0, 1};
+        VkRect2D msc{{0, 0}, {kMw, kMh}};
+        VkImageView mv[1] = {rt.hdr_res.view};
+        FullScreen(pm, {rt.tone_meter.att, VK_NULL_HANDLE, kMw, kMh}, mvp, msc, c, 16, mv, 1);
+        End();
+        Barrier();
+        VkViewport evp{0, 0, 1, 1, 0, 1};
+        VkRect2D esc{{0, 0}, {1, 1}};
+        VkImageView ev[3] = {rt.hdr_res.view, rt.tone_meter.view, last ? was.view : dummy_.view};
+        FullScreen(pa, {now.att, VK_NULL_HANDLE, 1, 1}, evp, esc, c, 16, ev, 3);
+        End();
+        Barrier();
+    }
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView rv[4] = {rt.hdr_res.view, rt.tone_meter.view, dummy_.view, st.auto_exposure ? now.view : dummy_.view};
+    FullScreen(pr, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, rv, 4);
+    End();
+    dirty_ = true;
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: HDR tone mapping drawn (%s%s)", st.hdr_tonemap == kHdrToneAgx ? "AgX" : "ACES",
+                                 st.auto_exposure ? ", auto exposure" : "");
+}
+
 // light shafts and fog over the scene: what lights the air at a quarter size, halved four times to a field that
 // points to the light, then the scene marched toward it and fogged (kAtmoHlsl)
 void VulkanBackend::AtmospherePass(Target& rt, Target* ds) {
@@ -7588,7 +7795,7 @@ void VulkanBackend::AtmospherePass(Target& rt, Target* ds) {
     constexpr VkFormat kAtmoFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     VkPipeline ps = PassPipeline({vh, sh, kAtmoFormat, VK_FORMAT_UNDEFINED, 0, 0});
     VkPipeline pd = PassPipeline({vh, dh, kAtmoFormat, VK_FORMAT_UNDEFINED, 0, 0});
-    VkPipeline pc = PassPipeline({vh, ch, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pc = PassPipeline({vh, ch, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0});
     VkPipeline pk = PassPipeline({vh, kh, VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
     if (!ps || !pd || !pc || !pk) return;
     if (!rt.atmo_pick.img && !MakeImage(rt.atmo_pick, VK_IMAGE_TYPE_2D, VK_FORMAT_R32G32B32A32_SFLOAT, 5, 1, 1, 1, 1,
@@ -7601,7 +7808,7 @@ void VulkanBackend::AtmospherePass(Target& rt, Target* ds) {
         if (im.img && (im.w != w || im.h != h)) DropImage(im);
         if (!im.img && !MakeImage(im, VK_IMAGE_TYPE_2D, kAtmoFormat, w, h, 1, 1, 1, u)) return;
     }
-    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return;
     End();
