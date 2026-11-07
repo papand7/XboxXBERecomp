@@ -30,6 +30,8 @@ void Init();  // window thread, before boot
 #ifndef _WIN32
 // the window thread's SDL events (an SDL_Event*), each one: true when it was a controller plugged in or out, taken here
 bool HandleSdlEvent(const void* event);
+// the virtual key of an SDL scancode, as Windows' WM_KEYDOWN has it (either shift VK_SHIFT ...); 0 for none
+int VkOfScancode(int scancode);
 #endif
 // the controller on that port, then GameInfo::pad
 Pad Poll(int port);

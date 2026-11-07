@@ -1,4 +1,5 @@
 // the settings file beside the exe
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -6,6 +7,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include "core/vk_codes.h"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -36,6 +40,7 @@ constexpr uint32_t kMsaaCount = 4;
 const char* kRenderers[] = {"d3d12", "d3d11", "vulkan"};
 constexpr uint32_t kRendererCount = 3;
 
+#ifdef _WIN32
 // the displays in Windows' order
 std::vector<HMONITOR> MonitorList() {
     std::vector<HMONITOR> list;
@@ -45,6 +50,7 @@ std::vector<HMONITOR> MonitorList() {
     }, reinterpret_cast<LPARAM>(&list));
     return list;
 }
+#endif
 
 // keys by name in the settings file: letters, digits and these
 struct KeyName {
@@ -398,8 +404,14 @@ void Save() {
         g_unread = false;
         std::filesystem::path bak = file;
         bak += ".bak";
+#ifdef _WIN32
         if (!CopyFileW(file.c_str(), bak.c_str(), FALSE))
             LOGR("settings: %s not kept as .bak (%lu)", file.string().c_str(), GetLastError());
+#else
+        std::error_code ec;
+        if (!std::filesystem::copy_file(file, bak, std::filesystem::copy_options::overwrite_existing, ec))
+            LOGR("settings: %s not kept as .bak (%s)", file.string().c_str(), ec.message().c_str());
+#endif
     }
     // written beside it and moved over it: a failed write leaves the old file
     std::filesystem::path tmp = file;
@@ -410,14 +422,24 @@ void Save() {
         f.close();
         if (!f) {
             LOGR("settings: %s could not be written", tmp.string().c_str());
-            DeleteFileW(tmp.c_str());
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
             return;
         }
     }
+#ifdef _WIN32
     if (!MoveFileExW(tmp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         LOGR("settings: %s could not be replaced (%lu)", file.string().c_str(), GetLastError());
         DeleteFileW(tmp.c_str());
     }
+#else
+    std::error_code ec;
+    std::filesystem::rename(tmp, file, ec);  // rename(2) replaces it in one step
+    if (ec) {
+        LOGR("settings: %s could not be replaced (%s)", file.string().c_str(), ec.message().c_str());
+        std::filesystem::remove(tmp, ec);
+    }
+#endif
 }
 
 void LogSettings() {
@@ -429,6 +451,7 @@ void LogSettings() {
         if (!line.empty()) LOGR("  %s", line.c_str());
 }
 
+#ifdef _WIN32  // off Windows: SDL's displays, app/main_sdl.cpp
 void* Monitor() {
     uint32_t n = Get().monitor;
     if (n) {
@@ -465,6 +488,7 @@ Mode Desktop() {
         return {dm.dmPelsWidth, dm.dmPelsHeight};
     return {uint32_t(GetSystemMetrics(SM_CXSCREEN)), uint32_t(GetSystemMetrics(SM_CYSCREEN))};
 }
+#endif
 
 Mode Output() {
     const Settings& s = Get();

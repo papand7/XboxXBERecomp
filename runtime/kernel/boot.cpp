@@ -232,6 +232,7 @@ void Relaunch(const char* exe) {
     ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
     std::string path = std::string(self, n > 0 ? size_t(n) : 0);
     path = path.substr(0, path.find_last_of('/') + 1) + exe;
+    setenv("XBE_RELAUNCHED", "1", 1);  // no boot splash again (app/main_sdl.cpp); --instance stays as XBE_INSTANCE
     execl(path.c_str(), path.c_str(), nullptr);
     std::_Exit(0);
 #endif

@@ -326,6 +326,19 @@ bool KeyDown(int vk) {
     }
 }
 
+int VkOfScancode(int scancode) {
+    static const std::vector<uint8_t> table = [] {
+        std::vector<uint8_t> t(SDL_SCANCODE_COUNT, 0);
+        for (int vk = 1; vk < 256; vk++)
+            if (SDL_Scancode s = Scancode(vk); s != SDL_SCANCODE_UNKNOWN && !t[s]) t[s] = uint8_t(vk);
+        t[SDL_SCANCODE_LSHIFT] = t[SDL_SCANCODE_RSHIFT] = VK_SHIFT;
+        t[SDL_SCANCODE_LCTRL] = t[SDL_SCANCODE_RCTRL] = VK_CONTROL;
+        t[SDL_SCANCODE_LALT] = t[SDL_SCANCODE_RALT] = VK_MENU;
+        return t;
+    }();
+    return scancode > 0 && scancode < int(table.size()) ? table[size_t(scancode)] : 0;
+}
+
 bool GameFocused() {
     SDL_Window* w = static_cast<SDL_Window*>(app::Window());
     return w && (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS) != 0;

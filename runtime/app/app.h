@@ -159,7 +159,15 @@ struct GameFiles {
 };
 bool FindGame(GameFiles& game);
 int Instance();  // --instance N on the command line, 0 without: a second copy on this PC for system link tests
-void* Window();  // HWND
+void* Window();  // HWND (off Windows the SDL_Window*)
+#ifndef _WIN32
+// off Windows (app/main_sdl.cpp, SDL3): the Vulkan renderer's way into the window, and the displays
+std::vector<const char*> VulkanInstanceExtensions();  // the instance extensions the window's surface needs
+bool CreateVulkanSurface(void* instance, void* surface);  // a VkInstance, a VkSurfaceKHR* to fill; false logged
+void* VulkanGetInstanceProcAddr();  // the loader SDL opened for the window: a PFN_vkGetInstanceProcAddr
+void WindowPixels(uint32_t& width, uint32_t& height);  // the window's drawable size in pixels (GetClientRect's)
+std::vector<Mode> DisplayModes();  // the monitor setting's display's fullscreen sizes, widest first, each once
+#endif
 // leave the game as closing its window does (the settings window's Quit, a title's own quit item); from any thread
 void Quit();
 // boot splash: GameInfo::splash .bmp or .png beside the exe, up before the game window
