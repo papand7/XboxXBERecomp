@@ -1467,7 +1467,8 @@ float4 adapt(O i) : SV_Target {
             ws += w;
         }
     float mean = s / ws;
-    float want = clamp(exp2((log2(0.18) - mean) * p[2].z), p[2].w, p[3].x);
+    // a bright scene (a sunlit day, a white-lit room) taken down more firmly than a dark one is lifted
+    float want = clamp(exp2((log2(0.18) - mean) * p[2].z * (mean > log2(0.18) ? 1.8 : 1)), p[2].w, p[3].x);
     float was = p[1].y != 0 ? lastexp.Load(int3(0, 0, 0)).r : want;
     float e = exp2(lerp(log2(max(was, 1e-3)), log2(want), p[1].z));
     return float4(e, exp2(mean), want, 1);
@@ -6670,7 +6671,9 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
     }
     bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
     // the air's light by how bright the level is outdoors: a night's moonlit air glows a little, not as a day's fog
-    const float vol_day = (1.0f - 0.8f * known * (1.0f - ramp(bl, 0.15f, 0.6f))) * (1.0f - 0.7f * night);
+    // and a day whose own fog is already bright haze (a pale grey fog) gets little more: it would bleach to white
+    const float vol_day = (1.0f - 0.8f * known * (1.0f - ramp(bl, 0.15f, 0.6f))) * (1.0f - 0.7f * night) *
+                          (1.0f - 0.75f * ramp(fogl, 0.45f, 0.8f) * (1.0f - night));
     const float p[8 * 4] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
                             float(lights), kept ? 1.0f : 0.0f, float(test), fs.stats.buf ? 1.0f : 0.0f,
                             sun[0], sun[1], sun[2], st.rt_sun * power,
@@ -8428,7 +8431,7 @@ void VulkanBackend::ToneResolve(Target& rt) {
     const Image& was = rt.tone_exp[(presents_ + 1) & 1];
     float c[16] = {1.0f / rt.w, 1.0f / rt.h, float(st.hdr_tonemap), st.exposure,
                    st.auto_exposure ? 1.0f : 0.0f, last ? 1.0f : 0.0f, 1.0f - std::exp(-dt * 1.5f), float(test),
-                   float(kMw), float(kMh), 0.25f, 0.7f,
+                   float(kMw), float(kMh), 0.25f, 0.5f,
                    1.15f, 0, 0, 0};
     Barrier();
     if (st.auto_exposure) {
