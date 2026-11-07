@@ -2501,6 +2501,7 @@ float4 ps(O i) : SV_Target {
     float2 uv = i.uv;
     float3 c = scene.SampleLevel(pt, uv, 0).rgb;
     int test = int(p[1].z);
+    if (test == 11) return float4(c, 1);  // XBE_RT_TEST=11: the scene as it comes in, not relit
     if (test == 6) {
         for (int n = 0; n < int(p[1].x); n++) {
             float3 l = p[8 + 2 * n].xyz;
@@ -2541,8 +2542,10 @@ float4 ps(O i) : SV_Target {
         // a bright day's baked light already holds the sun: there full sun brings it back to itself and shade darkens
         // it (it multiplied it by a third more, and pale concrete went past white); a dim night's is as it was
         float full = p[5].w + 0.75 * p[2].w * dot(p[3].rgb, float3(0.3, 0.59, 0.11));
-        float k = lerp(1, 1 / max(full, 0.2), saturate((dot(baked, float3(0.3, 0.59, 0.11)) - 0.5) / 0.4));
-        ratio = (p[5].w + p[3].rgb * (0.75 * p[2].w * sl)) * k + added / max(baked, 0.04);
+        float day = saturate((dot(baked, float3(0.3, 0.59, 0.11)) - 0.5) / 0.4);
+        float k = lerp(1, 1 / max(full, 0.2), day);
+        // the game's lamps in daylight: drowned by it (at full strength they turned sunlit pale walls white)
+        ratio = (p[5].w + p[3].rgb * (0.75 * p[2].w * sl)) * k + added / max(baked, 0.04) * (1 - 0.85 * day);
 #if STATS
         if (p[1].w != 0 && all((uint2(i.pos.xy) & 7) == 0)) {  // the outdoor baked light added up (the sun's colour)
             uint3 b = uint3(min(baked, 4) * 64 + 0.5);
@@ -2553,7 +2556,8 @@ float4 ps(O i) : SV_Target {
         }
 #endif
     }
-    ratio = clamp(ratio, 0, 4);
+    // at most two and a half times the baked light: a dark wall by a lamp (its baked light small) went up to four times
+    ratio = clamp(ratio, 0, 2.5);
     if (test == 5 || test == 6) return float4(ratio * 0.5, 1);
     if (f < 0.03) return float4(c, 1);
     float3 fogc = p[4].rgb;
@@ -6708,7 +6712,8 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
         return;
     static const int test = [] {
         const char* e = std::getenv("XBE_RT_TEST");
-        return e && *e >= '5' && *e <= '8' ? *e - '0' : 0;
+        const int v = e ? std::atoi(e) : 0;
+        return (v >= 5 && v <= 8) || v == 11 ? v : 0;
     }();
     // the bounced light (rt_gi): traced at half the size into rt.rt_gi first
     constexpr VkFormat kGiFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
