@@ -22,7 +22,7 @@ EXE=${EXE:-$(basename "$GEN")}; GEN_OBJ=${GEN_OBJ:-$OUT/gen}; mkdir -p "$GEN_OBJ
 H=$(dirname "$(realpath "$0")"); RT=$REPO/sdk/runtime
 CXX=${CXX:-clang++}; JOBS=${JOBS:-$(nproc)}
 BASE="-std=c++20 -march=x86-64-v2 -fno-strict-aliasing"
-HOST="$BASE -O1 -g -I$REPO/src -I$RT -I$GEN -I$H -I$H/compat -DXBE_HEADLESS=1 -DXBE_RAW_VERTICES=${RAW:-0} -DXBE_RENDER_THREAD=${RT_THREAD:-0}"
+HOST="$BASE -O1 -g -I$REPO/src -I$RT -I$GEN -I$H -I$H/compat -I$RT/compat -DXBE_HEADLESS=1 -DXBE_RAW_VERTICES=${RAW:-0} -DXBE_RENDER_THREAD=${RT_THREAD:-0}"
 
 # generated code, an object rebuilt only when its partition is newer
 export CXX BASE RT GEN GEN_OBJ GEN_OPT
