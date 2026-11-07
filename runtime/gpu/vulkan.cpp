@@ -5974,7 +5974,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     SqueezeBeyond(s, c.hud);
     // a movie on a 4:3 frame stretched wide (movie_43): squeezed whole about the middle back to 4:3, the sides left
     // as the frame's clear
-    if (stage_movie_ && draw_2d_ && stretch > 1.01f && Style().movie_43) c.hud[0] = -1.0f / stretch;
+    // (not a menu's background movie: GameInfo::menu_up)
+    if (stage_movie_ && draw_2d_ && stretch > 1.01f && Style().movie_43 && !(app::kGame.menu_up && app::kGame.menu_up()))
+        c.hud[0] = -1.0f / stretch;
     FillSurfaceConstants(s, size, c);
     if (k.topo == uint32_t(Topology::Points)) {
         const Target* t = bound_rt_ ? bound_rt_ : bound_ds_;
