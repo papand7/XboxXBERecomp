@@ -141,6 +141,13 @@ struct GraphicsStyle {
     // renderer's, the last frame turned by the mouse the title has not read yet (GameInfo::view_turn), the HUD and the
     // gun where they were: turning the view looks twice as smooth, the world still moves at the title's rate
     bool smooth_turn = false;
+    // contact shadows (Vulkan; not under ray traced lighting, which shadows for real; not in Retro): a short march from
+    // each pixel toward the light above it through the depth, something just above shading it (under props, feet,
+    // ledges): the crisp contact the baked lighting lacks
+    bool contact_shadows = false;
+    // floor reflections (Vulkan, with Reflections on): 1 ice (a bright, bluish, smooth texture), 2 also polished floors
+    // (a smooth grey one): reflecting where the surface faces up, more at a grazing view
+    int floor_reflections = 0;
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;

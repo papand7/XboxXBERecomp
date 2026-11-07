@@ -90,6 +90,7 @@ void Clamp(GraphicsStyle& s) {
     s.dof_strength = std::clamp(s.dof_strength, 0.0f, 2.0f);
     s.hdr_tonemap = std::clamp(s.hdr_tonemap, 0, int(kHdrTones) - 1);
     s.motion_blur_strength = std::clamp(s.motion_blur_strength, 0.0f, 2.0f);
+    s.floor_reflections = std::clamp(s.floor_reflections, 0, 2);
 }
 
 int Index(const std::string& v, const char* const* names, int n, int fallback) {
@@ -113,7 +114,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "snow_sparkle", "blood",
                                   "depth_of_field", "dof_strength", "hdr_tonemap", "auto_exposure",
                                   "motion_blur", "motion_blur_strength",
-                                  "smooth_turn"};
+                                  "smooth_turn", "contact_shadows", "floor_reflections"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -215,6 +216,8 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("motion_blur", s.motion_blur);
     num("motion_blur_strength", s.motion_blur_strength);
     flag("smooth_turn", s.smooth_turn);
+    flag("contact_shadows", s.contact_shadows);
+    integer("floor_reflections", s.floor_reflections);
     Clamp(s);
 }
 
@@ -294,7 +297,9 @@ toml::table Write(const GraphicsStyle& s) {
                        {"auto_exposure", s.auto_exposure},
                        {"motion_blur", s.motion_blur},
                        {"motion_blur_strength", double(s.motion_blur_strength)},
-                       {"smooth_turn", s.smooth_turn}};
+                       {"smooth_turn", s.smooth_turn},
+                       {"contact_shadows", s.contact_shadows},
+                       {"floor_reflections", s.floor_reflections}};
 }
 
 // the built-in presets
@@ -583,6 +588,8 @@ void ApplyPreset(const StylePreset& p) {
     g_style.motion_blur = keep.motion_blur;
     g_style.motion_blur_strength = keep.motion_blur_strength;
     g_style.smooth_turn = keep.smooth_turn;
+    g_style.contact_shadows = keep.contact_shadows;
+    g_style.floor_reflections = keep.floor_reflections;
     StyleChanged();
 }
 
@@ -651,7 +658,7 @@ bool StylePassWanted() {
 bool ScenePassWanted() {
     return StylePassWanted() ||
            ((app::Get().smaa || g_style.effect_lights || g_style.atmosphere || g_style.bounce_light || g_style.dof ||
-             g_style.weather || g_style.hdr_tonemap || g_style.motion_blur || g_style.smooth_turn ||
+             g_style.weather || g_style.hdr_tonemap || g_style.motion_blur || g_style.smooth_turn || g_style.contact_shadows ||
              (g_style.ray_tracing && g_ray_tracing.load())) &&
             g_style.mode != kStyleRetro);
 }
@@ -869,6 +876,12 @@ void DrawStyleSettings(bool vulkan) {
     }
     changed |= ImGui::Checkbox("Smooth turning (a frame in between, turned by the mouse; 100 Hz screens and up)",
                                &s.smooth_turn);
+    changed |= ImGui::Checkbox("Contact shadows (short shadows under things, without ray traced lighting)",
+                               &s.contact_shadows);
+    {
+        int f = s.floor_reflections;
+        if (ImGui::Combo("Floor reflections", &f, "Off\0Ice\0Ice and polished floors\0")) s.floor_reflections = f, changed = true;
+    }
     if (ImGui::CollapsingHeader("HDR tone mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
         int h = s.hdr_tonemap;
         if (ImGui::Combo("Tone mapping (HDR)", &h, "Off\0AgX\0ACES\0")) s.hdr_tonemap = h, changed = true;

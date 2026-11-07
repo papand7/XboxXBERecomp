@@ -14,6 +14,8 @@ constexpr uint8_t kDetailUnknown = 0xFF;  // a texture not looked at yet
 // a texture's kind, found once from its level 0 (key: its TextureKey) or as mods/details.toml lists it; none for one
 // that is not a seamless tiling, solid picture of one of the kinds
 uint8_t TextureDetail(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool paletted);
+// ice (floor reflections): an opaque texture bright, bluish and smooth (its brightness hardly varying)
+bool TextureIce(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool paletted);
 // a kind's detail picture, made here (no files): kDetailSize square B8G8R8A8 levels, R and G the bumps' normal x and
 // y, B the brightness (0.5 as it is), A the height
 constexpr uint32_t kDetailSize = 256;

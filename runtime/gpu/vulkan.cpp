@@ -504,6 +504,8 @@ struct Target {
     Image hdr_res, hdr_fb, tone_meter, tone_exp[2];
     Image bloom_down[6], bloom_up[5];  // HDR bloom: each half the one before, from half the scene's size
     Image hdr_ratio;                   // HDR10: each pixel's brightness over its SDR's (ToneResolve's ratio)
+    Image warp_copy;                   // smooth turning: the scene before the HUD, the gun in its alpha
+    uint64_t warp_copy_frame = 0;
     uint64_t hdr_ratio_frame = 0;
     uint64_t tone_frame = 0;
     uint64_t hdr_frame = 0;
@@ -523,6 +525,7 @@ struct Tex {
     float glass = 0;       // how much its alpha looks like window glass, 0 to 1 (GlassScore)
     bool solid = false;    // its alpha is all 1 (or it has none): drawn blended, it still covers
     uint8_t detail = 0;    // its ground detail's kind (gpu::TextureDetail), 0 none, kDetailUnknown not found yet
+    int8_t ice = -1;       // ice (gpu::TextureIce: floor reflections), -1 not looked at yet
 };
 
 // a draw's four texture stages
@@ -800,7 +803,7 @@ float2 screenuv(float3 v) { return v.xy / (v.z * p[8].z * float2(p[8].w, -1)) * 
 float3 ssr(float2 uv, float2 px, float3 c) {
     if (p[8].x == 0) return c;
     float4 mk = maskc.SampleLevel(pt, uv, 0);
-    float m = mk.r;
+    float m = abs(mk.r);
     if (m < 0.01) return c;
     if (p[9].z == 1) return lerp(c, float3(1, 0, 0), 0.5 * m);  // XBE_SSR_TEST=2: the mask shown
     float gz = mk.a;
@@ -811,6 +814,8 @@ float3 ssr(float2 uv, float2 px, float3 c) {
     float3 dy = viewpos(uv + float2(0, px.y), gz * (1 + mk.b)) - P;
     float3 N = normalize(cross(dx, dy));
     if (dot(N, P) > 0) N = -N;
+    if (mk.r < 0) m *= saturate((dot(N, p[10].yzw) - 0.8) * 5);  // a floor's: where it faces up (p[10].yzw the up)
+    if (m < 0.01) return c;
     float3 V = normalize(P);
     float3 R = reflect(V, N);
     if (p[9].z == 2) return N * 0.5 + 0.5;  // XBE_SSR_TEST=3: the slope
@@ -1614,6 +1619,7 @@ cbuffer P : register(b1) { float4 p[3]; };
 Texture2D frame : register(t0);
 Texture2D copyt : register(t1);
 Texture2D<float> keptz : register(t2);
+Texture2D hdrcopy : register(t3);  // HDR: the scene's copy HdrOut reads (its alpha the brightness ratio)
 SamplerState ls : register(s0);
 SamplerState pt : register(s1);
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -1627,6 +1633,26 @@ O vs(uint id : SV_VertexID) {
 float4 pack(O i) : SV_Target {
     bool gun = p[0].x != 0 && copyt.SampleLevel(pt, i.uv, 0).r < keptz.SampleLevel(pt, i.uv, 0) - 1e-6;
     return float4(frame.SampleLevel(pt, i.uv, 0).rgb, gun ? 1 : 0);
+}
+// where this pixel's in-between colour comes from: the frame's own place (the HUD, the gun), or the turned one
+bool turned(float2 uv, out float2 q) {
+    q = uv;
+    float4 g = frame.SampleLevel(pt, uv, 0), s = copyt.SampleLevel(pt, uv, 0);
+    if (any(abs(g.rgb - s.rgb) > 1.5 / 255) || s.a > 0.5) return false;
+    float ty = p[1].z, as = p[1].w;
+    float3 d = float3((uv.x * 2 - 1) * as * ty, (1 - uv.y * 2) * ty, 1);
+    float cy = cos(p[1].x), sy = sin(p[1].x), cp = cos(p[1].y), sp = sin(p[1].y);
+    d = float3(d.x, d.y * cp + d.z * sp, -d.y * sp + d.z * cp);
+    d = float3(d.x * cy + d.z * sy, d.y, -d.x * sy + d.z * cy);
+    q = float2(d.x / (d.z * as * ty), -d.y / (d.z * ty)) * 0.5 + 0.5;
+    q = clamp(q, 0.5 * p[2].xy, 1 - 0.5 * p[2].xy);
+    if (copyt.SampleLevel(ls, q, 0).a > 0.5) q = uv;  // what the gun hid is not known: this pixel's own
+    return true;
+}
+// HDR: the HDR copy as the frame was turned (the HUD's own where it was: HdrOut keeps it SDR's)
+float4 warphdr(O i) : SV_Target {
+    float2 q;
+    return turned(i.uv, q) ? hdrcopy.SampleLevel(ls, q, 0) : hdrcopy.SampleLevel(pt, i.uv, 0);
 }
 float4 warp(O i) : SV_Target {
     float2 uv = i.uv;
@@ -1643,6 +1669,60 @@ float4 warp(O i) : SV_Target {
     float4 w = copyt.SampleLevel(ls, q, 0);
     if (w.a > 0.5) w = s;  // what the gun hid in the frame is not known: this pixel's own
     return float4(w.rgb, 1);
+}
+)";
+
+// contact shadows (VulkanBackend::ContactPass): from each pixel of the world a short march toward the light above it
+// (the world's up in the view) through the world's depth (the kept one: the gun casts none); something there nearer
+// than the march, within a thickness, shades the pixel, more the nearer it is. b1 p: [0] 1/width, 1/height, tan of half
+// the vertical view, width / height; [1] the kept depth is there, strength, reach (metres), steps; [2] up, test.
+// t0 the scene, t1 its depth, t2 the kept depth
+const char* kContactHlsl = R"(
+cbuffer P : register(b1) { float4 p[3]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D<float> keptz : register(t2);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+static const float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z); }
+float2 screenuv(float3 v) { return v.xy / (v.z * p[0].z * float2(p[0].w, -1)) * 0.5 + 0.5; }
+float worldd(float2 uv) { return p[1].x != 0 ? keptz.SampleLevel(pt, uv, 0) : depthtex.SampleLevel(pt, uv, 0); }
+bool gunat(float2 uv) { return p[1].x != 0 && depthtex.SampleLevel(pt, uv, 0) < keptz.SampleLevel(pt, uv, 0) - 1e-6; }
+float4 ps(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    float3 up = p[2].xyz;
+    if (dot(up, up) < 0.5 || gunat(uv)) return float4(c, 1);
+    float d = worldd(uv);
+    if (d >= 0.99999) return float4(c, 1);
+    float z = d * 4096;
+    float3 P = viewpos(uv, z);
+    int n = int(p[1].w);
+    uint2 ip = uint2(i.pos.xy);
+    float j = (bayer[(ip.y & 3) * 4 + (ip.x & 3)] + 0.5) / 16.0;
+    float reach = p[1].z, bias = 0.01 + 0.004 * z, thick = 0.5 + 0.02 * z;
+    float occ = 0;
+    [loop] for (int k = 0; k < n; k++) {
+        float t = (k + j) / n;
+        float3 X = P + up * (reach * t + bias);
+        float2 q = screenuv(X);
+        if (any(q < 0) || any(q > 1)) break;
+        float dz = X.z - worldd(q) * 4096;
+        if (dz > bias && dz < thick) {
+            occ = 1 - t * 0.6;
+            break;
+        }
+    }
+    if (p[2].w == 1) return float4((1 - occ).xxx, 1);  // XBE_CONTACT_TEST=1: the shadows alone
+    return float4(c * (1 - p[1].y * occ), 1);
 }
 )";
 
@@ -1981,7 +2061,7 @@ float4 ps(O i) : SV_Target {
     float2 uv = i.uv, px = p[0].xy;
     float3 c = scene.SampleLevel(pt, uv, 0).rgb;
     float4 mk = maskc.SampleLevel(pt, uv, 0);
-    float m = mk.r, gz = mk.a;
+    float m = abs(mk.r), gz = mk.a;
     if (m < 0.01 || gz <= 0 || viewz(depthat(uv)) < gz * 0.995) return float4(c, 1);
     float3 P = viewpos(uv, gz);
     // the slope: the surface's own triangle where a ray from the camera meets it, else the mask's
@@ -2013,6 +2093,8 @@ float4 ps(O i) : SV_Target {
     if (dot(N, N) < 1e-20) return float4(c, 1);
     N = normalize(N);
     if (dot(N, P) > 0) N = -N;
+    if (mk.r < 0) m *= saturate((dot(N, p[2].yzw) - 0.8) * 5);  // a floor's: where it faces up (p[2].yzw the up)
+    if (m < 0.01) return float4(c, 1);
     float3 V = normalize(P);
     float3 R = reflect(V, N);
     RayDesc ray;
@@ -3034,14 +3116,15 @@ private:
     void BouncePass(Target& rt, Target* ds);      // bounced light (GraphicsStyle::bounce_light)
     void DofPass(Target& rt, Target* ds);         // depth of field (GraphicsStyle::dof)
     void MotionBlurPass(Target& rt, Target* ds);  // motion blur (GraphicsStyle::motion_blur)
+    void ContactPass(Target& rt, Target* ds);     // contact shadows (GraphicsStyle::contact_shadows)
     // smooth turning (GraphicsStyle::smooth_turn): the frame last presented, a frame turned from it between presents
     void MidFrame() override;
-    bool WarpWanted() const { return Style().smooth_turn && !swap_hdr_ && refresh_hz_ >= 100; }
+    bool WarpWanted() const { return Style().smooth_turn && refresh_hz_ >= 100; }
     Target* warp_t_ = nullptr;
     uint64_t warp_frames_ = 0;  // in-between frames presented (the perf log)
     std::chrono::steady_clock::time_point last_present_{};  // the last real present, the interval between them eased
     double present_interval_ = 1.0 / 60;
-    Image warp_img_;
+    Image warp_img_, warp_hdr_img_;  // the turned frame, and (HDR) the turned HDR copy
     VkSemaphore warp_sem_[kFramesInFlight] = {};
     uint32_t refresh_hz_ = 60;  // the window's screen's (CreateSwapchain)
     float mb_last_[3][4] = {};                    // the last frame's world to view (MotionBlurPass)
@@ -3052,7 +3135,7 @@ private:
         const GraphicsStyle& st = Style();
         return DofWanted() || st.mode == kStyleNoir ||
                (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light || QualityAo(st) > 0 || st.weather ||
-                                           st.motion_blur || st.smooth_turn));
+                                           st.motion_blur || st.smooth_turn || st.contact_shadows));
     }
     float dof_aim_ = 0;          // aiming down the sights, eased 0 to 1
     uint32_t scene_zwrites_ = 0;  // the frame's 3D draws that wrote the scene's depth
@@ -3159,6 +3242,9 @@ private:
     // reflections: the draw's stage 0 texture as BindGuestTexture saw it (none for a target or a replacement)
     uint64_t stage_key_ = 0;
     uint8_t stage_detail_ = 0;
+    bool stage_ice_ = false;    // stage 0's texture is ice (floor reflections)
+    bool refl_floor_ = false;   // the draw reflects as a floor (Reflectivity): only where it faces up
+    bool ViewUp(float aspect, float up[3]) const;  // the world's up in the view (rt_cams_), false unknown
     float stage_glass_ = 0;
     bool stage_solid_ = false, stage_seen_ = false;
     bool draw_env_ = false;
@@ -3206,7 +3292,7 @@ private:
         DropImage(t.tone_exp[0]), DropImage(t.tone_exp[1]);
         for (Image& im : t.bloom_down) DropImage(im);
         for (Image& im : t.bloom_up) DropImage(im);
-        DropImage(t.hdr_ratio);
+        DropImage(t.hdr_ratio), DropImage(t.warp_copy);
     }
     // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
     // mod, read again when it changes), else the built-in kScenePostHlsl
@@ -3223,7 +3309,7 @@ private:
     static constexpr const char* kPassNames[24] = {"relight", "rt ao", "rt reflect", "gtao", "lights", "bounce",
                                                    "atmosphere", "weather", "tone", "style", "smaa", "dof",
                                                    "rt-gi", "rt-lit", "rt-vol", "rt-build",
-                                                   "lt-tiles", "lt-pick", "lt-light", "motion", nullptr, nullptr, nullptr, nullptr};
+                                                   "lt-tiles", "lt-pick", "lt-light", "motion", "contact", nullptr, nullptr, nullptr};
     double pass_ms_[24] = {};
     uint32_t pass_n_[24] = {};
     bool frame_stamp_due_ = true;
@@ -5184,7 +5270,7 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
             // the game's picture it stands for (uploaded before the pack's was set): what reflections know it by
             if (auto it = textures_.find(d.data); stage == 0 && it != textures_.end())
                 stage_key_ = it->second.key, stage_glass_ = it->second.glass, stage_solid_ = it->second.solid,
-                stage_detail_ = it->second.detail, stage_seen_ = true;
+                stage_detail_ = it->second.detail, stage_ice_ = it->second.ice > 0, stage_seen_ = true;
             return v;
         }
     }
@@ -5208,17 +5294,21 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
             UploadTexture(tx, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr);
             tx.key = TextureKey(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.hash);
             tx.detail = kDetailUnknown;  // its kind found when first drawn with ground detail on
+            tx.ice = -1;
             TexturePackSeen(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr,
                             palette.hash);
         }
     }
-    if (tx.detail == kDetailUnknown && (Style().ground_detail || Style().displacement) && !draw_2d_)
+    if (tx.ice < 0 && Style().floor_reflections && !draw_2d_)
+        tx.ice = TextureIce(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0) ? 1 : 0;
+    if (tx.detail == kDetailUnknown && (Style().ground_detail || Style().displacement || Style().floor_reflections >= 2) &&
+        !draw_2d_)
         tx.detail = TextureDetail(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0);
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
     stages.levels[stage] = tx.levels;
     if (fi.depth) stages.info[stage].shadow = ShadowDepthKind(d.format);
     if (stage == 0)
-        stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_detail_ = tx.detail, stage_seen_ = true;
+        stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_detail_ = tx.detail, stage_ice_ = tx.ice > 0, stage_seen_ = true;
     return tx.img.view;
 }
 
@@ -5635,7 +5725,8 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
     if (!draw_2d_ && bound_ds_) scene_wbuf_ = pk.wbuf;
     // snow: how much of the world is snow, and (without ray tracing's capture) the level's camera (snow, motion blur)
-    if ((WeatherWanted() || (Style().motion_blur && Style().mode != kStyleRetro)) && !draw_2d_ && sh.prog && pk.wbuf && a.topology == Topology::Triangles && !sh.quad &&
+    if ((WeatherWanted() || ((Style().motion_blur || Style().contact_shadows || Style().floor_reflections) &&
+                              Style().mode != kStyleRetro)) && !draw_2d_ && sh.prog && pk.wbuf && a.topology == Topology::Triangles && !sh.quad &&
         bound_ds_ && bound_ds_->rt_depth_frame != presents_ + 1) {
         uint64_t n = (a.index_count ? a.index_count : a.draw_count) / 3;
         const SkyCheck sky = SkyDraw(s, a, sh);
@@ -5730,7 +5821,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
     // reflections: drawn into the mask after (DrawMask), which reads its strength from these constants
     const float refl = Reflectivity(k);
-    c.style[2] = refl;
+    c.style[2] = refl_floor_ ? -refl : refl;  // a floor's negative: the passes keep it where it faces up
     c.style[3] = Opaque(k) || stage_solid_ ? 1.0f : 0.0f;
     // materials: a pack picture's normal and roughness, read from a stage the draw leaves free
     int mat_slot = -1;
@@ -6406,6 +6497,7 @@ void VulkanBackend::RtReflectPass(Target& rt, Target* ds) {
     float c[12] = {1.0f / rt.w, 1.0f / rt.h, 0.5774f, float(rt.w) / float(rt.h),
                    st.reflection_strength, scene_wbuf_ ? 1.0f : 0.0f, float(test), 2.0f,
                    kept ? 1.0f : 0.0f, 0, 0, 0};
+    ViewUp(float(rt.w) / float(rt.h), &c[9]);  // floor reflections: the world's up in the view
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
     VkImageView views[4] = {rt.fb.view, ds->res.view, rt.mask.view, kept ? ds->rt_depth.view : ds->res.view};
@@ -7006,6 +7098,7 @@ uint64_t g_ssr_diag[6];
 // blended over the 3D scene, depth tested, a texture whose alpha looks like glass); 0 none
 float VulkanBackend::Reflectivity(const PsoKey& k) {
     const GraphicsStyle& st = Style();
+    refl_floor_ = false;
     if (st.reflections != kReflectOff && !draw_2d_)
         g_ssr_diag[0]++, g_ssr_diag[1] += stage_seen_, g_ssr_diag[2] += bound_rt_ && bound_ds_,
             g_ssr_diag[3] += bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_,
@@ -7025,6 +7118,11 @@ float VulkanBackend::Reflectivity(const PsoKey& k) {
     if (!st.reflections_auto || !k.zen) return 0;
     // metal: the game gives it an environment cube map of its own; ours shows the real surroundings over it
     if (draw_env_ && covers) return 0.5f;
+    // floor reflections: ice, and (2) a polished floor's smooth grey; only where it faces up (the passes)
+    if (st.floor_reflections && covers && k.zen) {
+        if (stage_ice_) return refl_floor_ = true, 0.5f;
+        if (st.floor_reflections >= 2 && stage_detail_ == kDetailConcrete) return refl_floor_ = true, 0.2f;
+    }
     // a pack picture with a roughness map (hd_pack --pbr): polished where it says so
     if (float r = PackRoughness(stage_key_); r >= 0 && r < 0.45f && covers) return (0.45f - r) / 0.45f * 0.8f;
     constexpr uint32_t kSrcAlpha = 0x302, kInvSrcAlpha = 0x303;  // GL values
@@ -7612,7 +7710,10 @@ void VulkanBackend::Present(const Surface& front) {
 void VulkanBackend::MidFrame() {
     if (!WarpWanted() || !warp_t_ || !swap_ || !app::kGame.view_turn) return;
     Target& t = *warp_t_;
-    if (t.hdr_frame != presents_ || t.hdr_scene.w != t.w || t.hdr_scene.h != t.h) return;
+    if (t.warp_copy_frame != presents_ || t.warp_copy.w != t.w || t.warp_copy.h != t.h) return;
+    // HDR: the HDR copy turned alongside, so the in-between frame's highlights are the frame's
+    const bool hdr = swap_hdr_ && t.hdr_frame == presents_ && t.hdr_scene.w == t.w && t.hdr_scene.h == t.h;
+    if (swap_hdr_ && !hdr) return;
     // half way between the last present and the next (the presents' interval, eased): waited for here, on the render
     // thread; too late for it (the next present near), none
     using clock = std::chrono::steady_clock;
@@ -7645,9 +7746,20 @@ void VulkanBackend::MidFrame() {
     VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
     VkRect2D sc{{0, 0}, {t.w, t.h}};
     const float c[12] = {0, 0, 0, 0, yaw, pitch, ty, float(t.w) / float(t.h), 1.0f / t.w, 1.0f / t.h, 0, 0};
-    VkImageView wv[2] = {t.res.view, t.hdr_scene.view};
-    FullScreen(pw, {warp_img_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, c, 12, wv, 2);
+    VkImageView wv[4] = {t.res.view, t.warp_copy.view, dummy_.view, hdr ? t.hdr_scene.view : dummy_.view};
+    FullScreen(pw, {warp_img_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, c, 12, wv, 4);
     End();
+    if (hdr) {
+        uint64_t sh;
+        VkPipeline ps2 = Compile(kWarpHlsl, "warphdr", "ps_5_0", sh) ? PassPipeline({vh, sh, kBgra, VK_FORMAT_UNDEFINED, 0, 0})
+                                                                    : VK_NULL_HANDLE;
+        if (warp_hdr_img_.img && (warp_hdr_img_.w != t.w || warp_hdr_img_.h != t.h)) DropImage(warp_hdr_img_);
+        if (!ps2 || (!warp_hdr_img_.img && !MakeImage(warp_hdr_img_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1,
+                                                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)))
+            return;
+        FullScreen(ps2, {warp_hdr_img_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, c, 12, wv, 4);
+        End();
+    }
     Barrier();
     static bool test_shot = false;
     if (test != 0 && presents_ >= 7400 && !test_shot) {  // the test's picture: an in-between frame as drawn
@@ -7667,9 +7779,18 @@ void VulkanBackend::MidFrame() {
             LOGR("vulkan: warp test %s", WritePngFile((app::ExeDir() / "warp_test.png").wstring(), px, t.w, t.h) ? "written" : "failed");
         }
     }
+    std::swap(t.res, warp_img_);  // the blits take the target's picture (and HDR's copy) as the title's frame
+    if (hdr) std::swap(t.hdr_scene, warp_hdr_img_);
+    const uint64_t hdr_frame_was = t.hdr_frame;
+    if (hdr) t.hdr_frame = presents_ + 1, HdrCompose(&t);
     uint32_t index = 0;
     VkResult ar = vkAcquireNextImageKHR(dev_, swap_, UINT64_MAX, warp_sem_[frame_slot_], VK_NULL_HANDLE, &index);
-    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) return;
+    auto put_back = [&] {
+        std::swap(t.res, warp_img_);
+        if (hdr) std::swap(t.hdr_scene, warp_hdr_img_);
+        t.hdr_frame = hdr_frame_was;
+    };
+    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) return put_back();
     VkCommandBuffer cb = Cmd();
     VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -7696,13 +7817,16 @@ void VulkanBackend::MidFrame() {
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &color;
     vkCmdBeginRendering(cb, &ri);
-    std::swap(t.res, warp_img_);  // the blit takes the target's picture
-    BlitFrame(t, swap_views_[index], swap_fmt_);
-    std::swap(t.res, warp_img_);
-    VkViewport bvp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
-    vkCmdSetViewport(cb, 0, 1, &bvp);
-    if (ui_) RenderUi();
+    if (hdr) {
+        HdrOut(&t, swap_views_[index]);
+    } else {
+        BlitFrame(t, swap_views_[index], swap_fmt_);
+        VkViewport bvp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
+        vkCmdSetViewport(cb, 0, 1, &bvp);
+        if (ui_) RenderUi();
+    }
     vkCmdEndRendering(cb);
+    put_back();
     open_ = false;
     cur_ = {};
     ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -7765,6 +7889,8 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     if (rt_built_) RtReflectPass(rt, ds), timed(2);
     gtao_drawn_ = false;
     if (!rt_drawn_ && QualityAo(Style()) > 0 && Style().mode != kStyleRetro && scene_wbuf_) GtaoPass(rt, ds), timed(3);
+    if (Style().contact_shadows && Style().mode != kStyleRetro && !(rt_built_ && Style().rt_lighting) && scene_wbuf_)
+        ContactPass(rt, ds), timed(20);
     if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds), timed(4);
     if (Style().bounce_light && Style().mode != kStyleRetro && !rt_gi_drawn_) BouncePass(rt, ds), timed(5);
     if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds), timed(6);
@@ -7777,9 +7903,9 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     End();
     // HDR: the finished scene before the HUD, which HdrOut compares the presented frame with
     // smooth turning: the copy with the gun marked (no HDR chain then)
-    if (WarpWanted() && (rt.hdr_scene.w == rt.w && rt.hdr_scene.h == rt.h ||
-                         (DropImage(rt.hdr_scene),
-                          MakeImage(rt.hdr_scene, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+    if (WarpWanted() && (rt.warp_copy.w == rt.w && rt.warp_copy.h == rt.h ||
+                         (DropImage(rt.warp_copy),
+                          MakeImage(rt.warp_copy, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)))) {
         uint64_t vh, kh;
@@ -7793,10 +7919,10 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
             VkRect2D sc{{0, 0}, {rt.w, rt.h}};
             VkImageView kv[3] = {rt.res.view, ds->res.view, kept ? ds->rt_depth.view : ds->res.view};
             float kc[12] = {kept ? 1.0f : 0.0f};
-            FullScreen(pk, {rt.hdr_scene.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, kc, 12, kv, 3);
+            FullScreen(pk, {rt.warp_copy.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, kc, 12, kv, 3);
             End();
             dirty_ = true;
-            rt.hdr_frame = presents_ + 1;
+            rt.warp_copy_frame = presents_ + 1;
         }
     }
     if (swap_hdr_ && (rt.hdr_scene.w == rt.w && rt.hdr_scene.h == rt.h ||
@@ -7900,6 +8026,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
     c[39] = scene_wbuf_ ? 1.0f : 0.0f;
     // the scene's depth was cleared mid-frame and the world's kept (RtKeepDepth): what it holds now is the gun alone
     c[40] = depth && ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1 ? 1.0f : 0.0f;
+    ViewUp(float(rt.w) / float(rt.h), &c[41]);  // floor reflections: the world's up in the view
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
     VkImageView views[4] = {rt.fb.view, depth ? ds->res.view : VK_NULL_HANDLE, mask ? rt.mask.view : VK_NULL_HANDLE,
@@ -8379,6 +8506,60 @@ void VulkanBackend::ToneResolve(Target& rt) {
     static bool said = false;
     if (!said) said = true, LOGR("vulkan: HDR tone mapping drawn (%s%s)", st.hdr_tonemap == kHdrToneAgx ? "AgX" : "ACES",
                                  st.auto_exposure ? ", auto exposure" : "");
+}
+
+// the world's up in the view (the level's camera, rt_cams_: rows scaled as the screen-space passes' view), unit length
+bool VulkanBackend::ViewUp(float aspect, float up[3]) const {
+    up[0] = up[1] = up[2] = 0;
+    const RtCam* cam = nullptr;
+    for (const auto& [h, c] : rt_cams_)
+        if (!cam || c.tris > cam->tris) cam = &c;
+    if (!cam) return false;
+    const float ty = 0.5774f, scale[3] = {ty * aspect, ty, 1};
+    float v[3], l = 0;
+    for (int r = 0; r < 3; r++) v[r] = cam->r[r][1] * scale[r], l += v[r] * v[r];
+    if (l < 1e-12f) return false;
+    l = 1 / std::sqrt(l);
+    for (int r = 0; r < 3; r++) up[r] = v[r] * l;
+    return true;
+}
+
+// contact shadows over the scene (kContactHlsl)
+void VulkanBackend::ContactPass(Target& rt, Target* ds) {
+    if (!ds || ds->w != rt.w || ds->h != rt.h) return;
+    uint64_t vh, ph;
+    if (!Compile(kContactHlsl, "vs", "vs_5_0", vh) || !Compile(kContactHlsl, "ps", "ps_5_0", ph)) {
+        LOG_FIRST(1, "vulkan: the contact shadows did not compile; none drawn");
+        return;
+    }
+    VkPipeline pl = PassPipeline({vh, ph, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pl) return;
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    static const int test = [] {
+        const char* e = std::getenv("XBE_CONTACT_TEST");
+        return e && *e == '1' ? 1 : 0;
+    }();
+    const bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    float c[12] = {1.0f / rt.w, 1.0f / rt.h, 0.5774f, float(rt.w) / float(rt.h),
+                   kept ? 1.0f : 0.0f, 0.4f, 0.35f, 12.0f, 0, 0, 0, float(test)};
+    if (!ViewUp(float(rt.w) / float(rt.h), &c[8])) return;
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[3] = {rt.fb.view, ds->res.view, kept ? ds->rt_depth.view : ds->res.view};
+    FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 12, views, 3);
+    End();
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: contact shadows drawn");
 }
 
 // motion blur over the finished scene (kMotionHlsl): the level's camera now and the last frame's

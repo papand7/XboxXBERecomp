@@ -274,6 +274,37 @@ uint8_t TextureDetail(uint64_t key, const TextureDesc& d, const uint8_t* guest, 
     return kind;
 }
 
+bool TextureIce(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool paletted) {
+    static std::unordered_map<uint64_t, bool> seen;
+    std::lock_guard lock(g_lock);
+    if (auto it = seen.find(key); it != seen.end()) return it->second;
+    bool ice = false;
+    std::vector<uint32_t> px;
+    if (!paletted && !d.cube && d.depth == 1 && !Format(d.format).depth && d.width >= 32 && d.height >= 32 &&
+        d.width <= 1024 && d.height <= 1024 && DecodeBgra(d, 0, guest, px) && px.size() >= size_t(d.width) * d.height) {
+        size_t n = size_t(d.width) * d.height, clear = 0;
+        double r = 0, g = 0, b = 0, l1 = 0, l2 = 0;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t p = px[i];
+            if ((p >> 24) < 250) clear++;
+            float pr = float(p >> 16 & 0xFF) / 255.0f, pg = float(p >> 8 & 0xFF) / 255.0f, pb = float(p & 0xFF) / 255.0f;
+            r += pr, g += pg, b += pb;
+            float l = 0.299f * pr + 0.587f * pg + 0.114f * pb;
+            l1 += l, l2 += l * l;
+        }
+        r /= double(n), g /= double(n), b /= double(n), l1 /= double(n);
+        double dev = std::sqrt(std::max(0.0, l2 / double(n) - l1 * l1));
+        double hi = std::max({r, g, b}), lo = std::min({r, g, b}), sat = hi > 0 ? (hi - lo) / hi : 0;
+        ice = clear * 50 <= n && l1 > 0.35 && b >= g && b > r + 0.04 && sat > 0.06 && sat < 0.55 && dev < 0.085;
+    }
+    seen[key] = ice;
+    if (ice) {
+        static int said = 0;
+        if (said++ < 20) LOGR("graphics: floor reflections: texture %016llx (%ux%u) is ice", (unsigned long long)key, d.width, d.height);
+    }
+    return ice;
+}
+
 void DetailPicture(uint8_t kind, std::vector<std::vector<uint32_t>>& levels) {
     Field f = Make(kind);
     const float strength[kDetailKinds] = {0, 5.0f, 3.0f, 6.0f, 5.0f, 4.0f};  // how steep the bumps are
