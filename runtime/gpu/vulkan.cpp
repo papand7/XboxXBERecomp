@@ -8610,7 +8610,7 @@ void VulkanBackend::MotionBlurPass(Target& rt, Target* ds) {
     for (int r = 0; r < 3; r++) inv[r][3] = -(inv[r][0] * m[0][3] + inv[r][1] * m[1][3] + inv[r][2] * m[2][3]);
     const bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
     float c[32] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
-                   kept ? 1.0f : 0.0f, 0.25f * st.motion_blur_strength, 0.008f * st.motion_blur_strength, 8.0f};
+                   kept ? 1.0f : 0.0f, 0.4f * st.motion_blur_strength, 0.014f * st.motion_blur_strength, 10.0f};
     std::memcpy(c + 8, inv, sizeof(inv));
     std::memcpy(c + 20, mb_last_, sizeof(mb_last_));
     std::memcpy(mb_last_, m, sizeof(m));
