@@ -38,6 +38,44 @@ file(READ ${smaa_SOURCE_DIR}/SMAA.hlsl XBE_SMAA_HLSL)
 file(WRITE ${CMAKE_BINARY_DIR}/smaa/smaa_hlsl.inc.new "R\"smaa(${XBE_SMAA_HLSL})smaa\"\n")
 configure_file(${CMAKE_BINARY_DIR}/smaa/smaa_hlsl.inc.new ${CMAKE_BINARY_DIR}/smaa/smaa_hlsl.inc COPYONLY)
 
+# FSR 2 (MIT, AMD FidelityFX): the Vulkan renderer's upscaler (gpu/upscale_fsr.cpp). Its library and Vulkan backend
+# are built from the fetched sources (not its CMake files, which want the Vulkan SDK); the backend's GLSL compute
+# shaders are compiled to SPIR-V at build time by tools/fsr2_shaders through glslang (BSD/Apache, Khronos; built from
+# source), which also writes each shader's bindings. The FidelityFX_SC.exe the FSR 2 archive carries is never run.
+FetchContent_Declare(fsr2 URL https://github.com/GPUOpen-Effects/FidelityFX-FSR2/archive/refs/tags/v2.2.1.tar.gz
+    URL_HASH SHA256=4d7261ef054b071de83c7d201f6850c274226bd3025f4a2274ef4968343bd534 SOURCE_SUBDIR none)
+set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+set(ENABLE_PCH OFF CACHE BOOL "" FORCE)
+set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(glslang URL https://github.com/KhronosGroup/glslang/archive/refs/tags/15.4.0.tar.gz
+    URL_HASH SHA256=b16c78e7604b9be9f546ee35ad8b6db6f39bbbbfb19e8d038b6fe2ea5bba4ff4 EXCLUDE_FROM_ALL)
+FetchContent_MakeAvailable(fsr2 glslang)
+set(XBE_FSR2_API ${fsr2_SOURCE_DIR}/src/ffx-fsr2-api)
+add_executable(fsr2_shaders EXCLUDE_FROM_ALL ${XBE_SDK_DIR}/tools/fsr2_shaders/main.cpp)
+target_link_libraries(fsr2_shaders PRIVATE glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/fsr2/fsr2_blobs.inc
+    COMMAND fsr2_shaders ${XBE_FSR2_API}/shaders ${CMAKE_BINARY_DIR}/fsr2/fsr2_blobs.inc
+    DEPENDS fsr2_shaders
+    COMMENT "FSR 2's Vulkan shaders to SPIR-V"
+    VERBATIM)
+add_library(xbe_fsr2 STATIC EXCLUDE_FROM_ALL
+    ${XBE_FSR2_API}/ffx_fsr2.cpp
+    ${XBE_FSR2_API}/ffx_assert.cpp
+    ${XBE_FSR2_API}/vk/ffx_fsr2_vk.cpp
+    ${XBE_SDK_DIR}/tools/fsr2_shaders/blobs_vk.cpp
+    ${CMAKE_BINARY_DIR}/fsr2/fsr2_blobs.inc)
+target_include_directories(xbe_fsr2 PRIVATE ${vulkanheaders_SOURCE_DIR}/include ${XBE_FSR2_API}/vk/shaders
+    ${CMAKE_BINARY_DIR}/fsr2)
+target_compile_definitions(xbe_fsr2 PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS
+    _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS _SILENCE_ALL_CXX20_DEPRECATION_WARNINGS)
+target_compile_options(xbe_fsr2 PRIVATE -w)
+
 # hd_pack (tools/hd_pack): a texture pack upscaled on the player's PC by Real-ESRGAN (BSD-3; its ncnn Vulkan build,
 # MIT, with the realesrgan-x4plus models), copied beside each game exe in tools/
 if(WIN32)
@@ -85,6 +123,9 @@ set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp PR
 file(GLOB XBE_RUNTIME_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/runtime/*/*.cpp)
 # SDL's headers go to the input code alone (it is linked LINK_ONLY), so the generated sources' compile line stays the same
 set_source_files_properties(${XBE_SDK_DIR}/runtime/core/input.cpp PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
+set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/upscale_fsr.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include;${XBE_FSR2_API};${XBE_FSR2_API}/vk"
+    COMPILE_DEFINITIONS "_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS")
 set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/smaa.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${smaa_SOURCE_DIR}/Textures;${CMAKE_BINARY_DIR}/smaa")
 
@@ -124,7 +165,7 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_include_directories(${target} SYSTEM PRIVATE ${imgui_SOURCE_DIR})
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 d3d11 dinput8 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
+    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> xbe_fsr2 d3d12 d3d11 dinput8 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
     # the Vulkan renderer's shader compiler, beside the exe
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll $<TARGET_FILE_DIR:${target}>)

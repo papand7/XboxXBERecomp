@@ -265,7 +265,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
         std::lock_guard lock(UiLock());
         if (!(lp & (1 << 30)) && CaptureKey(uint16_t(wp))) return 0;  // a title's binding: not a held key's repeat
-        if (wp == VK_F1 && !(lp & (1 << 30))) {
+        if (wp == VK_F1 && kGame.settings_window && !(lp & (1 << 30))) {
             ToggleOverlay();
             return 0;
         }

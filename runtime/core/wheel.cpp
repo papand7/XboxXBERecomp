@@ -538,6 +538,26 @@ void Run() {
     }
 }
 
+// a binding being detected (app::WheelDetectStart), under g_lock: every device's state as it began; after it, the
+// button taken while it is still held (and a moment for an axis), the rig quiet
+struct Detecting {
+    app::WheelDetect kind = app::WheelDetect::None;
+    Bind* bind = nullptr;
+    std::vector<WheelDevice> start;
+    std::string held_guid;
+    int held_button = -1;
+    Clock::time_point quiet_until{};
+} g_detect;
+
+bool Quiet() {
+    if (g_detect.kind != app::WheelDetect::None || Clock::now() < g_detect.quiet_until) return true;
+    if (g_detect.held_button < 0) return false;
+    for (const View& v : s.devs)
+        if (v.guid == g_detect.held_guid && v.ok && (v.state.rgbButtons[g_detect.held_button & 127] & 0x80)) return true;
+    g_detect.held_button = -1;
+    return false;
+}
+
 }  // namespace
 
 void WheelSetup() {
@@ -568,6 +588,9 @@ bool WheelRead(float* v, bool* steers) {
     std::lock_guard lock(g_lock);
     const Config& c = s.config;
     bool active = false;
+    // a binding being detected: the rig's inputs go nowhere (app::WheelDetectStart)
+    float quiet[kControls] = {};
+    if (Quiet()) v = quiet;
     if (steers) *steers = StateOf(s.devs, c.steer) != nullptr;
     if (const DIJOYSTATE2* st = StateOf(s.devs, c.steer)) {
         float steer = SteerValue(s.devs, c);
@@ -661,3 +684,99 @@ void WheelTestForce(float level) {
 }
 
 }  // namespace input
+
+// ---- binding a control by moving or pressing it (app.h)
+namespace app {
+
+using input::g_detect;
+using input::g_lock;
+
+void WheelDetectStart(WheelDetect kind, Settings::WheelBind& bind) {
+    input::WheelInfo w = input::Wheel();
+    std::lock_guard lock(g_lock);
+    g_detect.kind = kind;
+    g_detect.bind = &bind;
+    g_detect.start = std::move(w.devices);
+}
+
+void WheelDetectCancel() {
+    std::lock_guard lock(g_lock);
+    if (g_detect.kind == WheelDetect::None) return;
+    g_detect.kind = WheelDetect::None;
+    g_detect.bind = nullptr;
+    g_detect.start.clear();
+    g_detect.quiet_until = input::Clock::now() + std::chrono::milliseconds(300);
+}
+
+WheelDetect WheelDetecting(const Settings::WheelBind* bind) {
+    std::lock_guard lock(g_lock);
+    return bind && g_detect.bind != bind ? WheelDetect::None : g_detect.kind;
+}
+
+bool WheelDetectPoll() {
+    if (WheelDetecting() == WheelDetect::None) return false;
+    input::WheelInfo w = input::Wheel();
+    Settings::WheelBind found;
+    Settings::WheelBind* bind = nullptr;
+    {
+        std::lock_guard lock(g_lock);
+        const WheelDetect kind = g_detect.kind;
+        if (kind == WheelDetect::None) return false;
+        for (size_t i = 0; i < w.devices.size() && !bind; i++) {
+            const input::WheelDevice& d = w.devices[i];
+            const input::WheelDevice* was = nullptr;
+            for (const input::WheelDevice& e : g_detect.start)
+                if (e.guid == d.guid) was = &e;
+            if (!was) continue;  // plugged in since it began: its state then is not known
+            if (kind == WheelDetect::Button) {
+                for (int b : d.pressed)
+                    if (std::find(was->pressed.begin(), was->pressed.end(), b) == was->pressed.end()) {
+                        found = {.button = b};
+                        g_detect.held_guid = d.guid, g_detect.held_button = b;
+                        break;
+                    }
+            } else {
+                const int32_t need = kind == WheelDetect::Steer ? 8000 : 20000;
+                for (int a = 0; a < 8 && found.axis < 0; a++) {
+                    if (!(d.axis_mask >> a & 1)) continue;  // the axes the device has, wherever they are (Z, Rz, a slider ...)
+                    int32_t moved = d.axes[a] - was->axes[a];
+                    if (std::abs(moved) <= need) continue;
+                    if (kind == WheelDetect::Steer) found = {.axis = a, .invert = moved < 0};  // turned right
+                    else found = {.axis = a, .rest = was->axes[a], .full = moved > 0 ? 32767 : -32768};
+                }
+            }
+            if (found.axis >= 0 || found.button >= 0) {
+                found.device = d.name;
+                found.guid = d.guid;
+                bind = g_detect.bind;
+            }
+        }
+        if (!bind) return false;
+        g_detect.kind = WheelDetect::None;
+        g_detect.bind = nullptr;
+        g_detect.start.clear();
+        g_detect.quiet_until = input::Clock::now() + std::chrono::milliseconds(300);
+    }
+    {
+        std::lock_guard lock(UiLock());
+        *bind = found;
+        Save();
+    }
+    input::WheelSetup();
+    LOGR("wheel: bound %s", WheelBindText(found).c_str());
+    return true;
+}
+
+const char* WheelAxisName(int axis) {
+    static const char* kNames[8] = {"X", "Y", "Z", "Rx", "Ry", "Rz", "Slider 1", "Slider 2"};
+    return kNames[std::clamp(axis, 0, 7)];
+}
+
+std::string WheelBindText(const Settings::WheelBind& b) {
+    if (b.axis < 0 && b.button < 0) return "-";
+    std::string dev = b.device.empty() ? "the wheel" : b.device;
+    if (b.axis >= 0) return dev + ": " + WheelAxisName(b.axis) + " axis";
+    return dev + ": button " + std::to_string(b.button);
+}
+
+}  // namespace app

@@ -138,6 +138,7 @@ struct DrawConstants {
     float pts[4];        // point sprites on, size min, size max, D3DRS_POINTSIZE (console pixels)
     float style[4];      // graphics styles (style.h): xy the vertex snapping grid in clip units per half screen, 0 off
     float pbr[4];        // materials (Vulkan): 1 / target width and height, tan of half the vertical view, strength
+    float taa[4];        // TAA (Vulkan): xy the frame's sub-pixel jitter in clip units, 0 for 2D draws and with it off
 };
 
 }  // namespace gpu

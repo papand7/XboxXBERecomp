@@ -312,9 +312,10 @@ bool TextureWater(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool
     std::lock_guard lock(g_lock);
     if (auto it = seen.find(key); it != seen.end()) return it->second;
     bool water = false;
+    bool candidate = false;
     std::vector<uint32_t> px;
     double r = 0, g = 0, b = 0, l1 = 0, dev = 0, clear = 0;
-    if (!paletted && !d.cube && d.depth == 1 && !Format(d.format).depth && d.width >= 16 && d.height >= 16 &&
+    if (!paletted && !d.cube && d.depth == 1 && !Format(d.format).depth && d.width >= 64 && d.height >= 64 &&
         d.width <= 1024 && d.height <= 1024 && DecodeBgra(d, 0, guest, px) && px.size() >= size_t(d.width) * d.height) {
         size_t n = size_t(d.width) * d.height;
         double l2 = 0;
@@ -330,10 +331,26 @@ bool TextureWater(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool
         dev = std::sqrt(std::max(0.0, l2 / double(n) - l1 * l1));
         double hi = std::max({r, g, b}), lo = std::min({r, g, b}), sat = hi > 0 ? (hi - lo) / hi : 0;
         // blue or green over red, not grey, not bright (ice and snow), even (not a patterned wall)
-        water = std::max(b, g) > r + 0.05 && sat > 0.15 && l1 > 0.05 && l1 < 0.55 && dev < 0.12;
+        candidate = std::max(b, g) > r + 0.05 && sat > 0.15 && l1 > 0.05 && l1 < 0.55 && dev < 0.12;
+        // Conservative auto-detection: the survey also finds suits, carpet, sky and splash sprites. Keep only
+        // small square, opaque, smoothly varying patterns; the renderer additionally requires an upward-facing
+        // surface and excludes the sky. Fine checker patterns (carpet) have a large adjacent-pixel difference.
+        if (candidate && d.width == d.height && d.width <= 128 && clear < 0.05 && dev > 0.005) {
+            auto lum = [&](uint32_t x, uint32_t y) {
+                const uint32_t p = px[size_t(y) * d.width + x];
+                return (0.299 * double(p >> 16 & 255) + 0.587 * double(p >> 8 & 255) +
+                        0.114 * double(p & 255)) / 255.0;
+            };
+            double rough = 0;
+            for (uint32_t y = 1; y < d.height; y++)
+                for (uint32_t x = 1; x < d.width; x++)
+                    rough += std::abs(lum(x, y) - lum(x - 1, y)) + std::abs(lum(x, y) - lum(x, y - 1));
+            rough /= double(2 * (d.width - 1) * (d.height - 1));
+            water = rough / dev < 0.32;
+        }
     }
     seen[key] = water;
-    if (water) {
+    if (candidate) {
         static int said = 0;
         if (said++ < 60)
             LOGR("graphics: water? texture %016llx (%ux%u fmt %02X): mean %.2f %.2f %.2f, brightness %.2f, spread %.3f, %.0f%% see-through",

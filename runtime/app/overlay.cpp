@@ -228,73 +228,15 @@ void GameOptions() {
 
 // the wheel and the rest of a rig (core/wheel.cpp): the devices found, and each control bound by moving or pressing it
 // on any of them (the binding names the device)
-const char* kAxisNames[8] = {"X", "Y", "Z", "Rx", "Ry", "Rz", "Slider 1", "Slider 2"};
-struct WheelDetect {
-    enum Kind { None, Steer, Pedal, Button } kind = None;
-    Settings::WheelBind* bind = nullptr;
-    std::vector<input::WheelDevice> start;  // every device's state when it began
-} g_detect;
-
-std::string BindText(const Settings::WheelBind& b) {
-    if (b.axis < 0 && b.button < 0) return "-";
-    std::string dev = b.device.empty() ? "the wheel" : b.device;
-    if (b.axis >= 0) return dev + ": " + kAxisNames[std::clamp(b.axis, 0, 7)] + " axis";
-    return dev + ": button " + std::to_string(b.button);
-}
-
-void Bound(Settings::WheelBind& b, const input::WheelDevice& d) {
-    b.device = d.name;
-    b.guid = d.guid;
-    Save();
-    input::WheelSetup();
-}
-
-// what moved or was pressed since the detection began, on any device
-void Detect(const input::WheelInfo& w) {
-    if (g_detect.kind == WheelDetect::None) return;
-    for (size_t i = 0; i < w.devices.size() && i < g_detect.start.size(); i++) {
-        const input::WheelDevice& d = w.devices[i];
-        const input::WheelDevice& was = g_detect.start[i];
-        if (d.guid != was.guid) continue;
-        if (g_detect.kind == WheelDetect::Button) {
-            for (int b : d.pressed)
-                if (std::find(was.pressed.begin(), was.pressed.end(), b) == was.pressed.end()) {
-                    *g_detect.bind = {.button = b};
-                    Bound(*g_detect.bind, d);
-                    g_detect = {};
-                    return;
-                }
-            continue;
-        }
-        int32_t need = g_detect.kind == WheelDetect::Steer ? 8000 : 20000;
-        for (int a = 0; a < 8; a++) {
-            if (!(d.axis_mask >> a & 1)) continue;  // the axes the device has, wherever they are (Z, Rz, a slider ...)
-            int32_t moved = d.axes[a] - was.axes[a];
-            if (std::abs(moved) <= need) continue;
-            Settings::WheelBind& b = *g_detect.bind;
-            if (g_detect.kind == WheelDetect::Steer) {
-                b = {.axis = a, .invert = moved < 0};  // turned right
-            } else {
-                b = {.axis = a, .rest = was.axes[a], .full = moved > 0 ? 32767 : -32768};
-            }
-            Bound(b, d);
-            g_detect = {};
-            return;
-        }
-    }
-}
-
-// a binding's button: click, then move or press the control; "clear" unbinds it
-void BindButton(const char* id, Settings::WheelBind& b, WheelDetect::Kind kind, const input::WheelInfo& w,
-                const char* prompt) {
+// a binding's button: click, then move or press the control (app::WheelDetectStart); "clear" unbinds it
+void BindButton(const char* id, Settings::WheelBind& b, WheelDetect kind, const char* prompt) {
     ImGui::PushID(id);
-    bool waiting = g_detect.kind == kind && g_detect.bind == &b;
-    std::string text = waiting ? prompt : BindText(b);
-    if (ImGui::Button(text.c_str(), ImVec2(ImGui::GetFontSize() * 18, 0))) {
-        g_detect = {.kind = kind, .bind = &b, .start = w.devices};
-    }
+    bool waiting = WheelDetecting(&b) == kind;
+    std::string text = waiting ? prompt : WheelBindText(b);
+    if (ImGui::Button(text.c_str(), ImVec2(ImGui::GetFontSize() * 18, 0))) WheelDetectStart(kind, b);
     ImGui::SameLine();
     if (ImGui::SmallButton("clear")) {
+        if (waiting) WheelDetectCancel();
         b = {};
         Save();
         input::WheelSetup();
@@ -303,14 +245,14 @@ void BindButton(const char* id, Settings::WheelBind& b, WheelDetect::Kind kind, 
 }
 
 void Wheel(Settings& s) {
+    WheelDetectPoll();
     input::WheelInfo w = input::Wheel();
-    Detect(w);
     ImGui::SeparatorText("Devices");
     if (w.devices.empty()) {
         ImGui::TextUnformatted("No wheel, pedals, shifter or button box found.");
         ImGui::TextDisabled("Every DirectInput game controller is listed here (Xbox pads are under Controls).");
         ImGui::TextDisabled("One plugged in later is found within two seconds.");
-        g_detect = {};
+        WheelDetectCancel();
         return;
     }
     for (const input::WheelDevice& d : w.devices)
@@ -321,7 +263,7 @@ void Wheel(Settings& s) {
     ImGui::SeparatorText("Steering");
     float degrees = w.steer * float(s.wheel_lock) * 0.5f;
     ImGui::ProgressBar(0.5f + w.steer * 0.5f, ImVec2(-1, 0), (std::to_string(int(std::lround(degrees))) + " degrees").c_str());
-    BindButton("steer", s.wheel_steer, WheelDetect::Steer, w, "turn the wheel to the right...");
+    BindButton("steer", s.wheel_steer, WheelDetect::Steer, "turn the wheel to the right...");
     ImGui::SameLine();
     if (ImGui::Checkbox("Invert", &s.wheel_steer.invert)) Save(), input::WheelSetup();
     int range = int(s.wheel_range), lock = int(s.wheel_lock), dz = int(s.wheel_deadzone);
@@ -342,7 +284,7 @@ void Wheel(Settings& s) {
     for (Row& r : rows) {
         ImGui::ProgressBar(r.value, ImVec2(ImGui::GetFontSize() * 10, 0), r.name);
         ImGui::SameLine();
-        BindButton(r.name, *r.bind, WheelDetect::Pedal, w, "press the pedal fully...");
+        BindButton(r.name, *r.bind, WheelDetect::Pedal, "press the pedal fully...");
     }
     ImGui::TextDisabled("Let the pedal rest, click, then press it all the way.");
 
@@ -374,7 +316,7 @@ void Wheel(Settings& s) {
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(input::ControlLabel(c));
             ImGui::TableNextColumn();
-            BindButton(input::ControlName(c), s.wheel_buttons[c], WheelDetect::Button, w, "press a button...");
+            BindButton(input::ControlName(c), s.wheel_buttons[c], WheelDetect::Button, "press a button...");
         }
         ImGui::EndTable();
     }
@@ -384,7 +326,7 @@ void Wheel(Settings& s) {
     for (int i = 0; i < kGears; i++) {
         ImGui::Text("%s", i == 0 ? "Reverse" : ("Gear " + std::string(GearName(i))).c_str());
         ImGui::SameLine(ImGui::GetFontSize() * 5);
-        BindButton(GearName(i), s.wheel_gears[i], WheelDetect::Button, w, "select the gear...");
+        BindButton(GearName(i), s.wheel_gears[i], WheelDetect::Button, "select the gear...");
     }
     auto gear = [](int g) {
         return g == input::kGearUnknown ? std::string("-") : g < 0 ? std::string("R") : g == 0 ? std::string("N") : std::to_string(g);
@@ -397,7 +339,7 @@ void Wheel(Settings& s) {
         if (!ImGui::TreeNode(d.guid.c_str(), "%s", d.name.c_str())) continue;
         for (int a = 0; a < 8; a++)
             if (d.axis_mask >> a & 1) ImGui::ProgressBar((d.axes[a] + 32768) / 65535.0f, ImVec2(-1, 0),
-                               (std::string(kAxisNames[a]) + " " + std::to_string(d.axes[a])).c_str());
+                               (std::string(WheelAxisName(a)) + " " + std::to_string(d.axes[a])).c_str());
         std::string held;
         for (int b : d.pressed) held += (held.empty() ? "" : " ") + std::to_string(b);
         ImGui::TextDisabled("Buttons held: %s%s", held.empty() ? "none" : held.c_str(),

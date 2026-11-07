@@ -11,6 +11,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -20,20 +21,22 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "core/netplay.h"
 #include "app/app.h"
 #include "core/log.h"
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 namespace netplay {
 namespace {
 
 constexpr uint32_t kMagic = 0x504E464E;  // "NFNP"
-constexpr uint16_t kDefaultPort = 27015;
+constexpr uint16_t kDefaultPort = kPort;
 constexpr int kMaxPlayers = 4, kRing = 256, kMaxSend = 64;
-enum : uint8_t { kHello = 1, kWelcome, kStart, kInput, kHash, kBye };
+enum : uint8_t { kHello = 1, kWelcome, kStart, kInput, kHash, kBye, kFind, kHere };
 
 #pragma pack(push, 1)
 struct WirePad {
@@ -55,6 +58,14 @@ struct HashPacket {
     Header h;
     uint32_t frame;
     uint64_t hash;
+};
+// LAN discovery: kFind (a Header alone) broadcast to the port, kHere a waiting host's answer
+struct HerePacket {
+    Header h;
+    uint32_t session;  // the hosting process's, one host heard on several addresses shown once
+    uint16_t port;
+    uint8_t joined;
+    char name[33];
 };
 #pragma pack(pop)
 
@@ -231,12 +242,13 @@ void WaitOver() {
 
 // while the lobby waits (before the title draws anything): a box over the window says so, and its button (or Escape
 // in the window) gives up; the title then starts alone. The box closes by itself once everyone is in
-bool Waiting(const std::wstring& text) {
+bool Waiting(const std::wstring& text, const std::wstring& more = L"") {
     HWND w = static_cast<HWND>(app::Window());
     if (w) SetWindowTextW(w, (std::wstring(app::kGame.title) + L" - " + text).c_str());
     if (!g_wait_box.exchange(true)) {
-        std::wstring body = text + L"\n\nThe game starts on both PCs once the other player is in.\n\n"
-                                   L"Press OK to stop waiting and play alone.";
+        std::wstring body = text + L"\n\n" + (more.empty() ? L"" : more + L"\n\n") +
+                            L"The game starts on both PCs once the other player is in.\n\n"
+                            L"Press OK to stop waiting and play alone.";
         std::thread([w, body] {
             MessageBoxW(w, body.c_str(), kWaitBox, MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
             if (!g_wait_over) g_wait_cancel = true;
@@ -251,6 +263,80 @@ bool Waiting(const std::wstring& text) {
     return true;
 }
 
+void StartWsa() {
+    static const bool once = [] {
+        WSADATA wsa;
+        return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+    }();
+    (void)once;
+}
+
+std::string Dotted(in_addr a) {
+    char ip[64] = {};
+    inet_ntop(AF_INET, &a, ip, sizeof ip);
+    return ip;
+}
+
+// this PC's networks: its IPv4 address on each and the mask (0 unknown); those with a gateway first
+struct Adapter {
+    in_addr addr;
+    uint32_t mask;  // network order
+    bool gateway;
+};
+std::vector<Adapter> Adapters() {
+    std::vector<Adapter> out;
+    std::vector<uint8_t> buf;
+    ULONG size = 16 * 1024, r = ERROR_BUFFER_OVERFLOW;
+    const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER |
+                        GAA_FLAG_INCLUDE_GATEWAYS;
+    for (int i = 0; i < 4 && r == ERROR_BUFFER_OVERFLOW; i++) {
+        buf.assign(size, 0);
+        r = GetAdaptersAddresses(AF_INET, flags, nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()), &size);
+    }
+    if (r != NO_ERROR) return out;
+    for (auto* a = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()); a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK || a->IfType == IF_TYPE_TUNNEL)
+            continue;
+        for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
+            if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            in_addr ip = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr)->sin_addr;
+            if ((ntohl(ip.s_addr) >> 16) == 0xA9FE) continue;  // 169.254: no address was given
+            uint8_t len = u->OnLinkPrefixLength;
+            uint32_t mask = len == 0 || len > 32 ? 0 : htonl(len == 32 ? 0xFFFFFFFFu : ~(0xFFFFFFFFu >> len));
+            out.push_back({ip, mask, a->FirstGatewayAddress != nullptr});
+        }
+    }
+    std::stable_sort(out.begin(), out.end(), [](const Adapter& x, const Adapter& y) { return x.gateway > y.gateway; });
+    return out;
+}
+
+// the host's address as its waiting box shows it
+std::wstring HostAddressText() {
+    std::wstring ips;
+    for (const std::string& a : LocalAddresses()) ips += (ips.empty() ? L"" : L" or ") + std::wstring(a.begin(), a.end());
+    if (ips.empty()) ips = L"(no network found)";
+    return L"Your address: " + ips + L" (port " + std::to_wstring(ntohs(g_bound_port)) +
+           L").\nPlayers on this network find this game in Co-op, Network: Join. Friends over the internet need "
+           L"your public address and the port (UDP) forwarded to this PC.";
+}
+
+// a search's answer (kFind), while the host's lobby waits
+void AnswerFind(const sockaddr_in& to, int joined) {
+    static const uint32_t session = GetTickCount() ^ (GetCurrentProcessId() << 16);
+    HerePacket hp{};
+    hp.h = Head(kHere);
+    hp.session = session;
+    hp.port = ntohs(g_bound_port);
+    hp.joined = uint8_t(joined);
+    char name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD n = sizeof name;
+    if (!GetComputerNameA(name, &n)) std::strcpy(name, "Host");
+    std::strncpy(hp.name, name, sizeof hp.name - 1);
+    SendTo(to, &hp, sizeof hp);
+    static int said = 0;
+    if (said++ < 3) LOGR("netplay: a search from %s:%u answered", Dotted(to.sin_addr).c_str(), ntohs(to.sin_port));
+}
+
 bool Lobby() {
     char buf[1500];
     sockaddr_in from{};
@@ -258,11 +344,14 @@ bool Lobby() {
     if (g_host) {
         int joined = 1;
         while (joined < g_players) {
+            static const std::wstring where = HostAddressText();
             if (!Waiting(L"Network play: waiting for player " + std::to_wstring(joined + 1) +
-                         L" to join (this PC hosts, UDP port " + std::to_wstring(ntohs(g_bound_port)) + L")"))
+                             L" to join (this PC hosts, UDP port " + std::to_wstring(ntohs(g_bound_port)) + L")",
+                         where))
                 return false;
             if (Recv(buf, sizeof buf, from, 20) < int(sizeof(Header))) continue;
             const Header& h = *reinterpret_cast<Header*>(buf);
+            if (h.type == kFind) AnswerFind(from, joined);
             if (h.type != kHello) continue;
             int id = 0;
             for (int p = 1; p < g_players; p++)
@@ -328,8 +417,7 @@ bool Start() {
     g_players = g_host ? std::clamp(std::atoi(Env("XBE_NETPLAY_PLAYERS").c_str()), 2, kMaxPlayers) : 2;
     if (g_host && Env("XBE_NETPLAY_PLAYERS").empty()) g_players = 2;
 
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    StartWsa();
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     sockaddr_in me{};
     me.sin_family = AF_INET;
@@ -353,7 +441,12 @@ bool Start() {
         freeaddrinfo(res);
     }
     g_bound_port = htons(port);
-    if (g_host) LOGR("netplay: hosting on UDP port %u, waiting for %d players", port, g_players);
+    if (g_host) {
+        std::string ips;
+        for (const std::string& a : LocalAddresses()) ips += (ips.empty() ? "" : ", ") + a;
+        LOGR("netplay: hosting on UDP port %u (this PC: %s), waiting for %d players", port,
+             ips.empty() ? "no network" : ips.c_str(), g_players);
+    }
     else LOGR("netplay: joining %s:%u", addr.c_str(), port);
     const bool joined = Lobby();
     WaitOver();
@@ -436,6 +529,117 @@ void Frame() {
         }
     }
     g_frame = next;
+}
+
+// ---- LAN discovery: the search's thread broadcasts kFind each second (to the whole network, each of this PC's
+// networks and this PC itself) and keeps the kHere answers
+namespace {
+struct Heard {
+    FoundHost host;
+    uint32_t session;
+    std::chrono::steady_clock::time_point at;
+};
+std::mutex g_find_lock;
+std::vector<Heard> g_heard;
+std::atomic<bool> g_find_on{false}, g_find_running{false};
+
+void FindThread() {
+    StartWsa();
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    BOOL yes = TRUE;
+    sockaddr_in me{};
+    me.sin_family = AF_INET;
+    if (s == INVALID_SOCKET || bind(s, reinterpret_cast<sockaddr*>(&me), sizeof me) != 0) {
+        LOGR("netplay: the search for hosts could not open a socket (%d)", WSAGetLastError());
+        if (s != INVALID_SOCKET) closesocket(s);
+        g_find_running = false;
+        return;
+    }
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&yes), sizeof yes);
+    LOGR("netplay: searching this network for hosts (UDP port %u)", kPort);
+    for (;;) {
+        auto sent = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+        while (g_find_on) {
+            auto now = std::chrono::steady_clock::now();
+            if (now - sent >= std::chrono::seconds(1)) {
+                sent = now;
+                std::vector<uint32_t> to = {htonl(INADDR_BROADCAST), htonl(INADDR_LOOPBACK)};
+                for (const Adapter& a : Adapters())
+                    if (a.mask) to.push_back(a.addr.s_addr | ~a.mask);
+                Header q{kMagic, kFind, 0, 0, 0};
+                for (uint32_t ip : to) {
+                    sockaddr_in t{};
+                    t.sin_family = AF_INET;
+                    t.sin_port = htons(kPort);
+                    t.sin_addr.s_addr = ip;
+                    sendto(s, reinterpret_cast<const char*>(&q), sizeof q, 0, reinterpret_cast<sockaddr*>(&t), sizeof t);
+                }
+            }
+            fd_set set;
+            FD_ZERO(&set);
+            FD_SET(s, &set);
+            timeval tv{0, 100 * 1000};
+            if (select(0, &set, nullptr, nullptr, &tv) <= 0) continue;
+            char buf[512];
+            sockaddr_in from{};
+            int fl = sizeof from;
+            int n = recvfrom(s, buf, sizeof buf, 0, reinterpret_cast<sockaddr*>(&from), &fl);
+            if (n < int(sizeof(HerePacket))) continue;
+            HerePacket hp;
+            std::memcpy(&hp, buf, sizeof hp);
+            if (hp.h.magic != kMagic || hp.h.type != kHere) continue;
+            hp.name[sizeof hp.name - 1] = 0;
+            FoundHost f;
+            f.name = hp.name;
+            f.address = Dotted(from.sin_addr);
+            f.port = hp.port;
+            f.players = hp.h.players, f.joined = hp.joined;
+            const bool loopback = (ntohl(from.sin_addr.s_addr) >> 24) == 127;
+            std::lock_guard lock(g_find_lock);
+            auto it = std::find_if(g_heard.begin(), g_heard.end(), [&](const Heard& h) { return h.session == hp.session; });
+            if (it == g_heard.end()) {
+                LOGR("netplay: found %s hosting at %s:%u (%d of %d players)", f.name.c_str(), f.address.c_str(), f.port,
+                     f.joined, f.players);
+                g_heard.push_back({f, hp.session, now});
+            } else {
+                // one host heard on several addresses: its network's rather than this PC's own loopback
+                if (loopback && it->host.address.rfind("127.", 0) != 0) f.address = it->host.address;
+                it->host = f, it->at = now;
+            }
+        }
+        g_find_running = false;
+        // asked again as the loop ended: on with the same socket
+        if (!g_find_on || g_find_running.exchange(true)) break;
+    }
+    closesocket(s);
+}
+}  // namespace
+
+std::vector<FoundHost> FindHosts() {
+    g_find_on = true;
+    if (!g_find_running.exchange(true)) std::thread(FindThread).detach();
+    std::vector<FoundHost> out;
+    std::lock_guard lock(g_find_lock);
+    auto now = std::chrono::steady_clock::now();
+    g_heard.erase(std::remove_if(g_heard.begin(), g_heard.end(),
+                                 [&](const Heard& h) { return now - h.at > std::chrono::seconds(3); }),
+                  g_heard.end());
+    for (const Heard& h : g_heard) out.push_back(h.host);
+    return out;
+}
+
+void StopFindingHosts() {
+    if (g_find_on.exchange(false)) LOGR("netplay: the search for hosts stopped");
+}
+
+std::vector<std::string> LocalAddresses() {
+    StartWsa();
+    std::vector<std::string> out;
+    for (const Adapter& a : Adapters()) {
+        std::string ip = Dotted(a.addr);
+        if (std::find(out.begin(), out.end(), ip) == out.end()) out.push_back(ip);
+    }
+    return out;
 }
 
 uint64_t Clock(uint64_t freq) {

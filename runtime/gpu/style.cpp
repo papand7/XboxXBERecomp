@@ -40,6 +40,8 @@ const char* kTonemaps[] = {"off", "filmic", "reinhard"};
 const char* kReflectNames[] = {"off", "low", "high"};
 const char* kDofNames[] = {"off", "distance", "focus"};
 const char* kHdrToneNames[] = {"off", "agx", "aces"};
+const char* kUpscalerNames[] = {"off", "fsr", "dlss", "xess"};
+const char* kUpscaleQualityNames[] = {"native", "quality", "balanced", "performance"};
 
 std::filesystem::path StyleFile() { return app::ExeDir() / "graphics.toml"; }
 
@@ -91,6 +93,9 @@ void Clamp(GraphicsStyle& s) {
     s.hdr_tonemap = std::clamp(s.hdr_tonemap, 0, int(kHdrTones) - 1);
     s.motion_blur_strength = std::clamp(s.motion_blur_strength, 0.0f, 2.0f);
     s.floor_reflections = std::clamp(s.floor_reflections, 0, 2);
+    s.upscaler = std::clamp(s.upscaler, 0, 3);
+    s.upscale_quality = std::clamp(s.upscale_quality, 0, 3);
+    s.upscale_sharpness = std::clamp(s.upscale_sharpness, 0.0f, 1.0f);
 }
 
 int Index(const std::string& v, const char* const* names, int n, int fallback) {
@@ -109,9 +114,9 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "quality_ao", "quality_bloom", "reflections", "reflection_strength",
                                   "reflections_auto", "soft_particles", "particle_fade",
                                   "effect_lights", "light_strength", "atmosphere", "shaft_strength", "fog_strength", "bounce_light", "bounce_strength",
-                                  "materials", "material_strength", "surface_depth", "relief_high", "displacement", "displace_depth",
+                                  "materials", "material_strength", "surface_depth", "relief_high", "displacement", "displace_depth", "wall_displacement",
                                   "ground_detail", "detail_strength", "detail_distance",
-                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "snow_sparkle", "movie_upscale", "movie_43", "blood",
+                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "snow_sparkle", "movie_upscale", "movie_43", "taa", "upscaler", "upscale_quality", "upscale_sharpness", "rt_denoise", "particles", "blood",
                                   "depth_of_field", "dof_strength", "hdr_tonemap", "auto_exposure",
                                   "motion_blur", "motion_blur_strength",
                                   "smooth_turn", "contact_shadows", "floor_reflections"};
@@ -190,6 +195,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("relief_high", s.relief_high);
     flag("displacement", s.displacement);
     num("displace_depth", s.displace_depth);
+    flag("wall_displacement", s.wall_displacement);
     flag("ground_detail", s.ground_detail);
     num("detail_strength", s.detail_strength);
     num("detail_distance", s.detail_distance);
@@ -210,6 +216,12 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("snow_sparkle", s.snow_sparkle);
     flag("movie_upscale", s.movie_upscale);
     flag("movie_43", s.movie_43);
+    flag("taa", s.taa);
+    named("upscaler", s.upscaler, kUpscalerNames, 4);
+    named("upscale_quality", s.upscale_quality, kUpscaleQualityNames, 4);
+    num("upscale_sharpness", s.upscale_sharpness);
+    flag("rt_denoise", s.rt_denoise);
+    flag("particles", s.particles);
     flag("blood", s.blood);
     named("depth_of_field", s.dof, kDofNames, 3);
     num("dof_strength", s.dof_strength);
@@ -220,6 +232,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("smooth_turn", s.smooth_turn);
     flag("contact_shadows", s.contact_shadows);
     integer("floor_reflections", s.floor_reflections);
+    flag("water", s.water);
     Clamp(s);
 }
 
@@ -274,6 +287,7 @@ toml::table Write(const GraphicsStyle& s) {
                        {"relief_high", s.relief_high},
                        {"displacement", s.displacement},
                        {"displace_depth", double(s.displace_depth)},
+                       {"wall_displacement", s.wall_displacement},
                        {"ground_detail", s.ground_detail},
                        {"detail_strength", double(s.detail_strength)},
                        {"detail_distance", double(s.detail_distance)},
@@ -294,6 +308,12 @@ toml::table Write(const GraphicsStyle& s) {
                        {"snow_sparkle", s.snow_sparkle},
                        {"movie_upscale", s.movie_upscale},
                        {"movie_43", s.movie_43},
+                       {"taa", s.taa},
+                       {"upscaler", kUpscalerNames[s.upscaler]},
+                       {"upscale_quality", kUpscaleQualityNames[s.upscale_quality]},
+                       {"upscale_sharpness", double(s.upscale_sharpness)},
+                       {"rt_denoise", s.rt_denoise},
+                       {"particles", s.particles},
                        {"blood", s.blood},
                        {"depth_of_field", kDofNames[s.dof]},
                        {"dof_strength", double(s.dof_strength)},
@@ -303,7 +323,8 @@ toml::table Write(const GraphicsStyle& s) {
                        {"motion_blur_strength", double(s.motion_blur_strength)},
                        {"smooth_turn", s.smooth_turn},
                        {"contact_shadows", s.contact_shadows},
-                       {"floor_reflections", s.floor_reflections}};
+                       {"floor_reflections", s.floor_reflections},
+                       {"water", s.water}};
 }
 
 // the built-in presets
@@ -468,6 +489,29 @@ uint32_t Walkers(Walker* out, uint32_t max) {
 }
 void ClearFootprints() { g_print_epoch.fetch_add(1); }
 uint32_t FootprintEpoch() { return g_print_epoch.load(); }
+namespace {
+std::mutex g_particles_lock;
+std::vector<ParticleEvent> g_particles;
+double ParticleClock() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+void EmitParticles(uint32_t kind, const float pos[3], const float normal[3], float strength, const float rgb[3]) {
+    ParticleEvent e{kind, {pos[0], pos[1], pos[2]}, {0, 1, 0}, strength, {0.5f, 0.5f, 0.5f}, ParticleClock()};
+    if (normal) std::copy(normal, normal + 3, e.normal);
+    if (rgb) std::copy(rgb, rgb + 3, e.rgb);
+    std::lock_guard<std::mutex> lock(g_particles_lock);
+    if (g_particles.size() < 256) g_particles.push_back(e);
+}
+uint32_t TakeParticles(ParticleEvent* out, uint32_t max) {
+    const double now = ParticleClock();
+    std::lock_guard<std::mutex> lock(g_particles_lock);
+    uint32_t n = 0;
+    for (const ParticleEvent& e : g_particles)
+        if (n < max && now - e.time < 0.25) out[n++] = e;
+    g_particles.clear();
+    return n;
+}
 void SetSceneLights(const SceneLight* lights, uint32_t count) {
     std::lock_guard<std::mutex> lock(g_lights_lock);
     g_lights.assign(lights, lights + count);
@@ -566,6 +610,7 @@ void ApplyPreset(const StylePreset& p) {
     g_style.relief_high = keep.relief_high;
     g_style.displacement = keep.displacement;
     g_style.displace_depth = keep.displace_depth;
+    g_style.wall_displacement = keep.wall_displacement;
     g_style.ground_detail = keep.ground_detail;
     g_style.detail_strength = keep.detail_strength;
     g_style.detail_distance = keep.detail_distance;
@@ -586,6 +631,12 @@ void ApplyPreset(const StylePreset& p) {
     g_style.snow_sparkle = keep.snow_sparkle;
     g_style.movie_upscale = keep.movie_upscale;
     g_style.movie_43 = keep.movie_43;
+    g_style.taa = keep.taa;
+    g_style.upscaler = keep.upscaler;
+    g_style.upscale_quality = keep.upscale_quality;
+    g_style.upscale_sharpness = keep.upscale_sharpness;
+    g_style.rt_denoise = keep.rt_denoise;
+    g_style.particles = keep.particles;
     g_style.blood = keep.blood;
     g_style.dof = keep.dof;
     g_style.dof_strength = keep.dof_strength;
@@ -596,6 +647,7 @@ void ApplyPreset(const StylePreset& p) {
     g_style.smooth_turn = keep.smooth_turn;
     g_style.contact_shadows = keep.contact_shadows;
     g_style.floor_reflections = keep.floor_reflections;
+    g_style.water = keep.water;
     StyleChanged();
 }
 
@@ -670,8 +722,8 @@ int ViewCount() { return g_views.load(); }
 bool ScenePassWanted() {
     return StylePassWanted() ||
            ((app::Get().smaa || g_style.effect_lights || g_style.atmosphere || g_style.bounce_light || g_style.dof ||
-             g_style.weather || g_style.hdr_tonemap || g_style.motion_blur || g_style.smooth_turn || g_style.contact_shadows ||
-             (g_style.ray_tracing && g_ray_tracing.load())) &&
+             g_style.weather || g_style.particles || g_style.hdr_tonemap || g_style.motion_blur || g_style.smooth_turn || g_style.contact_shadows ||
+             g_style.upscaler || (g_style.ray_tracing && g_ray_tracing.load())) &&
             g_style.mode != kStyleRetro);
 }
 float QualityAo(const GraphicsStyle& s) {
@@ -893,6 +945,7 @@ void DrawStyleSettings(bool vulkan) {
     {
         int f = s.floor_reflections;
         if (ImGui::Combo("Floor reflections", &f, "Off\0Ice\0Ice and polished floors\0")) s.floor_reflections = f, changed = true;
+        changed |= ImGui::Checkbox("Water (with reflections on)", &s.water);
     }
     if (ImGui::CollapsingHeader("HDR tone mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
         int h = s.hdr_tonemap;
@@ -935,13 +988,24 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::Checkbox("Movies in 4:3 (black at the sides)", &s.movie_43);
         ImGui::TextDisabled("The 640x480 movies enlarged to the screen with edge-aware filtering and sharpening (Vulkan).");
     }
+    if (ImGui::CollapsingHeader("Temporal", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::Checkbox("TAA (temporal anti-aliasing)", &s.taa);
+        changed |= ImGui::Checkbox("Ray tracing denoise (built up over frames)", &s.rt_denoise);
+        ImGui::TextDisabled("Vulkan. TAA smooths and steadies edges (SMAA is left out with it).");
+    }
+    if (ImGui::CollapsingHeader("Particles", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::Checkbox("GPU particles (sparks, debris, smoke, explosions)", &s.particles);
+        ImGui::TextDisabled("Vulkan. Simulated on the GPU in the world: sparks bounce, smoke rises and drifts.\n"
+                            "Not drawn in split screen or Retro.");
+    }
     if (ImGui::CollapsingHeader("Materials (PBR)", ImGuiTreeNodeFlags_DefaultOpen)) {
         changed |= ImGui::Checkbox("Normal and roughness maps", &s.materials);
         changed |= ImGui::SliderFloat("Material strength", &s.material_strength, 0.0f, 1.5f, "%.2f");
         changed |= ImGui::SliderFloat("Relief depth (0 off)", &s.surface_depth, 0.0f, 2.0f, "%.2f");
         changed |= ImGui::Checkbox("Relief High (more steps, self-shadowing)", &s.relief_high);
-        changed |= ImGui::Checkbox("Ground geometry (the ground cut finer and pushed in; prototype)", &s.displacement);
-        changed |= ImGui::SliderFloat("Ground geometry depth", &s.displace_depth, 0.0f, 3.0f, "%.2f");
+        changed |= ImGui::Checkbox("Ground geometry (the ground cut finer, lumps and hollows)", &s.displacement);
+        changed |= ImGui::Checkbox("Wall geometry (rock and concrete walls made uneven)", &s.wall_displacement);
+        changed |= ImGui::SliderFloat("Geometry depth", &s.displace_depth, 0.0f, 3.0f, "%.2f");
         ImGui::TextDisabled("A texture pack's maps (tools\\hd_pack.exe --pbr) over the game's lighting: bumps and a\n"
                             "specular sheen. Turning them on takes effect at the next start. Not drawn in Retro.");
     }

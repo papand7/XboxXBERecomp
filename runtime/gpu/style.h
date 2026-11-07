@@ -20,6 +20,9 @@ enum Reflections : int { kReflectOff, kReflectLow, kReflectHigh, kReflectLevels 
 // depth of field: off, the distance blurred, focus on what is in the middle of the view
 enum DepthOfField : int { kDofOff, kDofDistance, kDofFocus, kDofModes };
 enum HdrTonemap : int { kHdrToneOff, kHdrToneAgx, kHdrToneAces, kHdrTones };
+// GraphicsStyle::upscaler and upscale_quality (gpu/upscale.h)
+enum Upscaler : int { kUpscalerOff, kUpscalerFsr, kUpscalerDlss, kUpscalerXess, kUpscalers };
+enum UpscaleQuality : int { kUpscaleNative, kUpscaleQuality, kUpscaleBalanced, kUpscalePerformance, kUpscaleQualities };
 
 struct GraphicsStyle {
     std::string preset = "original";  // the preset the values came from ("" once edited)
@@ -84,7 +87,11 @@ struct GraphicsStyle {
     // finds grass, snow, rock or dirt in) cut into more triangles and pushed in by their kind's height, so the ground
     // has real lumps and hollows (seen against the sky, in the ray traced scene, its shadows); its edges stay put
     bool displacement = false;
-    float displace_depth = 1.0f;  // 0 to 3, the push's scale (1: about 8 cm at the lowest)
+    float displace_depth = 1.0f;  // 0 to 3, the push's scale (1: about 8 cm at the lowest, 3.5 cm on walls)
+    // wall geometry (Vulkan; every style but Retro): rock and concrete walls, cliffs and floors cut the same way and
+    // pushed in a little (displace_depth's scale), their corners and edges kept. Both shade the new lumps on the
+    // vertex colour's baked light, refine within about 30 m and leave moving draws alone (gpu/displace.h)
+    bool wall_displacement = false;
     // ground detail (Vulkan; every style but Retro): the scenery's tiling textures get fine detail and bumps up close
     // by their kind (grass, snow, rock, dirt, concrete: gpu/detail.h), fading out by detail_distance metres
     bool ground_detail = true;
@@ -122,7 +129,23 @@ struct GraphicsStyle {
     // movies (Vulkan): a movie's 640x480 frame enlarged to the screen's size on the GPU before it is drawn, edge-aware
     // (Lanczos, kept within its neighbours so edges do not ring) and sharpened, in place of a plain stretch
     bool movie_upscale = true;
-    bool movie_43 = true;  // movies shown 4:3 in the middle of a wide screen (black at the sides), not stretched
+    bool movie_43 = true;
+    // TAA (Vulkan): the 3D scene jittered by a sub-pixel each frame and blended with the frames before (reprojected by
+    // the camera, held within each pixel's neighbours' range): smooth, steady edges; SMAA is left out meanwhile
+    bool taa = false;
+    // temporal upscaler (Vulkan; every style but Retro; one view; gpu/upscale.h): 0 off, 1 AMD FSR 2, 2 NVIDIA DLSS,
+    // 3 Intel XeSS (DLSS and XeSS not built in: off). The 3D scene drawn at the screen's size over the quality's
+    // ratio (0 Native AA 1x, 1 Quality 1.5x, 2 Balanced 1.7x, 3 Performance 2x), jittered, and brought to the screen
+    // with the frames before (camera motion from the depth) before the HUD; TAA and SMAA are left out meanwhile
+    int upscaler = 0;
+    int upscale_quality = 0;
+    float upscale_sharpness = 0.3f;  // 0 to 1 (FSR's RCAS)
+    // ray tracing denoise (Vulkan): the traced bounced and volumetric light built up over frames (reprojected), less grain
+    bool rt_denoise = true;  // movies shown 4:3 in the middle of a wide screen (black at the sides), not stretched
+    // GPU particles (Vulkan; every style but Retro; one view): sparks, dust and chips where shots hit, fire, smoke,
+    // sparks and debris from explosions (EmitParticles), simulated on the GPU in the world (gravity, drag, wind, smoke
+    // and fire rising, sparks and chips bouncing off the scene's depth), drawn over the scene before its tone mapping
+    bool particles = true;
     // blood (every style and renderer, drawn over the picture: app/blood.cpp): a spray where a player's shot hits a
     // character, and red at the edges of a player's view as they are hit, fading
     bool blood = false;
@@ -152,6 +175,7 @@ struct GraphicsStyle {
     // floor reflections (Vulkan, with Reflections on): 1 ice (a bright, bluish, smooth texture), 2 also polished floors
     // (a smooth grey one): reflecting where the surface faces up, more at a grazing view
     int floor_reflections = 0;
+    bool water = false;  // animated water, refraction, depth tint and shore foam (Vulkan; Reflections on)
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;
@@ -205,6 +229,8 @@ void SetStyleRendererActive(bool on);
 void SetViewCount(int n);
 int ViewCount();
 bool RayTracingSupported();  // the Vulkan renderer's GPU has ray queries (set by it)
+bool UpscalerAvailable(int upscaler);  // built in and usable: off and FSR 2 (DLSS and XeSS are not built in)
+float UpscaleRatio(int quality);      // the screen's size over the scene's, each way: 1, 1.5, 1.7, 2
 void SetRayTracingSupported(bool on);
 // the player aims down the sights (the game's thread, each frame): depth of field's focus blurs more
 bool Aiming();
@@ -230,6 +256,25 @@ struct Walker {
 void SetWalkers(const Walker* walkers, uint32_t count);
 uint32_t Walkers(Walker* out, uint32_t max);
 void ClearFootprints();         // a new level
+// GPU particles (GraphicsStyle::particles): the game's effects (its thread), in the world's units as the lights'; at
+// most 256 wait for the renderer, which takes them once a frame (older than a quarter second dropped: a menu, a load)
+enum ParticleKind : uint32_t {
+    kParticleImpact,     // a shot's hit: normal the surface's, strength 1 a bullet's, rgb the surface's dust
+    kParticleExplosion,  // strength the radius (world units)
+    kParticleSmoke,      // a puff of smoke rising (strength its size, world units)
+    kParticleFire,       // a lick of flame (strength its size, world units)
+    kParticleSparks,     // sparks alone (strength 1 a bullet's)
+};
+struct ParticleEvent {
+    uint32_t kind;
+    float pos[3];
+    float normal[3];
+    float strength;
+    float rgb[3];
+    double time;  // seconds (steady clock) it was emitted
+};
+void EmitParticles(uint32_t kind, const float pos[3], const float normal[3], float strength, const float rgb[3]);
+uint32_t TakeParticles(ParticleEvent* out, uint32_t max);  // the renderer, once a frame: the queue emptied
 uint32_t FootprintEpoch();      // counts the clears
 
 }  // namespace gpu

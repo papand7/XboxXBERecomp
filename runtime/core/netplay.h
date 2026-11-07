@@ -7,10 +7,28 @@
 // joins one (port 27015 by default). XBE_NETPLAY_DELAY: frames of input delay (default 2). Both copies must start
 // from the same saved data for the menus to match.
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "core/input.h"
 
 namespace netplay {
+
+constexpr uint16_t kPort = 27015;  // the host's UDP port without one in XBE_NETPLAY
+
+// LAN discovery: a host waiting in its lobby answers a "who hosts?" broadcast on its port
+struct FoundHost {
+    std::string name;     // the host PC's name
+    std::string address;  // its IPv4 address, as heard (dotted)
+    uint16_t port = kPort;
+    int players = 2, joined = 1;  // the players it waits for, those in (itself counted)
+};
+// the hosts waiting in their lobby on this network, heard in the last three seconds; the first call starts the search
+// (a broadcast each second, on a thread of its own), which runs until StopFindingHosts
+std::vector<FoundHost> FindHosts();
+void StopFindingHosts();
+// this PC's IPv4 addresses on its networks (no loopback), the one with a gateway (the router's network) first
+std::vector<std::string> LocalAddresses();
 
 bool Configured();  // XBE_NETPLAY set
 // before the title starts (a thread of its own): the lobby; false when it failed (playing alone)

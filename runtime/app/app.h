@@ -84,6 +84,18 @@ struct Settings {
 int8_t DefaultWheelButton(int c);
 constexpr int kGears = 8;  // an H-pattern shifter's positions: R, 1 to 7
 const char* GearName(int g);  // "R", "1" ... "7"
+// a wheel control bound by moving or pressing it on any device (core/wheel.cpp; the settings window's Wheel tab and a
+// title's own menus): every device's state is kept as it begins, then the first axis moved far enough (the steering a
+// little, a pedal most of its travel) or button newly pressed becomes the binding, saved at once (Save, then
+// input::WheelSetup). One at a time, any thread. While it waits the rig reaches no controller, nor until the button
+// taken is let go (it would press the menu's own buttons)
+enum class WheelDetect { None, Steer, Pedal, Button };
+void WheelDetectStart(WheelDetect kind, Settings::WheelBind& bind);
+void WheelDetectCancel();
+WheelDetect WheelDetecting(const Settings::WheelBind* bind = nullptr);  // what waits (for that binding), None nothing
+bool WheelDetectPoll();  // each frame while one waits: true when the binding was taken
+const char* WheelAxisName(int axis);                       // "X", "Y", "Z", "Rx", "Ry", "Rz", "Slider 1", "Slider 2"
+std::string WheelBindText(const Settings::WheelBind& b);  // "the wheel: X axis", "G27 Pedals: button 3", "-" unbound
 // the default keys for input::Control c
 std::array<uint16_t, 2> DefaultKeys(int c);
 std::string KeyToName(uint16_t vk);  // settings file names of Windows virtual keys
@@ -258,6 +270,8 @@ struct GameInfo {
     // Vulkan always (Settings::renderer held at 2, the settings window's Renderer choice not shown): a title whose
     // look is Vulkan's. Direct3D 12 still starts in its place on a PC where Vulkan cannot
     bool vulkan_only = false;
+    // the settings window (F1); a title whose settings are all in its own menus and its launcher turns it off
+    bool settings_window = true;
     // smooth turning (GraphicsStyle::smooth_turn): how far the view will turn by the mouse the title has not read yet,
     // radians (yaw right, pitch up), and the tangent of half its vertical field of view; false when it does not
     // (menus, cutscenes, a controller)

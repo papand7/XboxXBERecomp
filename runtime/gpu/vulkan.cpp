@@ -57,6 +57,7 @@
 #include "gpu/detail.h"
 #include "gpu/displace.h"
 #include "gpu/vertex.h"
+#include "gpu/upscale.h"
 #include "kernel/kernel.h"
 
 using Microsoft::WRL::ComPtr;
@@ -495,6 +496,10 @@ struct Target {
     Image rt_ao;      // ray traced ambient occlusion: what is open (r) and the distance (g), the scene's size
     Image rt_gi;      // ray traced bounced light (kRtRelightHlsl's gi): its light and distance, half the scene's size
     Image rt_vol;     // ray traced volumetric light (kRtRelightHlsl's vol): the air's light and distance, half size
+    // temporal: the bounced and volumetric light built up over frames (kTemporalHlsl's acc), this frame's and the
+    // last's in turn, and the frames they were made for; TAA's history likewise
+    Image rt_gi_acc[2], rt_vol_acc[2], taa_hist[2];
+    uint64_t gi_acc_frame = 0, vol_acc_frame = 0, taa_frame = 0;
     Image gtao;       // ground truth ambient occlusion (kGtaoHlsl): what is open (r) and the distance (g), half size
     Image dof_focus[2];  // depth of field: the distance in focus (1 / metres), this frame's and the last's in turn
     uint64_t dof_frame = 0;  // the frame (presents_ + 1) it was last drawn for
@@ -510,6 +515,13 @@ struct Target {
     uint64_t hdr_ratio_frame = 0;
     uint64_t tone_frame = 0;
     uint64_t hdr_frame = 0;
+    // the temporal upscaler drawing the scene smaller (VulkanBackend::UpscaleShrink): while up_small, res and fb are
+    // the smaller pair and alt_res, alt_fb the screen-sized ones put aside (else the other way about); the depth's last
+    // clear, which a smaller depth target starts from
+    Image alt_res, alt_fb;
+    bool up_small = false;
+    float clear_z = 1;
+    uint32_t clear_stencil = 0;
 };
 
 // a texture from guest memory
@@ -702,7 +714,7 @@ std::string LocateInputs(std::string src) {
 // holds what was drawn after a mid-frame clear alone (NightFire's gun and hands: RtKeepDepth kept the world's). t0 the
 // scene, t1 its depth, t2 the reflection mask (r), t3 its depth; s0 linear, s1 point.
 const char* kScenePostHlsl = R"(
-cbuffer P : register(b1) { float4 p[11]; };
+cbuffer P : register(b1) { float4 p[12]; };
 Texture2D scene : register(t0);
 Texture2D<float> depthtex : register(t1);
 Texture2D maskc : register(t2);
@@ -834,7 +846,9 @@ float2 screenuv(float3 v) { return v.xy / (v.z * p[8].z * float2(p[8].w, -1)) * 
 float3 ssr(float2 uv, float2 px, float3 c) {
     if (p[8].x == 0) return c;
     float4 mk = maskc.SampleLevel(pt, uv, 0);
-    float m = abs(mk.r);
+    bool water = mk.r < -1.5;
+    if (!water && p[11].x != 0) return c;  // already reflected by ray tracing
+    float m = water ? 0.7 : abs(mk.r);
     if (m < 0.01) return c;
     if (p[9].z == 1) return lerp(c, float3(1, 0, 0), 0.5 * m);  // XBE_SSR_TEST=2: the mask shown
     float gz = mk.a;
@@ -847,6 +861,32 @@ float3 ssr(float2 uv, float2 px, float3 c) {
     if (dot(N, P) > 0) N = -N;
     if (mk.r < 0) m *= saturate((dot(N, p[10].yzw) - 0.8) * 5);  // a floor's: where it faces up (p[10].yzw the up)
     if (m < 0.01) return c;
+    if (water) {
+        // Small travelling ripples in the surface's plane. The mask still supplies the undisturbed surface's
+        // depth, so waves cannot refract a foreground object into the water or shift its shoreline.
+        float3 U = normalize(p[10].yzw);
+        float3 X = normalize(cross(U, abs(U.z) < 0.9 ? float3(0, 0, 1) : float3(0, 1, 0)));
+        float3 Z = cross(X, U);
+        float2 q = float2(dot(P, X), dot(P, Z));
+        float tm = p[0].w;
+        float2 ripple = float2(cos(dot(q, float2(2.1, 1.3)) + tm * 1.4),
+                               sin(dot(q, float2(-1.2, 2.7)) - tm * 1.1));
+        N = normalize(N + (X * ripple.x + Z * ripple.y) * 0.045);
+        float behind = viewz(rawz(uv));
+        float thickness = clamp(behind - gz, 0, 20);
+        float2 bend = ripple * px * min(6, thickness * 3);
+        float2 refracted = clamp(uv + bend, px, 1 - px);
+        float4 other = maskc.SampleLevel(pt, refracted, 0);
+        // Refraction stays inside this water surface and behind it.
+        if (other.r < -1.5 && viewz(rawz(refracted)) >= gz * 0.995)
+            c = lerp(c, texl(refracted), 0.3 * saturate(thickness * 2));
+        float3 transmit = exp(-float3(0.28, 0.10, 0.065) * thickness);
+        c = c * transmit + float3(0.025, 0.10, 0.12) * (1 - transmit);
+        // Foam is confined to shallow intersections, with a broken, moving edge rather than a solid white line.
+        float foam = (1 - smoothstep(0.03, 0.4, thickness)) * smoothstep(0.005, 0.04, thickness);
+        foam *= smoothstep(0.05, 0.8, noise(q * 19 + tm * 0.2));
+        c = lerp(c, float3(0.65, 0.75, 0.73), foam * 0.45);
+    }
     float3 V = normalize(P);
     float3 R = reflect(V, N);
     if (p[9].z == 2) return N * 0.5 + 0.5;  // XBE_SSR_TEST=3: the slope
@@ -1243,6 +1283,273 @@ float4 ps(O i) : SV_Target {
 }
 )";
 
+// GPU particles (VulkanBackend::ParticlePass, GraphicsStyle::particles): 8192 particles in a ring, their state in a
+// 384 x 64 float image (columns 0-127 the place (the world's) and age, 128-255 the velocity (world units a second)
+// and life (seconds; negative once bounced, or a chip at rest), 256-383 the colour and kind * 16 + size (metres)),
+// two of them in turn. sim: each texel works out its particle's next state (the part it holds): new ones from this
+// frame's groups (a range of the ring each, made random from the particle's number), else gravity, drag toward the
+// wind, smoke and fire rising, and sparks and chips bounced off the scene's depth where they cross it on screen (the
+// surface's normal from the depth). dvs / dps draw them: six vertices a particle, a quad facing the view (sparks
+// stretched along their motion), hidden behind the scene's depth (the gun's too), smoke, dust and fire fading near
+// it; sparks and fire added (past white in the HDR scene), smoke, dust and chips blended over. Kinds: 0 a spark,
+// 1 smoke, 2 fire, 3 a chip, 4 dust. b1 p: [0] 1/width, 1/height, tan of half the vertical view, width / height;
+// [1] the depth was kept, seconds since the last step, metres a world unit, reset; [2]-[4] the view to the world
+// (rows); [5]-[7] the world to the view; [8] the wind (world x, z, metres a second), the frame, groups; [9] the
+// light's colour, HDR; [16 + 5g] a group: place, first; direction, count; colour, kind; speed (m/s), spread, size
+// (m), life (s); jitter (m), speed's spread, size's spread, stagger (s). t0 the state, t1 the depth, t2 the kept
+// depth; s1 point
+const char* kParticleHlsl = R"(
+cbuffer P : register(b1) { float4 p[16 + 5 * 160]; };
+Texture2D<float4> state : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D<float> keptz : register(t2);
+SamplerState pt : register(s1);
+static const uint NW = 128, NH = 64, NTOT = NW * NH;
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float3 toview(float3 w) { return float3(dot(p[5].xyz, w) + p[5].w, dot(p[6].xyz, w) + p[6].w, dot(p[7].xyz, w) + p[7].w); }
+float3 dirview(float3 w) { return float3(dot(p[5].xyz, w), dot(p[6].xyz, w), dot(p[7].xyz, w)); }
+float3 dirworld(float3 v) { return float3(dot(p[2].xyz, v), dot(p[3].xyz, v), dot(p[4].xyz, v)); }
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z); }
+// the world's depth (without the gun) for bounces; the nearest (with it) for hiding
+float worldd(float2 uv) { return p[1].x != 0 ? keptz.SampleLevel(pt, uv, 0) : depthtex.SampleLevel(pt, uv, 0); }
+float nearz(int2 px) {
+    float d = depthtex.Load(int3(px, 0));
+    return p[1].x != 0 ? min(d, keptz.Load(int3(px, 0))) : d;
+}
+uint hashu(uint n) {
+    n ^= n >> 16;
+    n *= 0x7feb352du;
+    n ^= n >> 15;
+    n *= 0x846ca68bu;
+    n ^= n >> 16;
+    return n;
+}
+float rnd(inout uint s) {
+    s = hashu(s);
+    return float(s & 0xFFFFFFu) / 16777216.0;
+}
+float3 rndsphere(inout uint s) {
+    float z = rnd(s) * 2 - 1, a = rnd(s) * 6.2831853, r = sqrt(saturate(1 - z * z));
+    return float3(r * cos(a), r * sin(a), z);
+}
+struct Part { float4 pos; float4 vel; float4 attr; };
+Part loadp(uint i) {
+    int2 at = int2(i % NW, i / NW);
+    Part q;
+    q.pos = state.Load(int3(at, 0));
+    q.vel = state.Load(int3(at + int2(NW, 0), 0));
+    q.attr = state.Load(int3(at + int2(2 * NW, 0), 0));
+    return q;
+}
+// a new particle of this frame's groups (the last group whose range holds it)
+bool spawned(uint i, out Part q) {
+    q = (Part)0;
+    int n = int(p[8].w), g = -1;
+    uint k = 0;
+    [loop] for (int j = 0; j < n; j++) {
+        uint first = uint(p[16 + 5 * j].w), cnt = uint(p[17 + 5 * j].w);
+        uint d = (i + NTOT - first) % NTOT;
+        if (d < cnt) {
+            g = j;
+            k = d;
+        }
+    }
+    if (g < 0) return false;
+    float4 g0 = p[16 + 5 * g], g1 = p[17 + 5 * g], g2 = p[18 + 5 * g], g3 = p[19 + 5 * g], g4 = p[20 + 5 * g];
+    uint s = hashu(i * 9781u + uint(p[8].z) * 6271u + k * 31u + 17u);
+    float unit = p[1].z;
+    float3 jit = rndsphere(s) * pow(rnd(s), 0.333) * g4.x / unit;
+    float3 d = normalize(g1.xyz + rndsphere(s) * g3.y + 1e-5);
+    if (g3.y < 1.5 && dot(d, g1.xyz) < 0) d -= 2 * dot(d, g1.xyz) * g1.xyz;  // the surface's side
+    float speed = g3.x * (1 - g4.y * rnd(s));
+    float life = g3.w * (0.6 + 0.8 * rnd(s));
+    float size = clamp(g3.z * (1 - g4.z + 2 * g4.z * rnd(s)), 0.002, 15.9);
+    float age = -rnd(s) * g4.w;  // staggered: born a little later
+    q.pos = float4(g0.xyz + jit, age);
+    q.vel = float4(d * speed / unit, life);
+    q.attr = float4(g2.rgb * (0.85 + 0.3 * rnd(s)), floor(g2.w + 0.5) * 16 + size);
+    return true;
+}
+// a spark or a chip crossing the scene's depth on screen bounces off it (a spark once, then it dies)
+void collide(inout Part q, inout float3 v, int kind, float life) {
+    float dt = p[1].y, unit = p[1].z;
+    float3 vp = toview(q.pos.xyz + v / unit * dt);
+    if (vp.z < 0.1) return;
+    float2 uv = float2(vp.x / (vp.z * p[0].z * p[0].w) * 0.5 + 0.5, 0.5 - vp.y / (vp.z * p[0].z) * 0.5);
+    if (any(uv < 0.003) || any(uv > 0.997)) return;
+    float d = worldd(uv);
+    float zs = d * 4096;
+    if (d >= 0.99999 || vp.z <= zs || vp.z - zs > max(0.3, length(v) * dt * 3)) return;
+    float2 px = p[0].xy * 2;
+    float3 P = viewpos(uv, zs);
+    float3 l = viewpos(uv - float2(px.x, 0), worldd(uv - float2(px.x, 0)) * 4096);
+    float3 r = viewpos(uv + float2(px.x, 0), worldd(uv + float2(px.x, 0)) * 4096);
+    float3 u = viewpos(uv - float2(0, px.y), worldd(uv - float2(0, px.y)) * 4096);
+    float3 dn = viewpos(uv + float2(0, px.y), worldd(uv + float2(0, px.y)) * 4096);
+    float3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;
+    float3 dy = abs(dn.z - P.z) < abs(P.z - u.z) ? dn - P : P - u;
+    float3 nv = cross(dx, dy);
+    if (dot(nv, nv) < 1e-12) return;
+    nv = normalize(nv);
+    if (dot(nv, P) > 0) nv = -nv;  // toward the camera
+    float3 n = normalize(dirworld(nv));
+    float vn = dot(v, n);
+    if (vn >= 0) return;
+    if (kind == 0 && q.vel.w < 0) {  // a spark's second bounce: gone
+        q.pos.w = life;
+        return;
+    }
+    float3 vt = v - vn * n;
+    v = vt * (kind == 0 ? 0.7 : 0.45) - vn * (kind == 0 ? 0.45 : 0.3) * n;
+    q.vel.w = -life;
+    if (kind == 3 && length(v) < 0.7) v = 0;  // a chip at rest
+}
+Part stepp(Part q, uint i) {
+    float dt = p[1].y, unit = p[1].z;
+    float life = abs(q.vel.w);
+    if (life <= 0 || q.pos.w >= life) return q;
+    if (q.pos.w < 0) {
+        q.pos.w += dt;
+        return q;
+    }
+    int kind = int(q.attr.w / 16);
+    float t = q.pos.w / life;
+    float3 v = q.vel.xyz * unit;  // metres a second
+    float3 acc = 0;
+    float drag = 0.5, windk = 0;
+    if (kind == 0) acc.y = -9.8, drag = 0.7;                           // a spark
+    else if (kind == 1) acc.y = 0.9 * (1 - t), drag = 1.4, windk = 1;    // smoke
+    else if (kind == 2) acc.y = 4.5 * (1 - t), drag = 3.0, windk = 0.4;  // fire
+    else if (kind == 3) acc.y = -9.8, drag = 0.15;                     // a chip
+    else acc.y = -0.35, drag = 2.2, windk = 0.7;                       // dust
+    if (kind == 1 || kind == 2 || kind == 4) {  // a slow swirl
+        float h = float(hashu(i) & 1023) / 1023 * 6.2831853, T = p[8].z / 60;
+        acc.xz += float2(sin(T * 1.3 + h), cos(T * 1.1 + h * 1.7)) * (kind == 2 ? 1.2 : 0.5);
+    }
+    bool rest = kind == 3 && q.vel.w < 0 && dot(v, v) == 0;
+    if (!rest) {
+        float3 wind = float3(p[8].x, 0, p[8].y) * windk;
+        v += (wind - v) * (1 - exp(-drag * dt)) + acc * dt;
+        if (kind == 0 || kind == 3) collide(q, v, kind, life);
+    }
+    q.vel.xyz = v / unit;
+    q.pos.xyz += q.vel.xyz * dt;
+    q.pos.w += dt;
+    return q;
+}
+float4 sim(O o) : SV_Target {
+    uint2 at = uint2(o.pos.xy);
+    uint region = at.x / NW, i = at.y * NW + at.x % NW;
+    if (p[1].w != 0) return 0;
+    Part q;
+    if (!spawned(i, q)) {
+        q = loadp(i);
+        if (region < 2) q = stepp(q, i);
+    }
+    return region == 0 ? q.pos : region == 1 ? q.vel : q.attr;
+}
+struct D {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+    nointerpolation float4 info : TEXCOORD1;  // kind, age / life, view distance, radius (metres)
+    nointerpolation float4 col : TEXCOORD2;
+};
+D dvs(uint id : SV_VertexID) {
+    D o = (D)0;
+    o.pos = float4(2, 2, 2, 1);  // none: off the screen
+    uint i = id / 6, c = id % 6;
+    Part q = loadp(i);
+    float life = abs(q.vel.w), age = q.pos.w;
+    if (life <= 0 || age < 0 || age >= life) return o;
+    const float2 corners[6] = {float2(-1, -1), float2(1, -1), float2(1, 1), float2(-1, -1), float2(1, 1), float2(-1, 1)};
+    float2 cn = corners[c];
+    int kind = int(q.attr.w / 16);
+    float size = q.attr.w - kind * 16, t = age / life;
+    float ty = p[0].z, aspect = p[0].w;
+    float3 v = toview(q.pos.xyz);
+    if (v.z < 0.12) return o;
+    float px = 2 * ty * v.z * p[0].y;  // a pixel at its distance, metres
+    float3 at;
+    float r;
+    if (kind == 0) {
+        float3 vv = dirview(q.vel.xyz);  // metres a second in the view
+        float3 back = v - vv * 0.03;
+        if (back.z < 0.1) back = v;
+        float2 ax = v.xy / v.z - back.xy / back.z;
+        float2 dir = length(ax) > 1e-7 ? normalize(ax) : float2(0, 1);
+        float2 perp = float2(-dir.y, dir.x);
+        // far off at least some 2.5 pixels long (plus its ends) and 2 wide, growing smoothly into its own size near
+        float len = length(ax) * v.z, want = sqrt(len * len + 6.25 * px * px);
+        back = len > 1e-5 * v.z ? v + (back - v) * (want / len) : v - float3(dir * want, 0);
+        if (back.z < 0.1) back = v - float3(dir * want, 0);
+        r = sqrt(size * size + 0.8 * px * px);
+        at = (cn.y > 0 ? v : back) + float3(perp * cn.x * r + dir * cn.y * r, 0);
+    } else {
+        float grow = kind == 1 ? 1 + 2.0 * sqrt(t) : kind == 2 ? 0.6 + 1.2 * t : kind == 4 ? 1 + 2.5 * t : 1;
+        // far off at least a few pixels across (chips 2.4, dust 5, smoke and fire 6), growing smoothly into its size
+        float least = kind == 3 ? 1.2 : kind == 4 ? 2.5 : 3.0;
+        r = sqrt(size * size * grow * grow + least * least * px * px);
+        float ang = float(hashu(i) & 1023) / 1023 * 6.2831853 + age * (kind == 3 ? 8.0 : 0.4) * ((i & 1) ? 1 : -1);
+        float2 rc = float2(cn.x * cos(ang) - cn.y * sin(ang), cn.x * sin(ang) + cn.y * cos(ang));
+        at = v + float3(rc * r, 0);
+    }
+    o.pos = float4(at.x / (aspect * ty), at.y / ty, 0.5 * at.z, at.z);
+    o.uv = cn;
+    o.info = float4(kind, t, v.z, r);
+    o.col = float4(q.attr.rgb, float(hashu(i * 3u + 1u) & 255) / 255);
+    return o;
+}
+float4 dps(D o) : SV_Target {
+    int kind = int(o.info.x + 0.5);
+    float t = o.info.y, z = o.info.z;
+    float d = nearz(int2(o.pos.xy));
+    float zs = d >= 0.99999 ? 1e6 : d * 4096;
+    bool soft = kind == 1 || kind == 2 || kind == 4;
+    // smoke, dust and fire a ball of the quad's radius: the part of its depth through the pixel in front of the
+    // scene (a big puff fades into a wall it meets rather than being cut along the wall's edge)
+    float h = o.info.w * sqrt(saturate(1 - dot(o.uv, o.uv)));
+    float vis = soft ? saturate((zs - (z - h)) / max(2 * h, max(o.info.w * 0.2, 0.05))) : (z < zs + 0.03 ? 1 : 0);
+    if (vis <= 0) discard;
+    float hdr = p[9].w;
+    float3 light = p[9].rgb;
+    float2 uv = o.uv;
+    float r = length(uv);
+    if (kind == 0) {
+        float a = saturate(1 - uv.x * uv.x) * saturate((1 - abs(uv.y)) * 3) * (0.3 + 0.7 * (uv.y * 0.5 + 0.5));
+        float3 c = lerp(float3(1, 0.85, 0.55), float3(1, 0.38, 0.06), saturate(t * 1.4)) * (1 - t * t);
+        return float4(c * a * vis * lerp(1.8, 5.0, hdr), 0);
+    }
+    if (kind == 2) {
+        float a = pow(saturate(1 - r), 1.5);
+        a *= 0.7 + 0.3 * sin(uv.x * 6 + t * 9 + o.col.w * 20) * sin(uv.y * 5 - t * 7);
+        float3 c = t < 0.25 ? lerp(float3(1, 0.85, 0.5), float3(1, 0.45, 0.1), t / 0.25)
+                            : lerp(float3(1, 0.45, 0.1), float3(0.3, 0.06, 0.01), saturate((t - 0.25) / 0.6));
+        a *= saturate((1 - t) * 3);
+        return float4(c * a * vis * lerp(1.0, 3.5, hdr), 0);
+    }
+    if (kind == 3) {
+        float edge = 0.75 + 0.2 * sin(atan2(uv.y, uv.x) * 3 + o.col.w * 6.28);
+        if (max(abs(uv.x), abs(uv.y)) > edge) discard;
+        float a = saturate((1 - t) * 6) * vis;
+        float3 c = o.col.rgb * light * (0.6 + 0.25 * uv.y);
+        return float4(c * a, a);
+    }
+    // smoke and dust: soft puffs lit by the light's colour, a little brighter on top
+    float a = pow(saturate(1 - r), 1.6) * (0.8 + 0.2 * sin(uv.x * 5 + uv.y * 3 + t * 4 + o.col.w * 9));
+    float op = kind == 1 ? saturate(t * 6) * (1 - t) * (1 - t) * 0.4 : saturate(t * 10) * (1 - t) * (1 - t) * 0.65;
+    a *= op * vis;
+    float3 c = o.col.rgb * light * (0.85 + 0.25 * uv.y);
+    return float4(c * a, a);
+}
+)";
+
 // ground truth ambient occlusion (VulkanBackend::GtaoPass; Jimenez et al. 2016, as Intel's XeGTAO): at half the
 // scene's size, for each pixel a few slices about the view ray, in each the highest horizon either side within a
 // radius in metres (falling off toward it), the visible arc of the cosine weighted hemisphere about the surface's
@@ -1506,6 +1813,149 @@ float4 sharp(O i) : SV_Target {
     float3 lobe3 = max(-hit_min, hit_max);
     float lobe = max(-0.1875, min(max(lobe3.r, max(lobe3.g, lobe3.b)), 0)) * p[1].z;
     return float4(saturate((lobe * (b + h + l + r) + e.rgb) / (4 * lobe + 1)), e.a);
+}
+)";
+
+// temporal passes (VulkanBackend::Accumulate, TaaPass): a pixel's place in the world (its depth, the view's inverse)
+// put through the last frame's view gives where it was; what was there last frame is taken when its distance there
+// agrees. acc: the ray traced bounced or volumetric light (half size; alpha its distance: the view's z, or with p[1].z
+// the ray's length) blended into what was built up (p[1].y of the new each frame). taa: the scene blended into its
+// history, the history held within the pixel's neighbours' range (no ghosts), the gun and hands (nearer than the
+// kept depth) where they were. b1 p[8]: [0] 1/width, 1/height, tan of half the vertical view, width / height; [1] a
+// last frame, the new's share, distance mode (acc) or the kept depth is there (taa), test; [2..4] the view to the
+// world now; [5..7] the world to the last frame's view. acc: t0 this frame's, t1 the built up; taa: t0 the scene,
+// t1 its history, t2 its depth, t3 the depth kept at the mid-frame clear.
+const char* kTemporalHlsl = R"(
+cbuffer P : register(b1) { float4 p[8]; };
+Texture2D t0 : register(t0);
+Texture2D t1 : register(t1);
+Texture2D<float> depthtex : register(t2);
+Texture2D<float> keptz : register(t3);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z); }
+float2 screenuv(float3 v) { return v.xy / (v.z * p[0].z * float2(p[0].w, -1)) * 0.5 + 0.5; }
+float3 toworld(float3 v) { return float3(dot(p[2].xyz, v) + p[2].w, dot(p[3].xyz, v) + p[3].w, dot(p[4].xyz, v) + p[4].w); }
+float3 tolast(float3 w) { return float3(dot(p[5].xyz, w) + p[5].w, dot(p[6].xyz, w) + p[6].w, dot(p[7].xyz, w) + p[7].w); }
+float4 acc(O i) : SV_Target {
+    float4 c = t0.SampleLevel(pt, i.uv, 0);
+    if (p[1].x == 0 || c.a <= 0) return c;
+    float3 v = p[1].z != 0 ? normalize(viewpos(i.uv, 1)) * c.a : viewpos(i.uv, c.a);
+    float3 l = tolast(toworld(v));
+    if (l.z <= 0.05) return c;
+    float2 luv = screenuv(l);
+    if (any(luv < 0) || any(luv > 1)) return c;
+    float4 h = t1.SampleLevel(pt, luv, 0);
+    float want = p[1].z != 0 ? length(l) : l.z;
+    if (h.a <= 0 || abs(h.a - want) > want * 0.04 + 0.05) return c;  // something else there last frame
+    if (int(p[1].w) == 1) return float4(0, 1, 0, c.a);                // XBE_TEMPORAL_TEST=1: green where kept
+    return float4(lerp(h.rgb, c.rgb, p[1].y), c.a);
+}
+float3 tolum(float3 c) { return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25))); }
+float3 fromlum(float3 y) { return float3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }
+float4 taa(O i) : SV_Target {
+    float2 uv = i.uv, px = p[0].xy;
+    float3 c = t0.SampleLevel(pt, uv, 0).rgb;
+    if (p[1].x == 0) return float4(c, 1);
+    // the neighbours' mean and spread (YCoCg): the history kept within them
+    float3 m1 = 0, m2 = 0;
+    [unroll] for (int y = -1; y <= 1; y++)
+        [unroll] for (int x = -1; x <= 1; x++) {
+            float3 s = tolum(t0.SampleLevel(pt, uv + float2(x, y) * px, 0).rgb);
+            m1 += s, m2 += s * s;
+        }
+    m1 /= 9, m2 /= 9;
+    float3 sd = sqrt(max(m2 - m1 * m1, 0));
+    float3 lo = m1 - sd * 1.25, hi = m1 + sd * 1.25;
+    // where it was: the gun and hands move with the view (as they were), the world by its depth
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    bool gun = p[1].z != 0 && d < keptz.SampleLevel(pt, uv, 0) - 1e-6;
+    float2 luv = uv;
+    if (!gun) {
+        float dz = p[1].z != 0 ? keptz.SampleLevel(pt, uv, 0) : d;
+        float z = dz >= 0.99999 ? 3000 : dz * 4096;
+        float3 l = tolast(toworld(viewpos(uv, z)));
+        if (l.z > 0.05) luv = screenuv(l);
+    }
+    if (any(luv < 0) || any(luv > 1)) return float4(c, 1);
+    float3 h = t1.SampleLevel(ls, luv, 0).rgb;
+    h = fromlum(clamp(tolum(h), lo, hi));
+    // moving fast: more of the new (less smear)
+    float moved = length((luv - uv) / px);
+    float k = lerp(p[1].y, 0.35, saturate(moved / 24));
+    if (int(p[1].w) == 2) return float4(saturate(moved / 8), 0, 0, 1);  // XBE_TEMPORAL_TEST=2: the motion
+    return float4(lerp(h, c, k), 1);
+}
+)";
+
+// the temporal upscaler's inputs beside the scene (VulkanBackend::UpscalePass), at the scene's size: depth, FSR 2's
+// device depth (0 near to 1 far: p[8].x near, p[8].y far, metres; the sky 1) from the W-buffer (W = d * 4096 metres)
+// and the depth kept at the mid-frame clear (the gun and hands nearer than it); motion, the camera's: where each
+// pixel was last frame (reprojected through its distance as kTemporalHlsl's taa does) less where it is, in UV units,
+// 0 for the gun and hands (they move with the view) and without a last frame. b1 p[8] as kTemporalHlsl's taa: [0]
+// 1/width, 1/height, tan of half the vertical view, width / height; [1] a last frame, -, the kept depth is there,
+// test; [2..4] the view to the world now; [5..7] the world to the last frame's view; [8] near, far. t0 the scene's
+// depth, t1 the depth kept at the mid-frame clear; reactive: t2, t3 the scene before and after the snow and
+// particles. XBE_UP_TEST=2: no motion.
+const char* kUpscaleHlsl = R"(
+cbuffer P : register(b1) { float4 p[9]; };
+Texture2D<float> depthtex : register(t0);
+Texture2D<float> keptz : register(t1);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z); }
+float2 screenuv(float3 v) { return v.xy / (v.z * p[0].z * float2(p[0].w, -1)) * 0.5 + 0.5; }
+float3 toworld(float3 v) { return float3(dot(p[2].xyz, v) + p[2].w, dot(p[3].xyz, v) + p[3].w, dot(p[4].xyz, v) + p[4].w); }
+float3 tolast(float3 w) { return float3(dot(p[5].xyz, w) + p[5].w, dot(p[6].xyz, w) + p[6].w, dot(p[7].xyz, w) + p[7].w); }
+// the pixel's depth (0 to 1 of 4096 metres) and whether it is the gun or hands
+float scenez(float2 uv, out bool gun) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    float k = p[1].z != 0 ? keptz.SampleLevel(pt, uv, 0) : d;
+    gun = p[1].z != 0 && d < k - 1e-6;
+    return gun ? d : k;
+}
+float4 depth(O i) : SV_Target {
+    bool gun;
+    float d = scenez(i.uv, gun);
+    if (d >= 0.99999) return float4(1, 0, 0, 0);
+    float n = p[8].x, f = p[8].y, z = max(d * 4096, n);
+    return float4(saturate(f * (z - n) / (z * (f - n))), 0, 0, 0);
+}
+float4 motion(O i) : SV_Target {
+    if (p[1].x == 0) return 0;
+    bool gun;
+    float d = scenez(i.uv, gun);
+    if (gun) return 0;
+    float z = d >= 0.99999 ? 3000 : d * 4096;
+    float3 l = tolast(toworld(viewpos(i.uv, z)));
+    if (l.z <= 0.05) return 0;
+    float2 mv = screenuv(l) - i.uv;
+    if (int(p[1].w) == 2) return 0;  // XBE_UP_TEST=2: no motion
+    return float4(mv, 0, 0);
+}
+// the reactive mask: where the snow and particles changed the scene (t2 before them, t3 after), up to 0.9
+Texture2D before : register(t2);
+Texture2D after : register(t3);
+float4 reactive(O i) : SV_Target {
+    float3 a = before.SampleLevel(pt, i.uv, 0).rgb, b = after.SampleLevel(pt, i.uv, 0).rgb;
+    float3 d = abs(b - a) / (max(a, b) + 0.05);
+    return float4(saturate(max(d.r, max(d.g, d.b)) * 2.5) * 0.9, 0, 0, 0);
 }
 )";
 
@@ -1895,13 +2345,14 @@ VOut main(%s, uint rt_vid : SV_VertexID) {
     int slot = int(rt_vid) - rt_pc.vmin;
     if (slot >= 0 && uint(slot) < rt_pc.count) {
         float3 v;
+        float2 pxy = o.pos.xy - taa.xy * o.pos.w;  // without TAA's jitter: the traced world stays still
         if (hud.w != 0) {
             float k = wdepth.w * wdepth.z * 4096;  // W-buffered: x y w scale to metres alike
-            v = float3(o.pos.xy, o.wlin) * k;
+            v = float3(pxy, o.wlin) * k;
         } else {
             float w = abs(o.pos.w) > 1e-8 ? o.pos.w : 1e-8;
             float z = 1 / max(1 - o.pos.z / w, 1e-6);
-            v = float3(o.pos.xy / w * z, z);
+            v = float3(pxy / w * z, z);
         }
         uint at = (rt_pc.base + uint(slot)) * 32;
         rt_cap.Store4(at, asuint(float4(v, saturate(o.fogamt))));
@@ -2152,6 +2603,7 @@ float4 ps(O i) : SV_Target {
     float2 uv = i.uv, px = p[0].xy;
     float3 c = scene.SampleLevel(pt, uv, 0).rgb;
     float4 mk = maskc.SampleLevel(pt, uv, 0);
+    if (mk.r < -1.5) return float4(c, 1);  // animated water is shaded by the later surface pass
     float m = abs(mk.r), gz = mk.a;
     if (m < 0.01 || gz <= 0 || viewz(depthat(uv)) < gz * 0.995) return float4(c, 1);
     float3 P = viewpos(uv, gz);
@@ -2237,7 +2689,7 @@ float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
     float cover = style.w > 0 ? 1 : smoothstep(0.02, 0.12, c.a);
     if (cover <= 0) discard;
     float vz = 1 / max(1 - i.pos.z, 1e-6);
-    return float4(style.z * cover, ddx_fine(vz) / vz, ddy_fine(vz) / vz, vz);
+    return float4(style.z < -1.5 ? style.z : style.z * cover, ddx_fine(vz) / vz, ddy_fine(vz) / vz, vz);
 }
 )";
 const char* kMaskMainW = R"(
@@ -2246,7 +2698,7 @@ float4 main(VOut i, bool front : SV_IsFrontFace, out float depth : SV_Depth) : S
     float cover = style.w > 0 ? 1 : smoothstep(0.02, 0.12, c.a);
     if (cover <= 0) discard;
     float vz = i.wlin * wdepth.w * wdepth.z * 4096;
-    return float4(style.z * cover, ddx_fine(vz) / vz, ddy_fine(vz) / vz, vz);
+    return float4(style.z < -1.5 ? style.z : style.z * cover, ddx_fine(vz) / vz, ddy_fine(vz) / vz, vz);
 }
 )";
 // effect lights (VulkanBackend::DrawGlow, RGBA16F, added): the draw's own pixel shader (renamed game_main), what it
@@ -3061,7 +3513,7 @@ private:
     VkPipeline PassPipeline(const PassKey& k);
     void FullScreen(VkPipeline p, const Attachments& a, const VkViewport& vp, const VkRect2D& sc, const float* cb,
                     uint32_t cb_floats, const VkImageView* views, uint32_t n_views,
-                    VkAccelerationStructureKHR tlas = VK_NULL_HANDLE);
+                    VkAccelerationStructureKHR tlas = VK_NULL_HANDLE, uint32_t vertices = 3);
     void Blit(VkImageView src, const Attachments& a, const VkViewport& vp, const VkRect2D& sc, const float uvrect[4],
               const BlitOptions& o, VkFormat fmt = kBgra);
     void BlitWhole(VkImageView src, const Image& dst, const BlitOptions& o);
@@ -3236,6 +3688,34 @@ private:
     VkSemaphore warp_sem_[kFramesInFlight] = {};
     uint32_t refresh_hz_ = 60;  // the window's screen's (CreateSwapchain)
     float mb_last_[3][4] = {};                    // the last frame's world to view (MotionBlurPass)
+    // the temporal passes' camera (Reproject, once a frame): the view to the world now, the world to the last
+    // frame's view, whether there is a last frame
+    float rp_inv_[3][4] = {}, rp_last_[3][4] = {}, rp_now_[3][4] = {};
+    uint64_t rp_frame_ = 0;
+    bool rp_ok_ = false;
+    float taa_jit_[2] = {};                       // this frame's TAA jitter in clip units (0 off)
+    bool Reproject(const Target& rt);
+    void Accumulate(Target& rt, Image& cur, Image (&acc)[2], uint64_t& frame, bool distance);
+    void TaaPass(Target& rt, Target* ds);
+    bool TaaWanted() const;
+    // temporal upscaler (GraphicsStyle::upscaler, gpu/upscale.h): FSR 2 over the finished scene before the HUD, the
+    // scene's targets drawn smaller meanwhile (UpscaleShrink, from its first 3D draw; UpscaleExpand after); what FSR
+    // reads beside the scene (kUpscaleHlsl: its depth, the camera's motion) and writes (the screen-sized scene)
+    bool UpscaleWanted() const;
+    float UpscaleShrinkRatio() const;  // the scene drawn this much smaller each way (1: not)
+    void UpscaleTargets(const State& s);
+    void UpscaleShrink(Target& t, float ratio);
+    void UpscaleExpand(Target& t, bool fill);
+    void UpscalePass(Target& rt, Target* ds);
+    bool UpscaleBefore(Target& rt);
+    void UpscaleReactive(Target& rt);
+    Image up_before_, up_reactive_;  // the scene before the snow and particles; FSR's reactive mask (where they drew)
+    uint64_t up_reactive_frame_ = 0;
+    Fsr2 fsr_;
+    bool fsr_tried_ = false, fsr_ok_ = false;
+    Image up_depth_, up_motion_, up_out_;
+    uint64_t up_frame_ = 0;  // the frame (presents_ + 1) last upscaled
+    std::chrono::steady_clock::time_point up_time_{};
     uint64_t mb_frame_ = 0;                       // the frame (presents_ + 1) it was kept for
     bool DofWanted() const { return Style().dof != kDofOff && Style().mode != kStyleRetro; }
     // the scene's passes that read the world's distance (the depth kept at the mid-frame clear, RtKeepDepth)
@@ -3243,7 +3723,7 @@ private:
         const GraphicsStyle& st = Style();
         return DofWanted() || st.mode == kStyleNoir ||
                (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light || QualityAo(st) > 0 || st.weather ||
-                                           st.motion_blur || st.smooth_turn || st.contact_shadows));
+                                           st.motion_blur || st.smooth_turn || st.contact_shadows || st.particles || st.upscaler));
     }
     float dof_aim_ = 0;          // aiming down the sights, eased 0 to 1
     uint32_t scene_zwrites_ = 0;  // the frame's 3D draws that wrote the scene's depth
@@ -3313,6 +3793,16 @@ private:
     // the footprints made (in the world's units) and each player's last step
     bool WeatherWanted() const { return Style().weather != 0 && Style().mode != kStyleRetro && ViewCount() < 2; }
     void WeatherPass(Target& rt, Target* ds);
+    // GPU particles (GraphicsStyle::particles, kParticleHlsl): the state images (one read, the other written, in
+    // turn), the ring's next particle, when the last ones made are gone (seconds, steady clock), the last step's time
+    bool ParticlesWanted() const { return Style().particles && Style().mode != kStyleRetro && ViewCount() < 2; }
+    void ParticlePass(Target& rt, Target* ds);
+    Image part_state_[2];
+    uint32_t part_cur_ = 0, part_head_ = 0;
+    bool part_reset_ = true;
+    double part_until_ = 0, part_log_ = 0;
+    uint64_t part_events_ = 0, part_made_ = 0;
+    std::chrono::steady_clock::time_point part_last_{};
     bool game_snow_ = false;  // the game drew its own snow this frame (it snows here)
     float snow_level_ = 0;
     struct Print { float pos[3]; float yaw; double made; };
@@ -3351,6 +3841,8 @@ private:
     uint64_t stage_key_ = 0;
     uint8_t stage_detail_ = 0;
     bool stage_ice_ = false;    // stage 0's texture is ice (floor reflections)
+    bool stage_water_ = false;  // stage 0's texture is a water candidate (restricted to upward-facing surfaces)
+    bool refl_water_ = false;
     bool refl_floor_ = false;   // the draw reflects as a floor (Reflectivity): only where it faces up
     bool ViewUp(float aspect, float up[3]) const;  // the world's up in the view (rt_cams_), false unknown
     float stage_glass_ = 0;
@@ -3402,6 +3894,7 @@ private:
         for (Image& im : t.bloom_down) DropImage(im);
         for (Image& im : t.bloom_up) DropImage(im);
         DropImage(t.hdr_ratio), DropImage(t.warp_copy);
+        DropImage(t.alt_res), DropImage(t.alt_fb);
     }
     // the scene pass's HLSL: mods/shaders/scene_post.hlsl beside the exe when there is one (a trusted local shader
     // mod, read again when it changes), else the built-in kScenePostHlsl
@@ -3418,7 +3911,7 @@ private:
     static constexpr const char* kPassNames[24] = {"relight", "rt ao", "rt reflect", "gtao", "lights", "bounce",
                                                    "atmosphere", "weather", "tone", "style", "smaa", "dof",
                                                    "rt-gi", "rt-lit", "rt-vol", "rt-build",
-                                                   "lt-tiles", "lt-pick", "lt-light", "motion", "contact", nullptr, nullptr, nullptr};
+                                                   "lt-tiles", "lt-pick", "lt-light", "motion", "contact", "taa-up", "rt-denoise", "particles"};
     double pass_ms_[24] = {};
     uint32_t pass_n_[24] = {};
     bool frame_stamp_due_ = true;
@@ -3439,14 +3932,25 @@ private:
     uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0, perf_reflect_ = 0, perf_soft_ = 0,
              perf_mat_ = 0;  // draws by kind
     uint64_t perf_det_[4] = {};  // ground detail: tagged 3D draws, not opaque, no free stage, drawn
-    uint64_t perf_disp_[2] = {};  // ground displacement: draws cut, their triangles
-    // ground displacement (GraphicsStyle::displacement): a ground draw assembled again on the CPU, cut and pushed in
-    // (DisplaceMesh), kept by its vertices', indices' and settings' hash
+    uint64_t perf_disp_[4] = {};  // geometry refinement: draws cut, their triangles, walls, later passes among them
+    // geometry refinement (GraphicsStyle::displacement, wall_displacement): a ground or wall draw assembled again on
+    // the CPU, cut and pushed in (DisplaceMesh), kept by its vertices', indices' and settings' hash
     bool Displace(const State& s, const DrawShaders& sh, uint32_t prim, uint32_t start, uint32_t count,
                   const uint8_t* indices, Assembled& a);
-    struct DispMesh { std::vector<float> v; std::vector<uint32_t> ix; bool ok = false; };
+    int DiffuseRegister(const State& s, const Assembled& a, const DrawShaders& sh);
+    std::unordered_map<uint64_t, int> disp_color_reg_;  // by program: DiffuseRegister
+    struct DispMesh { std::vector<float> v; std::vector<uint32_t> ix; bool ok = false, wall = false; float facing = 0; };
+    // a mesh's first refined pass this frame (by its vertex buffer, indices and range): the later passes over it follow
+    struct DispGeo { DisplaceParams p; uint64_t frame = 0, texture = 0; };
+    std::unordered_map<uint64_t, DispGeo> disp_geo_;
     std::unordered_map<uint64_t, DispMesh> disp_cache_;
     size_t disp_bytes_ = 0;
+    // a draw by its program, texture, place in its buffers and the settings: how often its vertices changed, whether
+    // it was refused (moving and refused draws are left alone)
+    struct DispSeen { uint64_t vhash = 0, frame = 0, retry_at = 0; int changes = 0; bool rejected = false; };
+    std::unordered_map<uint64_t, DispSeen> disp_seen_;
+    uint64_t disp_frame_ = 0;
+    double disp_ms_ = 0;  // this frame's new cuts, CPU ms
     std::chrono::steady_clock::time_point perf_t_ = std::chrono::steady_clock::now();
     void LogPerf();
     friend VkBool32 VKAPI_PTR DebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -3678,6 +4182,11 @@ bool VulkanBackend::CreateDevice() {
     on.features.occlusionQueryPrecise = f2.features.occlusionQueryPrecise;
     on.features.depthBiasClamp = f2.features.depthBiasClamp;
     on.features.fragmentStoresAndAtomics = f2.features.fragmentStoresAndAtomics;
+    // FSR 2's compute shaders (gpu/upscale_fsr.cpp): storage images without a format, wave64 where it asks for it
+    on.features.shaderStorageImageReadWithoutFormat = f2.features.shaderStorageImageReadWithoutFormat;
+    on.features.shaderStorageImageWriteWithoutFormat = f2.features.shaderStorageImageWriteWithoutFormat;
+    on13.subgroupSizeControl = f13.subgroupSizeControl;
+    on13.computeFullSubgroups = f13.computeFullSubgroups;
     frag_stores_ = f2.features.fragmentStoresAndAtomics;
     fill_lines_ = f2.features.fillModeNonSolid;
     aniso_ok_ = f2.features.samplerAnisotropy;
@@ -4154,8 +4663,10 @@ VulkanBackend::~VulkanBackend() {
         for (RtFrame& f : rt_) DropRt(f);
     for (auto& [k, l] : late_)
         for (Buffer& b : l.staging) DropBuffer(b);
+    DropImage(up_depth_), DropImage(up_motion_), DropImage(up_out_), DropImage(up_before_), DropImage(up_reactive_);
     if (cmd_) Submit();
     vkDeviceWaitIdle(dev_);
+    fsr_.Destroy();
     for (auto& [serial, f] : retire_) f();
     retire_.clear();
     for (auto& [k, m] : modules_) vkDestroyShaderModule(dev_, m, nullptr);
@@ -4987,10 +5498,11 @@ VkPipeline VulkanBackend::PassPipeline(const PassKey& k) {
     return pass_pipelines_[h] = p;
 }
 
-// the full screen triangle with cb at b1, views from t0, the pass samplers
+// the full screen triangle with cb at b1, views from t0, the pass samplers (or vertices of the shader's own: the
+// GPU particles' quads)
 void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewport& vp, const VkRect2D& sc,
                                const float* cb, uint32_t cb_floats, const VkImageView* views, uint32_t n_views,
-                               VkAccelerationStructureKHR tlas) {
+                               VkAccelerationStructureKHR tlas, uint32_t vertices) {
     if (!p) return;
     Begin(a);
     VkCommandBuffer c = cmd_;
@@ -5045,7 +5557,7 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
         vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_layout_, 1, 1, &f.tex_set, 0, nullptr);
     }
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, tlas ? rt_layout_ : layout_, 0, n, w);
-    vkCmdDraw(c, 3, 1, 0, 0);
+    vkCmdDraw(c, vertices, 1, 0, 0);
     ForgetDrawState();
 }
 
@@ -5159,6 +5671,8 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
             ((rt_used_ && RtWanted()) || (scene_zwrites_ && KeptDepthWanted())))
             RtKeepDepth(*t);
         ClearRects(*t, rs, flags, col, std::clamp(z, 0.0f, 1.0f), stencil);
+        if (t == ds && (flags & kClearZ)) t->clear_z = std::clamp(z, 0.0f, 1.0f);
+        if (t == ds && (flags & kClearStencil)) t->clear_stencil = stencil & 0xFF;
         t->drawn = true;
     }
 }
@@ -5377,9 +5891,17 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         if (VkImageView v = r ? BindReplacement(*r, d, stages.levels[stage]) : VK_NULL_HANDLE) {
             stages.replaced[stage] = true;
             // the game's picture it stands for (uploaded before the pack's was set): what reflections know it by
-            if (auto it = textures_.find(d.data); stage == 0 && it != textures_.end())
+            if (auto it = textures_.find(d.data); stage == 0 && it != textures_.end()) {
+                if (it->second.water < 0 && (Style().water || std::getenv("XBE_WATER_DUMP"))) {
+                    StagePalette palette;
+                    ReadStagePalette(s, stage, d, palette);
+                    it->second.water = TextureWater(it->second.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)),
+                                                    palette.va != 0) ? 1 : 0;
+                }
                 stage_key_ = it->second.key, stage_glass_ = it->second.glass, stage_solid_ = it->second.solid,
-                stage_detail_ = it->second.detail, stage_ice_ = it->second.ice > 0, stage_seen_ = true;
+                stage_detail_ = it->second.detail, stage_ice_ = it->second.ice > 0,
+                stage_water_ = it->second.water > 0, stage_seen_ = true;
+            }
             return v;
         }
     }
@@ -5410,11 +5932,11 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         }
     }
     static const bool water_survey = std::getenv("XBE_WATER_DUMP") != nullptr;
-    if (tx.water < 0 && water_survey && !draw_2d_)
+    if (tx.water < 0 && (water_survey || Style().water) && !draw_2d_)
         tx.water = TextureWater(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0) ? 1 : 0;
     if (tx.ice < 0 && Style().floor_reflections && !draw_2d_)
         tx.ice = TextureIce(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0) ? 1 : 0;
-    if (tx.detail == kDetailUnknown && (Style().ground_detail || Style().displacement || Style().floor_reflections >= 2) &&
+    if (tx.detail == kDetailUnknown && (Style().ground_detail || Style().displacement || Style().wall_displacement || Style().floor_reflections >= 2) &&
         !draw_2d_)
         tx.detail = TextureDetail(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0);
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
@@ -5426,13 +5948,14 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
             stages.levels[stage] = 1;
             if (stage == 0)
                 stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_detail_ = tx.detail,
-                stage_ice_ = false, stage_seen_ = true;
+                stage_ice_ = stage_water_ = false, stage_seen_ = true;
             return v;
         }
     }
     if (fi.depth) stages.info[stage].shadow = ShadowDepthKind(d.format);
     if (stage == 0)
-        stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_detail_ = tx.detail, stage_ice_ = tx.ice > 0, stage_seen_ = true;
+        stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_detail_ = tx.detail,
+        stage_ice_ = tx.ice > 0, stage_water_ = tx.water > 0, stage_seen_ = true;
     return tx.img.view;
 }
 
@@ -5781,17 +6304,174 @@ void VulkanBackend::DrawGeometry(const Assembled& a) {
     }
 }
 
+// the input register a vertex program's diffuse colour comes from (its one write of oD0's rgb a mul or mad of a single
+// v register with constants or temporaries): the baked light geometry refinement shades; -1 when it cannot be told
+int VulkanBackend::DiffuseRegister(const State& s, const Assembled& a, const DrawShaders& sh) {
+    if (!sh.prog || !s.vs) return -1;
+    const uint64_t key = s.vs->hash ^ (uint64_t(a.regs) << 48) ^ a.decode;
+    if (auto it = disp_color_reg_.find(key); it != disp_color_reg_.end()) return it->second;
+    int reg = -1, writes = 0;
+    const std::string src = VertexHlsl(s, a, sh);
+    for (size_t pos = src.find("        oD0."); pos != std::string::npos; pos = src.find("        oD0.", pos + 1)) {
+        const size_t eol = src.find('\n', pos);
+        const std::string line = src.substr(pos, eol - pos);
+        const size_t dot = line.find('.'), eq = line.find(" = ");
+        if (eq == std::string::npos) continue;
+        const std::string mask = line.substr(dot + 1, eq - dot - 1);
+        if (mask.find_first_of("xyz") == std::string::npos) continue;  // alpha alone
+        writes++;
+        const size_t blk = src.rfind("    {\n", pos), mr = src.find("precise float4 mr = ", blk);
+        if (line.find("= mr.") == std::string::npos || blk == std::string::npos || mr == std::string::npos || mr > pos) {
+            reg = -2;
+            continue;
+        }
+        const std::string expr = src.substr(mr, src.find('\n', mr) - mr);
+        int found = -1;
+        bool one = true;
+        for (size_t v = expr.find("i.v"); v != std::string::npos; v = expr.find("i.v", v + 3)) {
+            const int r = std::atoi(expr.c_str() + v + 3);
+            if (found >= 0 && r != found) one = false;
+            found = r;
+        }
+        reg = one && found > 0 ? found : -2;
+    }
+    if (writes != 1 || reg < 0) reg = -1;
+    disp_color_reg_[key] = reg;
+    return reg;
+}
+
 bool VulkanBackend::Displace(const State& s, const DrawShaders& sh, uint32_t prim, uint32_t start, uint32_t count,
                              const uint8_t* indices, Assembled& a) {
     const GraphicsStyle& st = Style();
-    if (!st.displacement || st.displace_depth <= 0 || st.mode == kStyleRetro || draw_2d_ || !sh.prog || !stage_seen_ ||
-        !bound_ds_ || !scene_wbuf_ || !s.rs[kRsZEnable] || !SimpleState(s, kMZWriteEnable) ||
-        a.topology != Topology::Triangles)
+    if ((!st.displacement && !st.wall_displacement) || st.displace_depth <= 0 || st.mode == kStyleRetro || draw_2d_ ||
+        !sh.prog || !s.vs || !bound_ds_ || !scene_wbuf_ || a.topology != Topology::Triangles)
         return false;
     // the world's alone: not the gun and hands (drawn after the game's mid-frame depth clear; a pistol's metal passed
     // for rock, and its mesh came apart)
     if (scene_cleared_ == presents_ + 1) return false;
-    if (stage_detail_ == kDetailNone || stage_detail_ == kDetailConcrete || stage_detail_ >= kDetailKinds) return false;
+
+    static const int disp_test = [] {
+        const char* e = std::getenv("XBE_DISP_TEST");
+        return e && *e ? std::atoi(e) : 0;
+    }();
+    static const float tile = [] {
+        const char* e = std::getenv("XBE_DISP_TILE");
+        return e && *e ? float(std::atof(e)) : 4.0f;
+    }();
+    static const float shade = [] {
+        const char* e = std::getenv("XBE_DISP_SHADE");
+        return e && *e ? float(std::atof(e)) : 1.0f;
+    }();
+    // refined within this many metres of the camera (the draw's box): the bumps are a pixel or two past it
+    static const float near_m = [] {
+        const char* e = std::getenv("XBE_DISP_NEAR");
+        return e && *e ? float(std::atof(e)) : 32.0f;
+    }();
+
+    // the same mesh drawn again (a second pass over it: frost, a light map, a decal layer, often depth tested EQUAL):
+    // cut and pushed exactly as its first pass was this frame, whatever its texture, or the passes no longer meet (a
+    // frosted wall's frost was gone in triangles). A mesh by its vertex buffer, indices and range
+    const uint64_t geo_key[8] = {s.streams[0].vb, s.streams[0].stride, s.input_streams[0].vb, start, count, prim,
+                                 s.base_vertex, uint64_t(uintptr_t(indices))};
+    const uint64_t geo = Hash(geo_key, sizeof(geo_key));
+    auto rec = disp_geo_.find(geo);
+    const bool rec_now = rec != disp_geo_.end() && rec->second.frame == presents_ + 1;
+    // last frame's first pass, for a pass drawn before it (not the first pass itself, when it is no longer refined)
+    const bool rec_last = rec != disp_geo_.end() && rec->second.frame == presents_ && rec->second.texture != stage_key_;
+
+    DisplaceParams p;
+    bool follow = rec_now;
+    const SkyCheck sky = SkyDraw(s, a, sh);
+    auto lead = [&] {
+        if (!stage_seen_ || !s.rs[kRsZEnable] || !SimpleState(s, kMZWriteEnable) || sky.sky) return false;
+        const uint8_t kind = stage_detail_;
+        if (kind == kDetailNone || kind >= kDetailKinds) return false;
+        // the ground (grass, snow, rock, dirt facing up); walls (rock and concrete, any way they face)
+        const bool ground = st.displacement && kind != kDetailConcrete;
+        const bool walls = st.wall_displacement && (kind == kDetailRock || kind == kDetailConcrete);
+        if (!ground && !walls) return false;
+        p.kind = kind;
+        p.depth = (ground ? 0.08f : 0.035f) * st.displace_depth;
+        p.side_depth = walls ? 0.035f * st.displace_depth : 0.0f;
+        p.tile = tile;
+        if (disp_test == 2) p.levels = 1;
+        if (disp_test == 3) p.push = false;
+        return true;
+    };
+    if (!follow && !lead()) {
+        if (!rec_last) return false;
+        follow = true;
+    }
+    if (follow) p = rec->second.p;
+    p.color_reg = disp_test == 4 ? -1 : DiffuseRegister(s, a, sh);
+    p.shade = shade;
+    const uint64_t pkey = p.Key();
+
+    // a draw seen before: one its vertices keep changing (moving, animated) or one not refined is left alone
+    struct {
+        uint32_t vs_lo, vs_hi, start, count, prim, follow;
+    } who{uint32_t(s.vs->hash), uint32_t(s.vs->hash >> 32), start, count, prim, follow ? 1u : 0u};
+    const uint64_t ident = Hash(&who, sizeof(who), stage_key_ ^ pkey);
+    DispSeen& seen = disp_seen_[ident];
+    if (seen.changes >= 4 || seen.rejected || seen.retry_at > presents_ + 1) return false;
+
+    // the camera in the draw's model space (SkyDraw's camera rows): its distance from the draw's box, and the side it
+    // sees the draw from (DisplaceParams::eye)
+    if (!follow && sky.cam_ok) {
+        const float(*m)[4] = sky.cam;
+        auto det3 = [](const float k[3][3]) {
+            return k[0][0] * (k[1][1] * k[2][2] - k[1][2] * k[2][1]) - k[0][1] * (k[1][0] * k[2][2] - k[1][2] * k[2][0]) +
+                   k[0][2] * (k[1][0] * k[2][1] - k[1][1] * k[2][0]);
+        };
+        float mm[3][3];
+        for (int r = 0; r < 3; r++)
+            for (int j = 0; j < 3; j++) mm[r][j] = m[r][j];
+        const float det = det3(mm);
+        if (std::fabs(det) > 1e-12f) {
+            // M e = -t by Cramer's rule
+            float e[3];
+            for (int c = 0; c < 3; c++) {
+                float k[3][3];
+                for (int r = 0; r < 3; r++)
+                    for (int j = 0; j < 3; j++) k[r][j] = j == c ? -m[r][3] : m[r][j];
+                e[c] = det3(k) / det;
+            }
+            p.eye_ok = true, p.eye[0] = e[0], p.eye[1] = e[1], p.eye[2] = e[2];
+            float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+            const VertexElement& el = a.elements[0];
+            const VertexBuffer& vb = a.buffers[el.buffer];
+            const bool raw = a.vertices.empty() && vb.src &&
+                             (el.format == DXGI_FORMAT_R32G32B32_FLOAT || el.format == DXGI_FORMAT_R32G32B32A32_FLOAT);
+            uint32_t regs = 0;
+            for (uint32_t r = a.regs; r; r &= r - 1) regs++;
+            const uint32_t n = a.index_count ? a.index_count : a.draw_count;
+            bool any = false;
+            if (raw || !a.vertices.empty())
+                for (uint32_t i = 0; i < n; i++) {
+                    int64_t vi = a.index_count ? int64_t(a.index16 ? static_cast<const uint16_t*>(a.index_src)[i]
+                                                                   : static_cast<const uint32_t*>(a.index_src)[i]) +
+                                                     a.base_vertex
+                                               : int64_t(i);
+                    const float* q = nullptr;
+                    if (!raw && vi >= 0 && uint64_t(vi) < a.vertex_count) q = &a.vertices[size_t(vi) * regs * 4];
+                    else if (raw && vi >= 0 && uint64_t(vi) * vb.stride + el.offset + 12 <= vb.bytes)
+                        q = reinterpret_cast<const float*>(vb.src + size_t(vi) * vb.stride + el.offset);
+                    if (!q) continue;
+                    any = true;
+                    for (int c = 0; c < 3; c++) lo[c] = std::min(lo[c], q[c]), hi[c] = std::max(hi[c], q[c]);
+                }
+            if (any) {
+                float d2 = 0;
+                for (int c = 0; c < 3; c++) {
+                    const float o = std::max({lo[c] - e[c], 0.0f, e[c] - hi[c]});
+                    d2 += o * o;
+                }
+                if (disp_test != 5 && d2 > near_m * near_m) return false;
+            }
+        }
+    }
+
+    bool converted = false;
     if (a.vertices.empty()) {  // the guest's own vertices: converted to floats for the cut
         const bool raw = g_raw_vertices;
         g_raw_vertices = false;
@@ -5801,40 +6481,78 @@ bool VulkanBackend::Displace(const State& s, const DrawShaders& sh, uint32_t pri
             Assemble(s, prim, start, count, indices, a);
             return false;
         }
+        converted = true;
     }
-    static const int disp_test = [] {
-        const char* e = std::getenv("XBE_DISP_TEST");
-        return e && *e ? std::atoi(e) : 0;
-    }();
+    // drawn as the game's: its own vertices again (the vertex shader was made for their layout)
+    auto as_was = [&] {
+        if (converted) Assemble(s, prim, start, count, indices, a);
+        return false;
+    };
     if (disp_test == 1) return true;  // converted only, not cut: the layout's change alone
-    static const float tile = [] {
-        const char* e = std::getenv("XBE_DISP_TILE");
-        return e && *e ? float(std::atof(e)) : 2.0f;
-    }();
-    DisplaceParams p;
-    p.kind = stage_detail_;
-    p.depth = 0.08f * st.displace_depth;
-    p.tile = tile;
-    if (disp_test == 2) p.levels = 1;
-    if (disp_test == 3) p.push = false;
-    uint64_t key = Hash(a.vertices.data(), a.vertices.size() * 4, Hash(a.indices.data(), a.indices.size() * 4));
-    key = Hash(&p, sizeof(p), key ^ a.buffers[0].stride);
+    const uint64_t vh = Hash(a.vertices.data(), a.vertices.size() * 4, Hash(a.indices.data(), a.indices.size() * 4));
+    if (seen.frame && seen.vhash != vh && seen.frame != presents_ + 1 && seen.frame + 3 >= presents_ + 1) seen.changes++;
+    seen.vhash = vh, seen.frame = presents_ + 1;
+    if (seen.changes >= 4) return as_was();
+    const uint64_t key = Hash(&pkey, sizeof(pkey), vh ^ a.buffers[0].stride);
     auto it = disp_cache_.find(key);
     if (it == disp_cache_.end()) {
+        // new cuts take at most a few milliseconds a frame (a level's first frames): the rest wait for the next
+        if (disp_frame_ != presents_ + 1) disp_frame_ = presents_ + 1, disp_ms_ = 0;
+        if (disp_ms_ > 6.0) return as_was();
         if (disp_bytes_ > (256u << 20)) disp_cache_.clear(), disp_bytes_ = 0;
+        const auto t0 = std::chrono::steady_clock::now();
         DispMesh m;
         Assembled cut = a;
         cut.buffers[0].src = reinterpret_cast<const uint8_t*>(cut.vertices.data());
-        m.ok = DisplaceMesh(cut, p);
+        DisplaceResult res;
+        m.ok = DisplaceMesh(cut, p, &res);
+        m.wall = !res.up;
+        m.facing = res.facing;
+        if (!m.ok && res.retry) {
+            seen.retry_at = presents_ + 1 + 30;  // asked again in half a second
+            return as_was();
+        }
         if (m.ok) m.v.swap(cut.vertices), m.ix.swap(cut.indices);
+        // XBE_DISP_TEST=6: refined draws' baked light red (floors) or green (walls), to see which are
+        if (m.ok && disp_test == 6 && p.color_reg > 0 && ((a.regs >> p.color_reg) & 1)) {
+            const uint32_t vf = a.buffers[0].stride / 4, co = a.elements[p.color_reg].offset / 4;
+            for (size_t v = 0; v + vf <= m.v.size(); v += vf)
+                m.v[v + co] = res.up ? 1.0f : 0.1f, m.v[v + co + 1] = res.up ? 0.1f : 1.0f, m.v[v + co + 2] = 0.1f;
+        }
         disp_bytes_ += m.v.size() * 4 + m.ix.size() * 4 + 64;
+        disp_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         it = disp_cache_.emplace(key, std::move(m)).first;
-        static int said = 0;
-        if (said < 4 && it->second.ok)
-            said++, LOGR("vulkan: ground displacement: a %s draw cut from %zu to %zu triangles", DetailName(p.kind),
-                         a.indices.size() / 3, it->second.ix.size() / 3);
+        if (!it->second.ok) seen.rejected = true;
+        // XBE_DISP_DUMP=folder (a test): each refined draw's vertex program as HLSL and its first vertices, by program
+        static const char* dump = std::getenv("XBE_DISP_DUMP");
+        static std::unordered_map<uint64_t, int> dumped;
+        if (dump && it->second.ok && !dumped[s.vs->hash]++) {
+            std::string path = std::string(dump) + "/disp_" + std::to_string(dumped.size()) + ".txt";
+            if (FILE* f = std::fopen(path.c_str(), "w")) {
+                std::fprintf(f, "kind %s regs %04x stride %u tris %zu colour v%d normal v%d levels %d follow %d\n",
+                             DetailName(p.kind), a.regs, a.buffers[0].stride, a.indices.size() / 3, p.color_reg,
+                             res.normal_reg, res.levels, follow ? 1 : 0);
+                const uint32_t vf = a.buffers[0].stride / 4;
+                for (uint32_t v = 0; v < 3 && (v + 1) * vf <= a.vertices.size(); v++) {
+                    for (uint32_t k = 0; k < vf; k++) std::fprintf(f, "%g%s", a.vertices[v * vf + k], k % 4 == 3 ? " | " : " ");
+                    std::fprintf(f, "\n");
+                }
+                std::fprintf(f, "%s\n", VertexHlsl(s, a, sh).c_str());
+                std::fclose(f);
+            }
+        }
+        static int said = 0, said_follow = 0;
+        if (it->second.ok && (follow ? said_follow++ < 4 : said++ < 6))
+            LOGR("vulkan: geometry refinement: a %s %s%s cut from %zu to %zu triangles (%d cuts, colour v%d, normal v%d)",
+                 DetailName(p.kind), res.up ? "floor" : "wall", follow ? " (a later pass)" : "", a.indices.size() / 3,
+                 it->second.ix.size() / 3, res.levels, p.color_reg, res.normal_reg);
     }
-    if (!it->second.ok) return false;
+    if (!it->second.ok) return as_was();
+    if (!follow) {
+        if (disp_geo_.size() > 65536) disp_geo_.clear();
+        DispGeo& g = disp_geo_[geo];
+        g.p = p, g.p.facing = it->second.facing, g.frame = presents_ + 1, g.texture = stage_key_;
+    }
     const uint32_t stride = a.buffers[0].stride;
     a.vertices = it->second.v;
     a.indices = it->second.ix;
@@ -5844,7 +6562,8 @@ bool VulkanBackend::Displace(const State& s, const DrawShaders& sh, uint32_t pri
     a.index_count = uint32_t(a.indices.size());
     a.index16 = false;
     a.base_vertex = 0;
-    perf_disp_[0]++, perf_disp_[1] += a.index_count / 3;
+    perf_disp_[0]++, perf_disp_[1] += a.index_count / 3, perf_disp_[2] += it->second.wall ? 1 : 0;
+    perf_disp_[3] += follow ? 1 : 0;
     return true;
 }
 
@@ -5885,7 +6604,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // the sky keeps the game's own pictures: a pack's are upscaled each apart, so a sky box's faces no longer meet
     // (a thin line at each edge of The Exchange's moon box)
     draw_seq_++;
-    sky_keeps_game_ = !draw_2d_ && Style().texture_pack && SkyDraw(s, a, sh).sky;
+    sky_keeps_game_ = !draw_2d_ && (Style().texture_pack || Style().water) && SkyDraw(s, a, sh).sky;
     for (int i = 0; i < 4; i++) stages.view[i] = BindTexture(s, i, stages);
     // ground displacement: the draw cut finer and pushed in, its vertex shader made for the converted layout
     if (Displace(s, sh, prim, start, count, indices, a)) {
@@ -5897,6 +6616,8 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     draw_env_ = false;
     for (int i = 0; i < 4; i++) draw_env_ |= stages.view[i] && stages.info[i].kind == kTexCube;
     if (!BindTargets(s)) return;
+    UpscaleTargets(s);
+    if (!bound_rt_ && !bound_ds_) return;
     // the pixel shader made for the textures
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
@@ -5907,7 +6628,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
     if (!draw_2d_ && bound_ds_) scene_wbuf_ = pk.wbuf;
     // snow: how much of the world is snow, and (without ray tracing's capture) the level's camera (snow, motion blur)
-    if ((WeatherWanted() || ((Style().motion_blur || Style().contact_shadows || Style().floor_reflections) &&
+    if ((WeatherWanted() || ParticlesWanted() || UpscaleWanted() || ((Style().motion_blur || Style().contact_shadows || Style().floor_reflections) &&
                               Style().mode != kStyleRetro)) && !draw_2d_ && sh.prog && pk.wbuf && a.topology == Topology::Triangles && !sh.quad &&
         bound_ds_ && bound_ds_->rt_depth_frame != presents_ + 1) {
         uint64_t n = (a.index_count ? a.index_count : a.draw_count) / 3;
@@ -5972,6 +6693,30 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (span == kSpanViewport) c.hud[0] = 1;
     }
     SqueezeBeyond(s, c.hud);
+    // TAA: a 3D draw moved by this frame's sub-pixel jitter (Halton 2, 3 over 8 frames), in its target's clip units
+    if (!draw_2d_ && bound_rt_ && TaaWanted()) {
+        auto halton = [](uint32_t i, uint32_t b) {
+            float f = 1, r = 0;
+            for (; i; i /= b) f /= float(b), r += f * float(i % b);
+            return r;
+        };
+        const uint32_t n = uint32_t(presents_ % 8) + 1;
+        c.taa[0] = (halton(n, 2) - 0.5f) * 2.0f / float(bound_rt_->w);
+        c.taa[1] = (halton(n, 3) - 0.5f) * 2.0f / float(bound_rt_->h);
+    } else if (!draw_2d_ && bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ && UpscaleWanted()) {
+        // the upscaler's: FSR 2's own sequence for the scene's size against the screen's (UpscalePass hands FSR
+        // the same offset), D3D's way up
+        static const float flip = [] {
+            const char* e = std::getenv("XBE_UP_JITTER_FLIP");
+            return e && *e == '1' ? -1.0f : 1.0f;
+        }();
+        const uint32_t dw = bound_rt_->up_small ? bound_rt_->alt_res.w : bound_rt_->w;
+        const int phases = std::max(1, FsrJitterPhases(bound_rt_->w, dw));
+        float jx, jy;
+        FsrJitterOffset(int(presents_ % uint64_t(phases)), phases, jx, jy);
+        c.taa[0] = 2.0f * jx / float(bound_rt_->w);
+        c.taa[1] = -2.0f * jy / float(bound_rt_->h) * flip;
+    }
     // a movie on a 4:3 frame stretched wide (movie_43): squeezed whole about the middle back to 4:3, the sides left
     // as the frame's clear
     // (not a menu's background movie: GameInfo::menu_up)
@@ -6008,7 +6753,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
     // reflections: drawn into the mask after (DrawMask), which reads its strength from these constants
     const float refl = Reflectivity(k);
-    c.style[2] = refl_floor_ ? -refl : refl;  // a floor's negative: the passes keep it where it faces up
+    c.style[2] = refl_water_ ? -2.0f : refl_floor_ ? -refl : refl;  // water tagged separately from floors
     c.style[3] = Opaque(k) || stage_solid_ ? 1.0f : 0.0f;
     // materials: a pack picture's normal and roughness, read from a stage the draw leaves free
     int mat_slot = -1;
@@ -6881,10 +7626,12 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
         End();
         Stamp(4 + 12);
         Barrier();
+        if (st.rt_denoise) Accumulate(rt, rt.rt_gi, rt.rt_gi_acc, rt.gi_acc_frame, false), Stamp(4 + 22);
         static bool said_gi = false;
         if (!said_gi) said_gi = true, LOGR("vulkan: ray traced bounced light drawn (%d rays at %ux%u, strength %.2f)", kGiRays, gw, gh, st.rt_gi_strength);
     }
-    VkImageView views[4] = {rt.fb.view, ds->res.view, keptv, pgi ? rt.rt_gi.view : dummy_.view};
+    const Image& gi_used = pgi && st.rt_denoise && rt.gi_acc_frame == presents_ + 1 ? rt.rt_gi_acc[presents_ & 1] : rt.rt_gi;
+    VkImageView views[4] = {rt.fb.view, ds->res.view, keptv, pgi ? gi_used.view : dummy_.view};
     FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, floats, views, 4, rt_[frame_slot_].tlas);
     End();
     Stamp(4 + 13);
@@ -6896,10 +7643,12 @@ void VulkanBackend::RtRelightPass(Target& rt, Target* ds) {
         End();
         Stamp(4 + 14);
         Barrier();
+        if (st.rt_denoise) Accumulate(rt, rt.rt_vol, rt.rt_vol_acc, rt.vol_acc_frame, true);
         vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
         dirty_ = true;
         Barrier();
-        VkImageView cv[4] = {rt.fb.view, ds->res.view, keptv, rt.rt_vol.view};
+        const Image& vol_used = st.rt_denoise && rt.vol_acc_frame == presents_ + 1 ? rt.rt_vol_acc[presents_ & 1] : rt.rt_vol;
+        VkImageView cv[4] = {rt.fb.view, ds->res.view, keptv, vol_used.view};
         FullScreen(pvolc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, floats, cv, 4, rt_[frame_slot_].tlas);
         End();
         static bool said_vol = false;
@@ -7291,6 +8040,7 @@ uint64_t g_ssr_diag[6];
 float VulkanBackend::Reflectivity(const PsoKey& k) {
     const GraphicsStyle& st = Style();
     refl_floor_ = false;
+    refl_water_ = false;
     if (st.reflections != kReflectOff && !draw_2d_)
         g_ssr_diag[0]++, g_ssr_diag[1] += stage_seen_, g_ssr_diag[2] += bound_rt_ && bound_ds_,
             g_ssr_diag[3] += bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_,
@@ -7299,6 +8049,7 @@ float VulkanBackend::Reflectivity(const PsoKey& k) {
         !bound_ds_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_)
         return 0;
     float listed = ReflectionOf(stage_key_);
+    if (st.water && stage_water_ && k.zen && !sky_keeps_game_ && listed != 0) return refl_water_ = true, 0.7f;
     if (listed >= 0) return listed;
     // XBE_SSR_TEST=1: every opaque 3D surface reflects (the reflection pass checked without a list)
     static const bool test = [] {
@@ -7725,6 +8476,8 @@ void VulkanBackend::Present(const Surface& front) {
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (ramp_dirty_) UploadGammaRamp();
     if (t && (ScenePassWanted() || swap_hdr_) && !post_done_ && scene_rt_ == t) ScenePass(*t, scene_ds_);
+    for (Target* x : {t, scene_rt_, scene_ds_})
+        if (x && x->up_small) UpscaleExpand(*x, true);
     // XBE_PAD_CMD's diagnostic: a file named shot beside the exe holding a PNG path gets the window's picture, as
     // shown (the settings window too), there
     static const bool shots = [] {
@@ -8076,6 +8829,7 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     rt_gi_drawn_ = false;
     tone_drawn_ = Style().hdr_tonemap && Style().mode != kStyleRetro && ToneBegin(rt);
     auto timed = [&](uint32_t k) { End(), Stamp(4 + k); };
+    Reproject(rt);
     if (rt_built_ && Style().rt_lighting) RtRelightPass(rt, ds), timed(0);
     if (rt_built_ && Style().rt_ao > 0) RtPass(rt, ds), timed(1);
     if (rt_built_) RtReflectPass(rt, ds), timed(2);
@@ -8087,12 +8841,21 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     if (Style().effect_lights && Style().mode != kStyleRetro && one_view) LightPass(rt, ds), timed(4);
     if (Style().bounce_light && Style().mode != kStyleRetro && !rt_gi_drawn_) BouncePass(rt, ds), timed(5);
     if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds), timed(6);
+    // the upscaler's reactive mask: the scene before the snow and the particles, which move by no camera
+    const bool up_reactive = UpscaleWanted() && (WeatherWanted() || ParticlesWanted()) && UpscaleBefore(rt);
     if (WeatherWanted()) WeatherPass(rt, ds), timed(7);
+    if (ParticlesWanted()) ParticlePass(rt, ds), timed(23);
+    if (up_reactive) UpscaleReactive(rt);
+    if (TaaWanted() && ds) TaaPass(rt, ds), timed(21);
     if (tone_drawn_) ToneResolve(rt), timed(8);
     if (StylePassWanted()) StylePass(rt, ds), timed(9);
-    if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt), timed(10);
+    if (app::Get().smaa && Style().mode != kStyleRetro && !TaaWanted() && !UpscaleWanted()) SmaaPass(rt), timed(10);
     if (DofWanted() && one_view) DofPass(rt, ds), timed(11);
     if (Style().motion_blur && Style().mode != kStyleRetro && one_view) MotionBlurPass(rt, ds), timed(19);
+    if (UpscaleWanted()) UpscalePass(rt, ds), timed(21);
+    // the scene's targets at the screen's size again for the HUD, however the upscaler went
+    if (rt.up_small) UpscaleExpand(rt, true);
+    if (ds && ds->up_small) UpscaleExpand(*ds, true);
     End();
     // HDR: the finished scene before the HUD, which HdrOut compares the presented frame with
     // smooth turning: the copy with the gun marked (no HDR chain then)
@@ -8194,7 +8957,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
     if (st.mode == kStyleOriginal && st.quality_bloom) g.bloom_threshold = 0.85f;
     if (tone_drawn_) g.tonemap = kToneOff, g.exposure = 1;
     if (tone_drawn_ && hdr_bloom_drawn_) bloom = 0;
-    float c[44] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
+    float c[48] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
                    g.exposure, float(g.tonemap), g.contrast, g.saturation,
                    g.temperature, g.sharpen, bloom, g.bloom_threshold,
                    ao, g.ao_radius, g.vignette, g.grain,
@@ -8204,7 +8967,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
                    depth ? 1.0f : 0.0f, float(rt.w), float(rt.h), k};
     // reflections, when a reflective draw made this frame's mask; an assumed 60 degree vertical view
     bool mask = depth && rt.mask.img && rt.mask_frame == presents_ + 1 && st.reflections != kReflectOff &&
-                st.mode != kStyleRetro && !rt_reflected_;
+                st.mode != kStyleRetro && (!rt_reflected_ || st.water);
     c[32] = mask && ViewCount() < 2 ? st.reflection_strength : 0.0f;
     c[33] = st.reflections == kReflectHigh ? 48.0f : 20.0f;
     c[34] = 0.5774f;
@@ -8220,13 +8983,14 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
     // the scene's depth was cleared mid-frame and the world's kept (RtKeepDepth): what it holds now is the gun alone
     c[40] = depth && ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1 ? 1.0f : 0.0f;
     ViewUp(float(rt.w) / float(rt.h), &c[41]);  // floor reflections: the world's up in the view
+    c[44] = rt_reflected_ ? 1.0f : 0.0f;
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
     VkImageView views[4] = {rt.fb.view, depth ? ds->res.view : VK_NULL_HANDLE, mask ? rt.mask.view : VK_NULL_HANDLE,
                             mask ? rt.mask_ds.view : VK_NULL_HANDLE};
     for (VkImageView& v : views)
         if (!v && !null_descriptor_) v = dummy_.view;
-    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 44, views, 4);
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 48, views, 4);
     End();
 }
 
@@ -8360,6 +9124,185 @@ void VulkanBackend::WeatherPass(Target& rt, Target* ds) {
              "%u players; the eye %.2f %.2f %.2f, player 0 %.2f %.2f %.2f)", traced ? "ray traced shelter" : "no shelter test",
              snow_level_, outdoors, st.snow_amount, prints_.size(), np, unit, nw, eye[0], eye[1], eye[2],
              nw ? ws[0].pos[0] : 0.0f, nw ? ws[0].pos[1] : 0.0f, nw ? ws[0].pos[2] : 0.0f);
+    }
+}
+
+// GPU particles (kParticleHlsl, GraphicsStyle::particles): the game's effects since the last frame (TakeParticles)
+// made into groups of new particles over the ring, the state stepped into the other state image (sim), then drawn
+// over the scene. Nothing is done while none live. XBE_PARTICLE_TEST=1: an explosion and a hit before the view (2, 3 far off)
+// every second and a half
+void VulkanBackend::ParticlePass(Target& rt, Target* ds) {
+    constexpr uint32_t kParticles = 8192, kW = 384, kH = 64, kGroups = 160;
+    constexpr VkFormat kState = VK_FORMAT_R32G32B32A32_SFLOAT;
+    ParticleEvent ev[256 + 2];
+    uint32_t ne = TakeParticles(ev, 256);
+    const auto now_t = std::chrono::steady_clock::now();
+    const double now = std::chrono::duration<double>(now_t.time_since_epoch()).count();
+    float dt = part_last_ == std::chrono::steady_clock::time_point{} ? 0.0f
+                                                                      : std::chrono::duration<float>(now_t - part_last_).count();
+    part_last_ = now_t;
+    dt = dt > 0.25f ? 1.0f / 60 : std::clamp(dt, 0.0f, 0.05f);  // after a stop (a menu, a load) one frame's
+    static const int test = [] {  // 1 near, 2 and 3 far off (25 and 40 m, 60 and 90 m)
+        const char* e = std::getenv("XBE_PARTICLE_TEST");
+        return e && *e >= '1' && *e <= '3' ? *e - '0' : 0;
+    }();
+    if (!ds || ds->w != rt.w || ds->h != rt.h || !scene_wbuf_ || rt_cams_.empty()) return;
+    if (!ne && !test && now > part_until_) return;  // none alive
+    // the level's camera (the most triangles), as WeatherPass takes it: the world to the view and back
+    const RtCam* cam = nullptr;
+    for (const auto& [h, c] : rt_cams_)
+        if (!cam || c.tris > cam->tris) cam = &c;
+    const float ty = 0.5774f, aspect = float(rt.w) / float(rt.h);
+    const float scale[3] = {ty * aspect, ty, 1};
+    float m[3][4];
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 4; k++) m[r][k] = cam->r[r][k] * scale[r];
+    const float unit = std::sqrt(m[2][0] * m[2][0] + m[2][1] * m[2][1] + m[2][2] * m[2][2]);  // metres a world unit
+    float a = m[0][0], b = m[0][1], c3 = m[0][2], d = m[1][0], e = m[1][1], f = m[1][2], g = m[2][0], h = m[2][1], k = m[2][2];
+    float det = a * (e * k - f * h) - b * (d * k - f * g) + c3 * (d * h - e * g);
+    if (std::abs(det) < 1e-12f || !(unit > 0)) return;
+    float inv[3][4] = {{(e * k - f * h) / det, (c3 * h - b * k) / det, (b * f - c3 * e) / det, 0},
+                       {(f * g - d * k) / det, (a * k - c3 * g) / det, (c3 * d - a * f) / det, 0},
+                       {(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det, 0}};
+    for (int r = 0; r < 3; r++) inv[r][3] = -(inv[r][0] * m[0][3] + inv[r][1] * m[1][3] + inv[r][2] * m[2][3]);
+    if (test && presents_ % 90 == 0) {
+        // 6 m and 3 m ahead (the view's +z), the hit's normal back toward the view
+        auto ahead = [&](float metres, float* out) {
+            for (int r = 0; r < 3; r++) out[r] = inv[r][3] + inv[r][2] * metres;
+        };
+        ParticleEvent x{kParticleExplosion, {}, {0, 1, 0}, 3.0f / unit, {1, 0.55f, 0.2f}, now};
+        const float test_at[3][2] = {{6, 3}, {40, 25}, {90, 60}};
+        ahead(test_at[test - 1][0], x.pos);
+        ParticleEvent y{kParticleImpact, {}, {}, 1.5f, {0.5f, 0.45f, 0.4f}, now};
+        ahead(test_at[test - 1][1], y.pos);
+        float nl = 0;
+        for (int r = 0; r < 3; r++) y.normal[r] = -inv[r][2], nl += y.normal[r] * y.normal[r];
+        for (float& v : y.normal) v /= std::sqrt(std::max(nl, 1e-12f));
+        ev[ne++] = x, ev[ne++] = y;
+    }
+    for (Image& im : part_state_)
+        if (!im.img) {
+            part_reset_ = true;
+            if (!MakeImage(im, VK_IMAGE_TYPE_2D, kState, kW, kH, 1, 1, 1,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+                return;
+        }
+    uint64_t vh, sh, dvh, dph;
+    if (!Compile(kParticleHlsl, "vs", "vs_5_0", vh) || !Compile(kParticleHlsl, "sim", "ps_5_0", sh) ||
+        !Compile(kParticleHlsl, "dvs", "vs_5_0", dvh) || !Compile(kParticleHlsl, "dps", "ps_5_0", dph)) {
+        LOG_FIRST(1, "vulkan: the GPU particles did not compile; none drawn");
+        return;
+    }
+    VkPipeline psim = PassPipeline({vh, sh, kState, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pdraw = PassPipeline({dvh, dph, scene_fmt_, VK_FORMAT_UNDEFINED, 1, 0});
+    if (!psim || !pdraw) return;
+    // the groups: each a range of the ring of one kind, from an event
+    std::vector<float> cb((16 + 5 * kGroups) * 4, 0.0f);
+    uint32_t ng = 0, made = 0;
+    auto add = [&](const float* pos, const float* dir, const float* rgb, int kind, float count, float speed, float spread,
+                   float size, float life, float jitter, float speed_var, float size_var, float stagger) {
+        uint32_t n = uint32_t(std::clamp(count, 0.0f, 1024.0f));
+        if (!n || ng >= kGroups) return;
+        float* q = &cb[(16 + 5 * ng) * 4];
+        const float gv[20] = {pos[0], pos[1], pos[2], float(part_head_), dir[0], dir[1], dir[2], float(n),
+                              rgb[0], rgb[1], rgb[2], float(kind), speed, spread, size, life,
+                              jitter, speed_var, size_var, stagger};
+        std::memcpy(q, gv, sizeof(gv));
+        part_head_ = (part_head_ + n) % kParticles;
+        ng++, made += n;
+        part_until_ = std::max(part_until_, now + life * 1.4 + stagger + 0.2);
+    };
+    const float up[3] = {0, 1, 0};
+    const float spark_c[3] = {1, 0.7f, 0.4f}, fire_c[3] = {1, 0.6f, 0.25f}, smoke_c[3] = {0.42f, 0.41f, 0.4f},
+                chip_c[3] = {0.3f, 0.28f, 0.26f}, grey[3] = {0.55f, 0.55f, 0.55f};
+    uint32_t kinds[5] = {};
+    for (uint32_t i = 0; i < ne; i++) {
+        const ParticleEvent& v = ev[i];
+        kinds[std::min<uint32_t>(v.kind, 4)]++;
+        switch (v.kind) {
+        case kParticleImpact: {
+            const bool metal = v.strength > 1.2f;
+            add(v.pos, v.normal, spark_c, 0, metal ? 16 : 7, 6.0f, 0.6f, 0.012f, 0.5f, 0.02f, 0.7f, 0.3f, 0);
+            add(v.pos, v.normal, v.rgb, 4, metal ? 3 : 6, 1.2f, 0.7f, 0.10f, 1.4f, 0.05f, 0.6f, 0.4f, 0.05f);
+            if (!metal) add(v.pos, v.normal, v.rgb, 3, 6, 3.0f, 0.8f, 0.022f, 1.6f, 0.02f, 0.6f, 0.5f, 0);
+            break;
+        }
+        case kParticleExplosion: {
+            const float rm = std::clamp(v.strength * unit, 1.0f, 12.0f), s = std::clamp(rm / 4, 0.5f, 2.5f);
+            add(v.pos, up, fire_c, 2, 70 * s, 4.0f * s, 1.6f, 0.7f * s, 0.9f, 0.5f * s, 0.8f, 0.4f, 0.1f);
+            add(v.pos, up, smoke_c, 1, 24 * s, 1.5f * s, 1.2f, 0.8f * s, 4.0f, 0.6f * s, 0.7f, 0.4f, 0.6f);
+            add(v.pos, up, spark_c, 0, 80 * s, 14.0f, 1.6f, 0.02f, 1.4f, 0.3f, 0.7f, 0.3f, 0);
+            add(v.pos, up, chip_c, 3, 36 * s, 9.0f, 1.0f, 0.05f * std::sqrt(s), 3.0f, 0.3f * s, 0.7f, 0.6f, 0);
+            break;
+        }
+        case kParticleSmoke: {
+            const float sm = std::clamp(v.strength * unit, 0.2f, 4.0f);
+            add(v.pos, up, grey, 1, 1, 0.5f, 0.5f, 0.5f * sm, 3.0f, 0.2f * sm, 0.5f, 0.3f, 0);
+            break;
+        }
+        case kParticleFire: {
+            const float sm = std::clamp(v.strength * unit, 0.2f, 4.0f);
+            add(v.pos, up, fire_c, 2, 1, 1.0f, 0.5f, 0.5f * sm, 0.6f, 0.2f * sm, 0.5f, 0.3f, 0);
+            break;
+        }
+        default:
+            add(v.pos, v.normal, spark_c, 0, 12 * std::clamp(v.strength, 0.2f, 8.0f), 6.0f, 0.6f, 0.012f, 0.5f, 0.02f, 0.7f, 0.3f, 0);
+            break;
+        }
+    }
+    if (!made && now > part_until_) return;
+    // a light breeze, turning slowly; the light: the level's fog colour, brightened
+    const float t = float(presents_ % 216000) / 60.0f, around = 0.6f + 0.5f * std::sin(t * 0.02f);
+    const float wind = 0.5f + 0.3f * std::sin(t * 0.27f);
+    float light[3];
+    for (int i = 0; i < 3; i++) light[i] = std::clamp(0.6f + 0.6f * rt_fog_[i], 0.55f, 1.0f);
+    const bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    const float head[10 * 4] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
+                                kept ? 1.0f : 0.0f, dt, unit, 0,
+                                inv[0][0], inv[0][1], inv[0][2], inv[0][3],
+                                inv[1][0], inv[1][1], inv[1][2], inv[1][3],
+                                inv[2][0], inv[2][1], inv[2][2], inv[2][3],
+                                m[0][0], m[0][1], m[0][2], m[0][3],
+                                m[1][0], m[1][1], m[1][2], m[1][3],
+                                m[2][0], m[2][1], m[2][2], m[2][3],
+                                wind * std::cos(around), wind * std::sin(around), float(presents_ % 1000000), float(ng),
+                                light[0], light[1], light[2], tone_drawn_ ? 1.0f : 0.0f};
+    std::memcpy(cb.data(), head, sizeof(head));
+    End();
+    const VkImageView keptv = kept ? ds->rt_depth.view : ds->res.view;
+    VkViewport svp{0, 0, float(kW), float(kH), 0, 1};
+    VkRect2D ssc{{0, 0}, {kW, kH}};
+    if (part_reset_) {  // new images: every particle dead
+        cb[7] = 1;
+        VkImageView rv[3] = {dummy_.view, ds->res.view, keptv};
+        FullScreen(psim, {part_state_[part_cur_].att, VK_NULL_HANDLE, kW, kH}, svp, ssc, cb.data(), uint32_t(cb.size()), rv, 3);
+        End();
+        cb[7] = 0;
+        part_reset_ = false;
+    }
+    const uint32_t next = part_cur_ ^ 1;
+    VkImageView sv[3] = {part_state_[part_cur_].view, ds->res.view, keptv};
+    FullScreen(psim, {part_state_[next].att, VK_NULL_HANDLE, kW, kH}, svp, ssc, cb.data(), uint32_t(cb.size()), sv, 3);
+    End();
+    part_cur_ = next;
+    VkImageView dv[3] = {part_state_[part_cur_].view, ds->res.view, keptv};
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    FullScreen(pdraw, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, cb.data(), uint32_t(cb.size()), dv, 3,
+               VK_NULL_HANDLE, kParticles * 6);
+    End();
+    part_events_ += ne, part_made_ += made;
+    static bool said = false;
+    if (!said && made) {
+        said = true;
+        LOGR("vulkan: GPU particles drawn (%u made from %u effects: %u hits, %u explosions, %u smoke, %u fire; a world "
+             "unit %.3f m, %s, %s)", made, ne, kinds[0], kinds[1], kinds[2], kinds[3], unit, tone_drawn_ ? "HDR" : "8 bit",
+             kept ? "the gun kept apart" : "no mid-frame clear seen");
+    }
+    if (now > part_log_) {
+        part_log_ = now + 30;
+        LOGR("vulkan: GPU particles: %llu effects, %llu particles made so far", (unsigned long long)part_events_,
+             (unsigned long long)part_made_);
     }
 }
 
@@ -8755,6 +9698,368 @@ void VulkanBackend::ContactPass(Target& rt, Target* ds) {
     if (!said) said = true, LOGR("vulkan: contact shadows drawn");
 }
 
+// the temporal passes' camera, once a frame: the level's (the most triangles, as MotionBlurPass takes it) scaled as
+// the screen-space passes' view, its inverse, and the last frame's
+bool VulkanBackend::Reproject(const Target& rt) {
+    if (rp_frame_ == presents_ + 1) return rp_ok_;
+    const bool had = rp_frame_ == presents_;
+    rp_frame_ = presents_ + 1;
+    rp_ok_ = false;
+    const RtCam* cam = nullptr;
+    for (const auto& [h, c] : rt_cams_)
+        if (!cam || c.tris > cam->tris) cam = &c;
+    if (!cam) return false;
+    const float ty = 0.5774f, aspect = float(rt.w) / float(rt.h);
+    const float scale[3] = {ty * aspect, ty, 1};
+    float m[3][4];
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 4; k++) m[r][k] = cam->r[r][k] * scale[r];
+    float a = m[0][0], b = m[0][1], c3 = m[0][2], d = m[1][0], e = m[1][1], f = m[1][2], g = m[2][0], h = m[2][1], k = m[2][2];
+    float det = a * (e * k - f * h) - b * (d * k - f * g) + c3 * (d * h - e * g);
+    std::memcpy(rp_last_, rp_now_, sizeof(rp_last_));
+    std::memcpy(rp_now_, m, sizeof(m));
+    if (std::abs(det) < 1e-12f) return false;
+    float inv[3][4] = {{(e * k - f * h) / det, (c3 * h - b * k) / det, (b * f - c3 * e) / det, 0},
+                       {(f * g - d * k) / det, (a * k - c3 * g) / det, (c3 * d - a * f) / det, 0},
+                       {(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det, 0}};
+    for (int r = 0; r < 3; r++) inv[r][3] = -(inv[r][0] * m[0][3] + inv[r][1] * m[1][3] + inv[r][2] * m[2][3]);
+    std::memcpy(rp_inv_, inv, sizeof(inv));
+    rp_ok_ = had;
+    return rp_ok_;
+}
+
+// a ray traced image built up over frames (kTemporalHlsl's acc) into acc[this frame's], from acc[the last's]
+void VulkanBackend::Accumulate(Target& rt, Image& cur, Image (&acc)[2], uint64_t& frame, bool distance) {
+    uint64_t vh, ah;
+    if (!Compile(kTemporalHlsl, "vs", "vs_5_0", vh) || !Compile(kTemporalHlsl, "acc", "ps_5_0", ah)) {
+        LOG_FIRST(1, "vulkan: the ray tracing denoise did not compile; none");
+        return;
+    }
+    VkPipeline pl = PassPipeline({vh, ah, cur.fmt, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pl) return;
+    for (Image& im : acc) {
+        if (im.img && (im.w != cur.w || im.h != cur.h)) DropImage(im), frame = 0;
+        if (!im.img && !MakeImage(im, VK_IMAGE_TYPE_2D, cur.fmt, cur.w, cur.h, 1, 1, 1,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+            return;
+    }
+    static const int test = [] {
+        const char* e = std::getenv("XBE_TEMPORAL_TEST");
+        return e ? std::atoi(e) : 0;
+    }();
+    const bool last = frame == presents_ && rp_ok_;
+    float c[32] = {1.0f / cur.w, 1.0f / cur.h, 0.5774f, float(rt.w) / float(rt.h),
+                   last ? 1.0f : 0.0f, 0.2f, distance ? 1.0f : 0.0f, float(test)};
+    std::memcpy(c + 8, rp_inv_, sizeof(rp_inv_));
+    std::memcpy(c + 20, rp_last_, sizeof(rp_last_));
+    Image& out = acc[presents_ & 1];
+    const Image& was = acc[(presents_ + 1) & 1];
+    VkViewport vp{0, 0, float(cur.w), float(cur.h), 0, 1};
+    VkRect2D sc{{0, 0}, {cur.w, cur.h}};
+    VkImageView v[4] = {cur.view, was.view, dummy_.view, dummy_.view};
+    FullScreen(pl, {out.att, VK_NULL_HANDLE, cur.w, cur.h}, vp, sc, c, 32, v, 4);
+    End();
+    Barrier();
+    frame = presents_ + 1;
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: ray tracing denoise: the bounced and volumetric light built up over frames");
+}
+
+bool VulkanBackend::TaaWanted() const {
+    return Style().taa && Style().mode != kStyleRetro && ViewCount() < 2 && scene_wbuf_ && !UpscaleWanted();
+}
+
+bool VulkanBackend::UpscaleWanted() const {
+    const GraphicsStyle& st = Style();
+    return st.upscaler == kUpscalerFsr && st.mode != kStyleRetro && ViewCount() < 2 && scene_wbuf_;
+}
+
+float VulkanBackend::UpscaleShrinkRatio() const { return UpscaleWanted() ? UpscaleRatio(Style().upscale_quality) : 1.0f; }
+
+// at a 3D draw into the scene's targets (before the scene pass): drawn smaller when the upscaler's quality asks, at
+// the screen's size when not (what was made for the other size let go once)
+void VulkanBackend::UpscaleTargets(const State& s) {
+    if (draw_2d_ || !bound_rt_ || !bound_ds_ || post_done_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_)
+        return;
+    const float r = UpscaleShrinkRatio();
+    bool changed = false;
+    for (Target* t : {bound_rt_, bound_ds_}) {
+        const uint32_t full_w = t->up_small ? t->alt_res.w : t->w, full_h = t->up_small ? t->alt_res.h : t->h;
+        const uint32_t sw = std::max(1u, uint32_t(std::lround(full_w / r))), sh = std::max(1u, uint32_t(std::lround(full_h / r)));
+        if (t->up_small && (r <= 1.0f || t->w != sw || t->h != sh)) UpscaleExpand(*t, true), changed = true;
+        if (!t->up_small && r > 1.0f) UpscaleShrink(*t, r), changed = true;
+        // upscaling at the screen's size again: the smaller images and the scene's images made at their size go
+        if (r <= 1.0f && t->alt_res.img) End(), DropScene(*t), changed = true;
+    }
+    if (changed) BindTargets(s);
+}
+
+// a scene target drawn smaller from here to its upscaling: its screen-sized images put aside; a colour target starts
+// as its picture so far scaled down, a depth target as its last clear
+void VulkanBackend::UpscaleShrink(Target& t, float ratio) {
+    if (t.up_small) return;
+    const uint32_t sw = std::max(1u, uint32_t(std::lround(t.w / ratio))), sh = std::max(1u, uint32_t(std::lround(t.h / ratio)));
+    End();
+    // another size than last time (or the first): the scene's images made at the size before go with the old pair
+    if (!t.alt_res.img || t.alt_res.w != sw || t.alt_res.h != sh) {
+        DropScene(t);
+        const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                    (t.depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        if (!MakeImage(t.alt_res, VK_IMAGE_TYPE_2D, t.depth ? depth_fmt_ : kBgra, sw, sh, 1, 1, 1, u)) {
+            LOG_FIRST(1, "vulkan: no memory for the upscaler's smaller scene; drawn at the screen's size");
+            return;
+        }
+    }
+    if (dirty_) Barrier();
+    if (t.depth) {
+        Begin(Attachments{VK_NULL_HANDLE, t.alt_res.att, sw, sh});
+        VkClearAttachment ca{};
+        ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        ca.clearValue.depthStencil = {t.clear_z, t.clear_stencil};
+        VkClearRect cr{{{0, 0}, {sw, sh}}, 0, 1};
+        vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
+        End();
+    } else {
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {int32_t(t.w), int32_t(t.h), 1};
+        b.dstOffsets[1] = {int32_t(sw), int32_t(sh), 1};
+        vkCmdBlitImage(Cmd(), t.res.img, VK_IMAGE_LAYOUT_GENERAL, t.alt_res.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                       VK_FILTER_LINEAR);
+    }
+    std::swap(t.res, t.alt_res);
+    std::swap(t.fb, t.alt_fb);
+    t.w = sw, t.h = sh;
+    t.up_small = true;
+    if (t.fb.img && (t.fb.w != t.w || t.fb.h != t.h)) DropImage(t.fb);
+    dirty_ = true;
+    ForgetDrawState();
+}
+
+// back to the screen-sized images: a colour target's filled with its smaller picture scaled up (fill; the upscaler
+// writes its own instead), a depth target's with the smaller depth (nearest) where the GPU blits depth, else its clear
+void VulkanBackend::UpscaleExpand(Target& t, bool fill) {
+    if (!t.up_small) return;
+    End();
+    if (dirty_) Barrier();
+    std::swap(t.res, t.alt_res);
+    std::swap(t.fb, t.alt_fb);
+    t.w = t.res.w, t.h = t.res.h;
+    t.up_small = false;
+    if (t.fb.img && (t.fb.w != t.w || t.fb.h != t.h)) DropImage(t.fb);
+    VkImageBlit b{};
+    b.srcOffsets[1] = {int32_t(t.alt_res.w), int32_t(t.alt_res.h), 1};
+    b.dstOffsets[1] = {int32_t(t.w), int32_t(t.h), 1};
+    if (t.depth) {
+        static const bool blit_depth = [&] {
+            VkFormatProperties fp;
+            vkGetPhysicalDeviceFormatProperties(pd_, depth_fmt_, &fp);
+            const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+            return (fp.optimalTilingFeatures & need) == need;
+        }();
+        if (blit_depth) {
+            b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
+            vkCmdBlitImage(Cmd(), t.alt_res.img, VK_IMAGE_LAYOUT_GENERAL, t.res.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                           VK_FILTER_NEAREST);
+        } else {
+            Begin(Attachments{VK_NULL_HANDLE, t.res.att, t.w, t.h});
+            VkClearAttachment ca{};
+            ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+            ca.clearValue.depthStencil = {t.clear_z, t.clear_stencil};
+            VkClearRect cr{{{0, 0}, {t.w, t.h}}, 0, 1};
+            vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
+            End();
+        }
+    } else if (fill) {
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        vkCmdBlitImage(Cmd(), t.alt_res.img, VK_IMAGE_LAYOUT_GENERAL, t.res.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                       VK_FILTER_LINEAR);
+    }
+    dirty_ = true;
+    ForgetDrawState();
+}
+
+// the upscaler's reactive mask, made about the snow (WeatherPass) and the GPU particles (ParticlePass), which move by
+// no camera: the scene copied before them, then where they changed it (kUpscaleHlsl's reactive), which FSR 2 takes
+// more of the new frame at (no smears or broken flakes)
+bool VulkanBackend::UpscaleBefore(Target& rt) {
+    End();
+    if (up_before_.img && (up_before_.w != rt.w || up_before_.h != rt.h || up_before_.fmt != rt.res.fmt)) DropImage(up_before_);
+    if (!up_before_.img && !MakeImage(up_before_, VK_IMAGE_TYPE_2D, rt.res.fmt, rt.w, rt.h, 1, 1, 1,
+                                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return false;
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, up_before_.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    return true;
+}
+
+void VulkanBackend::UpscaleReactive(Target& rt) {
+    uint64_t vh, ph;
+    if (!Compile(kUpscaleHlsl, "vs", "vs_5_0", vh) || !Compile(kUpscaleHlsl, "reactive", "ps_5_0", ph)) return;
+    VkPipeline pl = PassPipeline({vh, ph, VK_FORMAT_R8_UNORM, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pl) return;
+    if (up_reactive_.img && (up_reactive_.w != rt.w || up_reactive_.h != rt.h)) DropImage(up_reactive_);
+    if (!up_reactive_.img && !MakeImage(up_reactive_, VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM, rt.w, rt.h, 1, 1, 1,
+                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        return;
+    End();
+    if (dirty_) Barrier();
+    float c[36] = {1.0f / rt.w, 1.0f / rt.h};
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView v[4] = {dummy_.view, dummy_.view, up_before_.view, rt.res.view};
+    FullScreen(pl, {up_reactive_.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 36, v, 4);
+    End();
+    up_reactive_frame_ = presents_ + 1;
+}
+
+// FSR 2 over the finished scene (after its tone mapping, style, depth of field and motion blur: LDR), from the
+// scene's size to the screen's; the result is the scene the HUD is drawn over. Its depth and the camera's motion
+// made first (kUpscaleHlsl); FSR 2's jitter is the one the scene's 3D draws took (Draw's constants)
+void VulkanBackend::UpscalePass(Target& rt, Target* ds) {
+    if (!ds || ds->w != rt.w || ds->h != rt.h) return;
+    if (!fsr_tried_) {
+        fsr_tried_ = true;
+        fsr_ok_ = fsr_.Init(instance_, pd_, dev_, vkGetInstanceProcAddr, vkGetDeviceProcAddr);
+        if (!fsr_ok_) LOGE("vulkan: FSR 2 could not find its Vulkan entry points; no upscaling");
+    }
+    if (!fsr_ok_) return;
+    uint64_t vh, dh, mh;
+    if (!Compile(kUpscaleHlsl, "vs", "vs_5_0", vh) || !Compile(kUpscaleHlsl, "depth", "ps_5_0", dh) ||
+        !Compile(kUpscaleHlsl, "motion", "ps_5_0", mh)) {
+        LOG_FIRST(1, "vulkan: the upscaler's depth and motion pass did not compile; no upscaling");
+        return;
+    }
+    VkPipeline pd = PassPipeline({vh, dh, VK_FORMAT_R32_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pm = PassPipeline({vh, mh, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pd || !pm) return;
+    const uint32_t dw = rt.up_small ? rt.alt_res.w : rt.w, dhh = rt.up_small ? rt.alt_res.h : rt.h;
+    auto ensure = [&](Image& im, VkFormat f, uint32_t w, uint32_t h, VkImageUsageFlags u) {
+        if (im.img && (im.w != w || im.h != h)) DropImage(im);
+        return im.img || MakeImage(im, VK_IMAGE_TYPE_2D, f, w, h, 1, 1, 1, u);
+    };
+    const VkImageUsageFlags in = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (!ensure(up_depth_, VK_FORMAT_R32_SFLOAT, rt.w, rt.h, in) || !ensure(up_motion_, VK_FORMAT_R16G16_SFLOAT, rt.w, rt.h, in) ||
+        !ensure(up_out_, VK_FORMAT_R8G8B8A8_UNORM, dw, dhh,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        LOG_FIRST(1, "vulkan: no memory for the upscaler; none");
+        return;
+    }
+    static const int test = [] {
+        const char* e = std::getenv("XBE_UP_TEST");
+        return e ? std::atoi(e) : 0;
+    }();
+    const float near_z = 0.05f, far_z = 4096.0f;
+    const bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    float c[36] = {1.0f / rt.w, 1.0f / rt.h, 0.5774f, float(rt.w) / float(rt.h),
+                   rp_ok_ ? 1.0f : 0.0f, 0, kept ? 1.0f : 0.0f, float(test)};
+    std::memcpy(c + 8, rp_inv_, sizeof(rp_inv_));
+    std::memcpy(c + 20, rp_last_, sizeof(rp_last_));
+    c[32] = near_z, c[33] = far_z;
+    End();
+    if (dirty_) Barrier();
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView v[2] = {ds->res.view, kept ? ds->rt_depth.view : ds->res.view};
+    FullScreen(pd, {up_depth_.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 36, v, 2);
+    FullScreen(pm, {up_motion_.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 36, v, 2);
+    End();
+    Barrier();
+    // a new context for new sizes: the frames in flight done with the old one first
+    if (!fsr_.Same(rt.w, rt.h, dw, dhh, false)) vkDeviceWaitIdle(dev_), fsr_.Destroy();
+    FsrDispatch d;
+    d.cmd = Cmd();
+    d.color = {rt.res.img, rt.res.view, rt.res.fmt, rt.w, rt.h};
+    d.depth = {up_depth_.img, up_depth_.view, up_depth_.fmt, rt.w, rt.h};
+    d.motion = {up_motion_.img, up_motion_.view, up_motion_.fmt, rt.w, rt.h};
+    d.output = {up_out_.img, up_out_.view, up_out_.fmt, dw, dhh};
+    if (up_reactive_frame_ == presents_ + 1 && up_reactive_.w == rt.w && up_reactive_.h == rt.h)
+        d.reactive = {up_reactive_.img, up_reactive_.view, up_reactive_.fmt, rt.w, rt.h};
+    d.render_w = rt.w, d.render_h = rt.h;
+    const int phases = std::max(1, FsrJitterPhases(rt.w, dw));
+    FsrJitterOffset(int(presents_ % uint64_t(phases)), phases, d.jitter_x, d.jitter_y);
+    d.sharpness = Style().upscale_sharpness;
+    auto now = std::chrono::steady_clock::now();
+    d.frame_ms = up_frame_ == presents_ ? float(std::clamp(std::chrono::duration<double, std::milli>(now - up_time_).count(), 1.0, 100.0)) : 16.7f;
+    up_time_ = now;
+    d.near_z = near_z, d.far_z = far_z, d.fov_y = 2.0f * std::atan(0.5774f);
+    d.reset = up_frame_ != presents_ || !rp_ok_;
+    const bool ok = fsr_.Dispatch(d, dw, dhh);
+    dirty_ = true;
+    Barrier();
+    // the screen-sized images back for the HUD; FSR's picture into the colour one
+    if (rt.up_small) UpscaleExpand(rt, !ok);
+    if (ds->up_small) UpscaleExpand(*ds, true);
+    if (!ok) return;
+    if (dirty_) Barrier();
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[1] = {int32_t(dw), int32_t(dhh), 1};
+    b.dstOffsets[1] = {int32_t(rt.w), int32_t(rt.h), 1};
+    vkCmdBlitImage(Cmd(), up_out_.img, VK_IMAGE_LAYOUT_GENERAL, rt.res.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    dirty_ = true;
+    Barrier();
+    up_frame_ = presents_ + 1;
+    static uint64_t said = 0;
+    const uint64_t key = uint64_t(d.render_w) << 32 | dw;
+    if (said != key) {
+        said = key;
+        LOGR("vulkan: FSR 2 upscaling %ux%u -> %ux%u (sharpness %.2f)", d.render_w, d.render_h, dw, dhh, d.sharpness);
+    }
+}
+
+// TAA (kTemporalHlsl's taa) over the scene, before its tone mapping: the result is the scene and the next history
+void VulkanBackend::TaaPass(Target& rt, Target* ds) {
+    if (!ds || ds->w != rt.w || ds->h != rt.h) return;
+    uint64_t vh, th;
+    if (!Compile(kTemporalHlsl, "vs", "vs_5_0", vh) || !Compile(kTemporalHlsl, "taa", "ps_5_0", th)) {
+        LOG_FIRST(1, "vulkan: TAA did not compile; none");
+        return;
+    }
+    VkPipeline pl = PassPipeline({vh, th, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pl) return;
+    for (Image& im : rt.taa_hist) {
+        if (im.img && (im.w != rt.w || im.h != rt.h || im.fmt != scene_fmt_)) DropImage(im), rt.taa_frame = 0;
+        if (!im.img && !MakeImage(im, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+            return;
+    }
+    static const int test = [] {
+        const char* e = std::getenv("XBE_TEMPORAL_TEST");
+        return e ? std::atoi(e) : 0;
+    }();
+    const bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    const bool last = rt.taa_frame == presents_ && rp_ok_;
+    float c[32] = {1.0f / rt.w, 1.0f / rt.h, 0.5774f, float(rt.w) / float(rt.h),
+                   last ? 1.0f : 0.0f, 0.1f, kept ? 1.0f : 0.0f, float(test)};
+    std::memcpy(c + 8, rp_inv_, sizeof(rp_inv_));
+    std::memcpy(c + 20, rp_last_, sizeof(rp_last_));
+    Image& out = rt.taa_hist[presents_ & 1];
+    const Image& was = rt.taa_hist[(presents_ + 1) & 1];
+    End();
+    if (dirty_) Barrier();
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView v[4] = {rt.res.view, was.view, ds->res.view, kept ? ds->rt_depth.view : ds->res.view};
+    FullScreen(pl, {out.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 32, v, 4);
+    End();
+    Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), out.img, VK_IMAGE_LAYOUT_GENERAL, rt.res.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    rt.taa_frame = presents_ + 1;
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: TAA drawn (jitter over 8 frames, history held within the neighbours)");
+}
+
 // motion blur over the finished scene (kMotionHlsl): the level's camera now and the last frame's
 void VulkanBackend::MotionBlurPass(Target& rt, Target* ds) {
     const GraphicsStyle& st = Style();
@@ -9019,9 +10324,9 @@ void VulkanBackend::LogPerf() {
     LOGR("perf: vulkan ground detail a frame: %.1f tagged, %.1f not opaque, %.1f no free stage, %.1f drawn",
          perf_det_[0] / n, perf_det_[1] / n, perf_det_[2] / n, perf_det_[3] / n);
     for (uint64_t& d : perf_det_) d = 0;
-    if (Style().displacement)
-        LOGR("perf: vulkan ground displacement a frame: %.1f draws, %.0f triangles (%zu meshes kept, %.1f MB)",
-             perf_disp_[0] / n, perf_disp_[1] / n, disp_cache_.size(), disp_bytes_ / 1048576.0);
+    if (Style().displacement || Style().wall_displacement)
+        LOGR("perf: vulkan geometry refinement a frame: %.1f draws (%.1f walls, %.1f later passes), %.0f triangles (%zu meshes kept, %.1f MB)",
+             perf_disp_[0] / n, perf_disp_[2] / n, perf_disp_[3] / n, perf_disp_[1] / n, disp_cache_.size(), disp_bytes_ / 1048576.0);
     for (uint64_t& d : perf_disp_) d = 0;
     perf_soft_ = perf_mat_ = perf_glow_ = 0;
     LOGR("perf: vulkan reflective draws a frame: %.1f (3D %.0f, stage 0 seen %.0f, rt+ds %.0f, scene size %.0f, opaque %.0f, W-buffer %.0f)",
