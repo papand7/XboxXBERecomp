@@ -74,8 +74,10 @@ void Sharpen2D(const TextureDesc& d);
 // a picture enlarged: alpha that is mostly fully in or out sharpened as a mask (UpscaleMask), else interpolated;
 // colour Catmull-Rom interpolated weighted by alpha. B8G8R8A8 in and out.
 std::vector<uint32_t> UpscalePicture(const std::vector<uint32_t>& bgra, uint32_t width, uint32_t height, uint32_t scale);
-// one level as B8G8R8A8 rows (the DXT formats decoded too); false for formats it cannot
-bool DecodeBgra(const TextureDesc& d, uint32_t level, const uint8_t* guest, std::vector<uint32_t>& out);
+// one level as B8G8R8A8 rows (the DXT formats decoded too; P8 through palette, its 256 colours); false for formats it
+// cannot
+bool DecodeBgra(const TextureDesc& d, uint32_t level, const uint8_t* guest, std::vector<uint32_t>& out,
+                const uint32_t* palette = nullptr);
 void ClearReplacement(uint32_t data_va);
 // false (and dropped) when the guest bytes changed since it was set; a renderer checks once a frame
 bool ReplacementHolds(const Replacement& r);

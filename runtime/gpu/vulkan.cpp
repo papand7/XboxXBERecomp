@@ -23,6 +23,7 @@
 #include <dxcapi.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -480,6 +481,8 @@ struct Target {
     // a depth target's copy soft particles read (drawn into the target at the time: no feedback loop), made at the
     // frame's first soft particle
     Image soft_depth;
+    Image water_background, post_depth;
+    uint64_t water_background_frame = 0, post_depth_frame = 0;
     uint64_t soft_frame = 0;
     // ray tracing: the scene's depth as it was when the game cleared it mid-frame (NightFire, before the gun and
     // hands), which the traced passes take the nearer of with the depth at the end
@@ -539,7 +542,8 @@ struct Tex {
     bool solid = false;    // its alpha is all 1 (or it has none): drawn blended, it still covers
     uint8_t detail = 0;    // its ground detail's kind (gpu::TextureDetail), 0 none, kDetailUnknown not found yet
     int8_t ice = -1;       // ice (gpu::TextureIce: floor reflections), -1 not looked at yet
-    int8_t water = -1;     // water (gpu::TextureWater), -1 not looked at yet
+    int8_t water = -1;     // XBE_WATER_TEST's survey (gpu::TextureWater), -1 not looked at yet
+    bool water_frame = false;  // an animated water's frame: the picture before it at this place was water
 };
 
 // a draw's four texture stages
@@ -713,12 +717,31 @@ std::string LocateInputs(std::string src) {
 // angle, width / height; [9] the thickness a ray hits and its reach (parts of the surface's distance); [10] the depth
 // holds what was drawn after a mid-frame clear alone (NightFire's gun and hands: RtKeepDepth kept the world's). t0 the
 // scene, t1 its depth, t2 the reflection mask (r), t3 its depth; s0 linear, s1 point.
+const char* kWaterCopyHlsl = R"(
+cbuffer P : register(b1) { float4 p; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D<float> keptz : register(t2);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o; o.uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1); return o;
+}
+float depth_at(float2 uv) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    return p.x != 0 ? min(d, keptz.SampleLevel(pt, uv, 0)) : d;
+}
+float4 background(O i) : SV_Target { return float4(scene.SampleLevel(pt, i.uv, 0).rgb, depth_at(i.uv)); }
+float depth_only(O i) : SV_Target { return depth_at(i.uv); }
+)";
+
 const char* kScenePostHlsl = R"(
-cbuffer P : register(b1) { float4 p[12]; };
+cbuffer P : register(b1) { float4 p[28]; };
 Texture2D scene : register(t0);
 Texture2D<float> depthtex : register(t1);
 Texture2D maskc : register(t2);
-Texture2D<float> maskz : register(t3);
+Texture2D waterbg : register(t3);  // scene before water: RGB and opaque depth in alpha
 SamplerState ls : register(s0);
 SamplerState pt : register(s1);
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -843,10 +866,151 @@ float edge(float2 uv, float2 px, float d) {
 float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[8].w, -1) * p[8].z * z, z); }
 float2 screenuv(float3 v) { return v.xy / (v.z * p[8].z * float2(p[8].w, -1)) * 0.5 + 0.5; }
 
+// water (its mask r -2; GraphicsStyle::water): the surface's plane from the view's up (p[10].yzw), the world's plane
+// coordinates from p[12] and p[14] (p[11].z) for waves that stay put as the view moves; p[11].w a clock (600 s, every
+// motion a whole number of cycles over it); t3 (p[11].y) the scene before the water and its depth, seen through it;
+// p[15].y the lights (p[16 + 2n] a light's place and reach, p[17 + 2n] its colour), p[15].z a world unit in the view's
+float vnoise(float2 x) {
+    float2 i = floor(x), f = frac(x);
+    f = f * f * (3 - 2 * f);
+    return lerp(lerp(noise(i), noise(i + float2(1, 0)), f.x), lerp(noise(i + float2(0, 1)), noise(i + 1), f.x), f.y);
+}
+// the scene's own reflection: a ray marched through the depth from P along R; 0 missed to 1 met
+float water_march(float3 P, float3 R, float2 uv, out float3 hit) {
+    hit = 0;
+    const int steps = 40;
+    float len = P.z * max(p[9].y, 2) / steps;
+    float t = len * (0.5 + noise(uv * 731.0 + p[0].w));
+    [loop] for (int i = 0; i < steps; i++) {
+        float3 Q = P + R * t;
+        if (Q.z < P.z * 0.02) break;
+        float2 q = screenuv(Q);
+        if (any(q < 0) || any(q > 1)) break;
+        float diff = Q.z - viewz(rawz(q));
+        if (diff > 0 && diff < Q.z * max(p[9].x, 0.05) + len) {
+            float a = t - len, b = t;
+            [unroll] for (int k = 0; k < 5; k++) {
+                float mid = (a + b) * 0.5;
+                float3 M = P + R * mid;
+                if (M.z - viewz(rawz(screenuv(M))) > 0) b = mid;
+                else a = mid;
+            }
+            q = screenuv(P + R * b);
+            float2 e = min(q, 1 - q);
+            hit = texl(q);
+            return saturate(min(e.x, e.y) * 10) * (1 - float(i) / steps * 0.5);
+        }
+        t += len;
+        len *= 1.07;
+    }
+    return 0;
+}
+// a pixel past the water's edge: not water in the mask, or something drawn nearer there that stands in the water
+// (a wall); what is far nearer (the gun and hands, a character walking past) is not an edge
+float water_out(float2 q, float z) {
+    if (any(q < 0) || any(q > 1)) return 0;
+    float4 o = maskc.SampleLevel(pt, q, 0);
+    if (o.r > -1.5 || o.a <= 0) return 1;
+    float s = viewz(rawz(q));
+    return s < o.a * 0.995 && s > z * 0.75 ? 1 : 0;
+}
+float3 water_shade(float2 uv, float2 px, float3 c, float3 P) {
+    float3 U = normalize(p[10].yzw);
+    float3 X = normalize(cross(U, abs(U.z) < 0.9 ? float3(0, 0, 1) : float3(0, 1, 0)));
+    float3 Z = cross(X, U);
+    float unit = p[15].z > 0 ? p[15].z : 1;  // a world unit in the view's
+    float2 q = float2(dot(P, X), dot(P, Z)) / unit;
+    if (p[11].z != 0) {
+        q = float2(dot(p[12], float4(P, 1)), dot(p[14], float4(P, 1))) / unit;
+        X = normalize(p[12].xyz); Z = normalize(p[14].xyz);
+    }
+    float tm = p[11].w;
+    const float cyc = 0.0104719755;  // a whole cycle over the 600 s clock
+    float3 V = normalize(P);
+    float cosv = saturate(dot(-V, U));
+    // waves: eight travelling sines in as many directions, swells to a fine chop; the slope from their derivatives
+    // (smooth everywhere: no noise grid for the glints to show)
+    float2 g = 0;
+    const float2 dirs[8] = {float2(0.96, 0.28), float2(-0.37, 0.93), float2(0.71, -0.71), float2(-0.98, -0.2),
+                            float2(0.24, -0.97), float2(0.53, 0.85), float2(-0.8, 0.6), float2(0.9, -0.44)};
+    const float freq[8] = {1.6, 2.7, 4.1, 6.3, 8.9, 11.7, 15.3, 19.9};
+    const float amp[8] = {0.05, 0.032, 0.02, 0.012, 0.007, 0.0045, 0.003, 0.002};
+    const float speed[8] = {90, 130, 170, 230, 290, 350, 410, 470};
+    [unroll] for (int k = 0; k < 8; k++)
+        g += dirs[k] * freq[k] * amp[k] * cos(dot(q, dirs[k]) * freq[k] + tm * cyc * speed[k] + k * 1.7);
+    float2 drift = float2(sin(tm * cyc * 5), cos(tm * cyc * 4)) * 3;
+    // calmer far away and at a grazing view (less shimmer)
+    g *= lerp(0.45, 1, cosv) / (1 + P.z / unit * 0.02);
+    float3 N = normalize(U - X * g.x - Z * g.y);
+    // under the surface: the scene before the water, bent by the waves; deeper water darker and greener
+    float4 bg = waterbg.SampleLevel(pt, uv, 0);
+    bool have_bg = p[11].y != 0;
+    float behind = have_bg && bg.a < 0.99999 ? viewz(bg.a) : P.z + 30 * unit;
+    float depth = abs(dot(viewpos(uv, max(behind, P.z)) - P, U)) / unit;  // straight down, world units
+    float2 bend = g * float2(1, -1) * min(depth, 2) * 0.06 / max(P.z / unit, 1) / px.y * px;
+    float2 rq = clamp(uv + bend, px, 1 - px);
+    float3 under = c;
+    if (have_bg) {
+        float4 b2 = waterbg.SampleLevel(ls, rq, 0);
+        float4 m2 = maskc.SampleLevel(pt, rq, 0);
+        // the bent sample stays in this water and behind it, else the straight one
+        under = m2.r < -1.5 && b2.a < 0.99999 && viewz(b2.a) > P.z * 1.001 ? b2.rgb : bg.rgb;
+    }
+    // the view's path through the water: its depth over the cosine, at most 12 units
+    float path = min(depth / max(cosv, 0.2), 12);
+    float around = luma(texl(float2(0.5, 0.2))) * 0.3 + luma(texl(float2(0.25, 0.35))) * 0.2 +
+                   luma(texl(float2(0.75, 0.35))) * 0.2 + 0.3 * luma(c);
+    float3 deep = float3(0.035, 0.15, 0.17) * (0.7 + around * 1.6);
+    float3 transmit = exp(-float3(0.45, 0.16, 0.12) * path);
+    float3 body = under * transmit * float3(0.85, 1.0, 1.0) + deep * (1 - transmit);
+    body = lerp(body, max(c, body), 0.25);  // the game's own water picture (its moving caustics) shows a little
+    // reflection: the scene where a ray off the waves meets it; a missed ray sees the room's average, dimmer
+    float3 R = reflect(V, N);
+    float3 hit;
+    float found = water_march(P, R, uv, hit);
+    float3 env = (texl(float2(0.5, 0.08)) + texl(float2(0.2, 0.15)) + texl(float2(0.8, 0.15))) / 3 * 0.6 + deep * 0.5;
+    hit = lerp(env, hit * (1 + 0.7 * smoothstep(0.5, 0.95, luma(hit))), found);
+    float fres = saturate(0.1 + 0.9 * pow(1 - saturate(dot(-V, N)), 3));
+    float3 col = lerp(body, hit, fres * lerp(0.7, 1, found));
+    // the lamps' glints: a sharp highlight and a softer sheen on the waves
+    int lights = int(p[15].y);
+    float3 spec = 0;
+    [loop] for (int l = 0; l < lights; l++) {
+        float3 Lv = p[16 + 2 * l].xyz - P;
+        float dist = length(Lv);
+        float reach = p[16 + 2 * l].w * 2.5;
+        if (dist > reach || dist <= 0) continue;
+        float3 L = Lv / dist;
+        if (dot(L, U) <= 0) continue;
+        float nh = saturate(dot(N, normalize(L - V)));
+        float fall = 1 - dist / reach;
+        spec += p[17 + 2 * l].rgb * (pow(nh, 250) * 2.5 + pow(nh, 40) * 0.2) * fall * fall;
+    }
+    col += min(spec, 1.2) * (0.4 + 0.6 * fres);
+    col = col / (1 + max(luma(col) - 0.85, 0));  // soft roll-off: no hard white blocks
+    // foam: a soft band along the edge (walls standing in the water), broken by drifting noise, up to 0.5 units wide:
+    // the nearest edge found along 8 directions (turned a little each pixel, so the band has no steps)
+    float rpx = 0.5 * unit / (2 * p[8].z * P.z) / px.y;  // the band's width in pixels at this distance
+    float nearest = 1;
+    float turn = frac(52.9829189 * frac(dot(uv / px, float2(0.06711056, 0.00583715)))) * 0.785;
+    [loop] for (int k = 0; k < 8; k++) {
+        float a = k * 0.785398 + turn;
+        float2 o = float2(cos(a), sin(a) * max(cosv, 0.3)) * px * rpx;
+        [unroll] for (int r = 1; r <= 6; r++)
+            if (r / 6.0 < nearest && water_out(uv + o * (r / 6.0), P.z) > 0) nearest = r / 6.0 - 0.0833;
+    }
+    float band = 1 - smoothstep(0.0, 1.0, nearest);
+    float fn = vnoise(q * 4 + drift * 0.7) * 0.6 + vnoise(q * 9.1 - drift) * 0.4;
+    float foam = smoothstep(0.25, 0.65, band * 0.9 + (fn - 0.5) * 0.55) * band;
+    float3 foamc = float3(0.72, 0.8, 0.8) * (0.3 + around * 1.1);
+    return lerp(col, foamc, foam * 0.55);
+}
+
 float3 ssr(float2 uv, float2 px, float3 c) {
-    if (p[8].x == 0) return c;
+    if (p[8].x == 0 && p[11].y == 0) return c;
     float4 mk = maskc.SampleLevel(pt, uv, 0);
     bool water = mk.r < -1.5;
+    if (!water && p[8].x == 0) return c;
     if (!water && p[11].x != 0) return c;  // already reflected by ray tracing
     float m = water ? 0.7 : abs(mk.r);
     if (m < 0.01) return c;
@@ -860,33 +1024,18 @@ float3 ssr(float2 uv, float2 px, float3 c) {
     float3 N = normalize(cross(dx, dy));
     if (dot(N, P) > 0) N = -N;
     if (mk.r < 0) m *= saturate((dot(N, p[10].yzw) - 0.8) * 5);  // a floor's: where it faces up (p[10].yzw the up)
+    if (water && p[15].x == 2) {  // XBE_WATER_TEST, overlay 2: the texture's number in colour (r + 8 g + 64 b)
+        uint n = uint(round((-mk.r - 2) * 100));
+        return float3(n & 7, (n >> 3) & 7, (n >> 6) & 3) / float3(7, 7, 3);
+    }
+    if (water && p[15].x != 0) return lerp(c, m < 0.01 ? float3(1, 0.5, 0) : float3(1, 0, 1), 0.6);  // XBE_WATER_TEST
     if (m < 0.01) return c;
     if (water) {
-        // Small travelling ripples in the surface's plane. The mask still supplies the undisturbed surface's
-        // depth, so waves cannot refract a foreground object into the water or shift its shoreline.
-        float3 U = normalize(p[10].yzw);
-        float3 X = normalize(cross(U, abs(U.z) < 0.9 ? float3(0, 0, 1) : float3(0, 1, 0)));
-        float3 Z = cross(X, U);
-        float2 q = float2(dot(P, X), dot(P, Z));
-        float tm = p[0].w;
-        float2 ripple = float2(cos(dot(q, float2(2.1, 1.3)) + tm * 1.4),
-                               sin(dot(q, float2(-1.2, 2.7)) - tm * 1.1));
-        N = normalize(N + (X * ripple.x + Z * ripple.y) * 0.045);
-        float behind = viewz(rawz(uv));
-        float thickness = clamp(behind - gz, 0, 20);
-        float2 bend = ripple * px * min(6, thickness * 3);
-        float2 refracted = clamp(uv + bend, px, 1 - px);
-        float4 other = maskc.SampleLevel(pt, refracted, 0);
-        // Refraction stays inside this water surface and behind it.
-        if (other.r < -1.5 && viewz(rawz(refracted)) >= gz * 0.995)
-            c = lerp(c, texl(refracted), 0.3 * saturate(thickness * 2));
-        float3 transmit = exp(-float3(0.28, 0.10, 0.065) * thickness);
-        c = c * transmit + float3(0.025, 0.10, 0.12) * (1 - transmit);
-        // Foam is confined to shallow intersections, with a broken, moving edge rather than a solid white line.
-        float foam = (1 - smoothstep(0.03, 0.4, thickness)) * smoothstep(0.005, 0.04, thickness);
-        foam *= smoothstep(0.05, 0.8, noise(q * 19 + tm * 0.2));
-        c = lerp(c, float3(0.65, 0.75, 0.73), foam * 0.45);
+        // the surface's place from the scene's depth (it writes it): the mask's 16-bit distance makes steps in the waves
+        float zs = viewz(rawz(uv));
+        return water_shade(uv, px, c, abs(zs - gz) < gz * 0.01 ? viewpos(uv, zs) : P);
     }
+    if (p[8].x == 0) return c;
     float3 V = normalize(P);
     float3 R = reflect(V, N);
     if (p[9].z == 2) return N * 0.5 + 0.5;  // XBE_SSR_TEST=3: the slope
@@ -3672,6 +3821,7 @@ private:
     bool post_done_ = false;
     void ScenePass(Target& rt, Target* ds);
     void StylePass(Target& rt, Target* ds);  // the style's own pass (StylePassWanted)
+    bool WaterCopy(Target& rt, Target& ds, bool background);
     void AtmospherePass(Target& rt, Target* ds);  // light shafts and fog (GraphicsStyle::atmosphere)
     void BouncePass(Target& rt, Target* ds);      // bounced light (GraphicsStyle::bounce_light)
     void DofPass(Target& rt, Target* ds);         // depth of field (GraphicsStyle::dof)
@@ -3723,7 +3873,8 @@ private:
         const GraphicsStyle& st = Style();
         return DofWanted() || st.mode == kStyleNoir ||
                (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light || QualityAo(st) > 0 || st.weather ||
-                                           st.motion_blur || st.smooth_turn || st.contact_shadows || st.particles || st.upscaler));
+                                           st.motion_blur || st.smooth_turn || st.contact_shadows || st.particles || st.upscaler ||
+                                           (st.water && WaterDrawn()) || st.reflections != kReflectOff));
     }
     float dof_aim_ = 0;          // aiming down the sights, eased 0 to 1
     uint32_t scene_zwrites_ = 0;  // the frame's 3D draws that wrote the scene's depth
@@ -3841,8 +3992,10 @@ private:
     uint64_t stage_key_ = 0;
     uint8_t stage_detail_ = 0;
     bool stage_ice_ = false;    // stage 0's texture is ice (floor reflections)
+    int water_pick_ = 0, water_pick_hi_ = 0, water_overlay_ = 1, water_number_ = 0;  // XBE_WATER_TEST: the water_pick file (Reflectivity)
     bool stage_water_ = false;  // stage 0's texture is a water candidate (restricted to upward-facing surfaces)
     bool refl_water_ = false;
+    bool water_drawn_ = false;  // this frame drew water (SetWaterDrawn at its present)
     bool refl_floor_ = false;   // the draw reflects as a floor (Reflectivity): only where it faces up
     bool ViewUp(float aspect, float up[3]) const;  // the world's up in the view (rt_cams_), false unknown
     float stage_glass_ = 0;
@@ -3884,6 +4037,7 @@ private:
     void DropScene(Target& t) {
         DropImage(t.smaa_edges), DropImage(t.smaa_weights), DropImage(t.mask), DropImage(t.mask_ds);
         DropImage(t.soft_depth);
+        DropImage(t.water_background), DropImage(t.post_depth);
         DropImage(t.glow), DropImage(t.light_a), DropImage(t.light_b), DropImage(t.light_list);
         DropImage(t.light_pa), DropImage(t.light_pb), DropImage(t.light_rank);
         DropImage(t.rt_ao), DropImage(t.rt_depth), DropImage(t.rt_gi), DropImage(t.rt_vol), DropImage(t.gtao);
@@ -5883,6 +6037,18 @@ void VulkanBackend::UploadTexture(Tex& tx, const TextureDesc& d, const uint8_t* 
     }
 }
 
+// water: the textures the game names (WaterTexture: GameInfo's list, mods/reflections.toml's [water]) and an animated
+// water's frames after them; XBE_WATER_TEST takes every loosely water-coloured texture (TextureWater's survey) instead
+bool WaterSurvey() {
+    static const bool on = std::getenv("XBE_WATER_TEST") || std::getenv("XBE_WATER_DUMP");
+    return on;
+}
+bool IsWater(const Tex& t) {
+    static const bool test = std::getenv("XBE_WATER_TEST") != nullptr;
+    if (test) return t.water > 0;
+    return (t.water_frame && WaterTexture(t.key) != 0) || WaterTexture(t.key) > 0;
+}
+
 VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const TextureDesc& d, const FormatInfo& fi,
                                             DrawTextures& stages) {
     if (!d.cube && d.depth == 1 && !fi.depth && !sky_keeps_game_) {
@@ -5892,15 +6058,15 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
             stages.replaced[stage] = true;
             // the game's picture it stands for (uploaded before the pack's was set): what reflections know it by
             if (auto it = textures_.find(d.data); stage == 0 && it != textures_.end()) {
-                if (it->second.water < 0 && (Style().water || std::getenv("XBE_WATER_DUMP"))) {
+                if (it->second.water < 0 && WaterSurvey()) {
                     StagePalette palette;
                     ReadStagePalette(s, stage, d, palette);
                     it->second.water = TextureWater(it->second.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)),
-                                                    palette.va != 0) ? 1 : 0;
+                                                    palette.va ? palette.colours : nullptr) ? 1 : 0;
                 }
                 stage_key_ = it->second.key, stage_glass_ = it->second.glass, stage_solid_ = it->second.solid,
                 stage_detail_ = it->second.detail, stage_ice_ = it->second.ice > 0,
-                stage_water_ = it->second.water > 0, stage_seen_ = true;
+                stage_water_ = IsWater(it->second), stage_seen_ = true;
             }
             return v;
         }
@@ -5911,6 +6077,7 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
     const uint64_t key = uint64_t(palette.va) << 32 | d.data;
     Tex& tx = textures_[key];
     bool same = SameTexture(tx, d);
+    const uint64_t last_bound = tx.frame;
     if (!same && !CreateTexture(tx, d, fi)) {
         DropImage(tx.img);
         textures_.erase(key);
@@ -5921,19 +6088,25 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         tx.palette = palette.hash;
         uint64_t sig = SurfaceSig(d.data, TotalSize(d)) ^ DirtyEpoch(d.data) ^ palette.hash;
         if (sig != tx.sig || !same) {
+            // a water picture drawn a moment ago changed in place: the water's next frame (an animated water's
+            // frames need not all be listed)
+            const bool flowing = same && tx.key && last_bound + 8 > presents_ + 1 && IsWater(tx);
             tx.sig = sig;
             UploadTexture(tx, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr);
             tx.key = TextureKey(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.hash);
             tx.detail = kDetailUnknown;  // its kind found when first drawn with ground detail on
             tx.ice = -1;
             tx.water = -1;
+            if (flowing && !tx.water_frame && !WaterTexture(tx.key))
+                LOG_FIRST(16, "vulkan: water: texture %016llx is a frame of an animated water", (unsigned long long)tx.key);
+            tx.water_frame = flowing;
             TexturePackSeen(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr,
                             palette.hash);
         }
     }
-    static const bool water_survey = std::getenv("XBE_WATER_DUMP") != nullptr;
-    if (tx.water < 0 && (water_survey || Style().water) && !draw_2d_)
-        tx.water = TextureWater(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0) ? 1 : 0;
+    if (tx.water < 0 && WaterSurvey() && !draw_2d_)
+        tx.water = TextureWater(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)),
+                                palette.va ? palette.colours : nullptr) ? 1 : 0;
     if (tx.ice < 0 && Style().floor_reflections && !draw_2d_)
         tx.ice = TextureIce(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0) ? 1 : 0;
     if (tx.detail == kDetailUnknown && (Style().ground_detail || Style().displacement || Style().wall_displacement || Style().floor_reflections >= 2) &&
@@ -5955,7 +6128,7 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
     if (fi.depth) stages.info[stage].shadow = ShadowDepthKind(d.format);
     if (stage == 0)
         stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_detail_ = tx.detail,
-        stage_ice_ = tx.ice > 0, stage_water_ = tx.water > 0, stage_seen_ = true;
+        stage_ice_ = tx.ice > 0, stage_water_ = IsWater(tx), stage_seen_ = true;
     return tx.img.view;
 }
 
@@ -6628,7 +6801,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
     if (!draw_2d_ && bound_ds_) scene_wbuf_ = pk.wbuf;
     // snow: how much of the world is snow, and (without ray tracing's capture) the level's camera (snow, motion blur)
-    if ((WeatherWanted() || ParticlesWanted() || UpscaleWanted() || ((Style().motion_blur || Style().contact_shadows || Style().floor_reflections) &&
+    if ((WeatherWanted() || ParticlesWanted() || UpscaleWanted() || ((Style().motion_blur || Style().contact_shadows || Style().floor_reflections || (Style().water && WaterDrawn())) &&
                               Style().mode != kStyleRetro)) && !draw_2d_ && sh.prog && pk.wbuf && a.topology == Topology::Triangles && !sh.quad &&
         bound_ds_ && bound_ds_->rt_depth_frame != presents_ + 1) {
         uint64_t n = (a.index_count ? a.index_count : a.draw_count) / 3;
@@ -6753,7 +6926,10 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
     // reflections: drawn into the mask after (DrawMask), which reads its strength from these constants
     const float refl = Reflectivity(k);
-    c.style[2] = refl_water_ ? -2.0f : refl_floor_ ? -refl : refl;  // water tagged separately from floors
+    if (refl_water_) water_drawn_ = true;
+    if (refl_water_ && bound_rt_ && bound_ds_ && ViewCount() < 2) WaterCopy(*bound_rt_, *bound_ds_, true);
+    c.style[2] = refl_water_ ? -2.0f - 0.01f * float(water_number_) : refl_floor_ ? -refl : refl;  // water tagged apart
+    water_number_ = 0;
     c.style[3] = Opaque(k) || stage_solid_ ? 1.0f : 0.0f;
     // materials: a pack picture's normal and roughness, read from a stage the draw leaves free
     int mat_slot = -1;
@@ -8045,11 +8221,26 @@ float VulkanBackend::Reflectivity(const PsoKey& k) {
         g_ssr_diag[0]++, g_ssr_diag[1] += stage_seen_, g_ssr_diag[2] += bound_rt_ && bound_ds_,
             g_ssr_diag[3] += bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_,
             g_ssr_diag[4] += Opaque(k) || stage_solid_, g_ssr_diag[5] += scene_wbuf_;
-    if (st.reflections == kReflectOff || st.mode == kStyleRetro || draw_2d_ || !stage_seen_ || !bound_rt_ ||
+    if ((st.reflections == kReflectOff && !st.water) || st.mode == kStyleRetro || draw_2d_ || !stage_seen_ || !bound_rt_ ||
         !bound_ds_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_)
         return 0;
     float listed = ReflectionOf(stage_key_);
+    // XBE_WATER_TEST=1 (finding a level's water): each loosely water-coloured texture logged with a number as it is
+    // first drawn; the run folder's water_pick file ("number overlay") keeps one of them (0 all), shown magenta where
+    // it faces up and orange where not (overlay 1) or shaded as water (0)
+    static const bool water_test = std::getenv("XBE_WATER_TEST") != nullptr;
+    if (water_test && st.water && stage_water_ && k.zen && !sky_keeps_game_) {
+        static std::unordered_map<uint64_t, int> numbers;
+        auto [it, fresh] = numbers.try_emplace(stage_key_, int(numbers.size()) + 1);
+        if (fresh)
+            LOGR("water test: #%d texture %016llx, blend %u (%X %X), z write %u, cull %u", it->second,
+                 (unsigned long long)stage_key_, k.blend, k.src, k.dst, k.zwrite, k.cull);
+        if (water_pick_ != 0 && (it->second < water_pick_ || it->second > water_pick_hi_)) return 0;
+        water_number_ = it->second;
+        return refl_water_ = true, 0.7f;
+    }
     if (st.water && stage_water_ && k.zen && !sky_keeps_game_ && listed != 0) return refl_water_ = true, 0.7f;
+    if (st.reflections == kReflectOff) return 0;
     if (listed >= 0) return listed;
     // XBE_SSR_TEST=1: every opaque 3D surface reflects (the reflection pass checked without a list)
     static const bool test = [] {
@@ -8640,6 +8831,8 @@ void VulkanBackend::Present(const Surface& front) {
     Unbind();
     DeliverReports(false);
     Collect();
+    SetWaterDrawn(water_drawn_);
+    water_drawn_ = false;
     presents_++;
     presents_seen_.store(presents_);
     warp_t_ = t;
@@ -8913,6 +9106,34 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     ForgetDrawState();  // the draw that asked for it goes on with its targets
 }
 
+bool VulkanBackend::WaterCopy(Target& rt, Target& ds, bool background) {
+    if (rt.w != ds.w || rt.h != ds.h) return false;
+    Image& dst = background ? rt.water_background : rt.post_depth;
+    uint64_t& frame = background ? rt.water_background_frame : rt.post_depth_frame;
+    if (dst.img && (dst.w != rt.w || dst.h != rt.h)) DropImage(dst), frame = 0;
+    if (frame == presents_ + 1 && dst.img) return true;
+    const VkFormat fmt = background ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32_SFLOAT;
+    if (!dst.img && !MakeImage(dst, VK_IMAGE_TYPE_2D, fmt, rt.w, rt.h, 1, 1, 1,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return false;
+    uint64_t vh, ph;
+    if (!Compile(kWaterCopyHlsl, "vs", "vs_5_0", vh) ||
+        !Compile(kWaterCopyHlsl, background ? "background" : "depth_only", "ps_5_0", ph)) return false;
+    VkPipeline pipe = PassPipeline({vh, ph, fmt, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pipe) return false;
+    const bool kept = ds.rt_depth.img && ds.rt_depth_frame == presents_ + 1;
+    VkImageView views[3] = {rt.res.view, ds.res.view, kept ? ds.rt_depth.view : ds.res.view};
+    const float c[4] = {kept ? 1.0f : 0.0f};
+    End();
+    if (dirty_) Barrier();
+    FullScreen(pipe, {dst.att, VK_NULL_HANDLE, rt.w, rt.h}, {0, 0, float(rt.w), float(rt.h), 0, 1},
+               {{0, 0}, {rt.w, rt.h}}, c, 4, views, 3);
+    End();
+    dirty_ = true;
+    frame = presents_ + 1;
+    if (background) LOG_FIRST(2, "vulkan: water background and opaque depth captured (%ux%u)", rt.w, rt.h);
+    return true;
+}
+
 void VulkanBackend::StylePass(Target& rt, Target* ds) {
     const GraphicsStyle& st = Style();
     uint64_t vh, ph;
@@ -8957,7 +9178,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
     if (st.mode == kStyleOriginal && st.quality_bloom) g.bloom_threshold = 0.85f;
     if (tone_drawn_) g.tonemap = kToneOff, g.exposure = 1;
     if (tone_drawn_ && hdr_bloom_drawn_) bloom = 0;
-    float c[48] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
+    float c[112] = {float(g.mode), 1.0f / rt.w, 1.0f / rt.h, float(presents_ % 3600) / 60.0f,
                    g.exposure, float(g.tonemap), g.contrast, g.saturation,
                    g.temperature, g.sharpen, bloom, g.bloom_threshold,
                    ao, g.ao_radius, g.vignette, g.grain,
@@ -8966,7 +9187,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
                    float(st.pixel) * k, levels, st.dither ? 1.0f : 0.0f, st.retro_tint,
                    depth ? 1.0f : 0.0f, float(rt.w), float(rt.h), k};
     // reflections, when a reflective draw made this frame's mask; an assumed 60 degree vertical view
-    bool mask = depth && rt.mask.img && rt.mask_frame == presents_ + 1 && st.reflections != kReflectOff &&
+    bool mask = depth && rt.mask.img && rt.mask_frame == presents_ + 1 && (st.reflections != kReflectOff || st.water) &&
                 st.mode != kStyleRetro && (!rt_reflected_ || st.water);
     c[32] = mask && ViewCount() < 2 ? st.reflection_strength : 0.0f;
     c[33] = st.reflections == kReflectHigh ? 48.0f : 20.0f;
@@ -8984,13 +9205,73 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
     c[40] = depth && ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1 ? 1.0f : 0.0f;
     ViewUp(float(rt.w) / float(rt.h), &c[41]);  // floor reflections: the world's up in the view
     c[44] = rt_reflected_ ? 1.0f : 0.0f;
+    static const auto water_epoch = std::chrono::steady_clock::now();
+    c[47] = float(std::fmod(std::chrono::duration<double>(std::chrono::steady_clock::now() - water_epoch).count(), 600.0));
+    const RtCam* water_cam = nullptr;
+    for (const auto& [hash, cam] : rt_cams_)
+        if (!water_cam || cam.tris > water_cam->tris) water_cam = &cam;
+    if (st.water && water_cam) {
+        const float scale[3] = {0.5774f * float(rt.w) / float(rt.h), 0.5774f, 1};
+        float m[3][4];
+        for (int row = 0; row < 3; row++)
+            for (int col = 0; col < 4; col++) m[row][col] = water_cam->r[row][col] * scale[row];
+        const float a = m[0][0], b = m[0][1], z = m[0][2], d = m[1][0], e = m[1][1], f = m[1][2],
+                    j = m[2][0], h = m[2][1], k = m[2][2];
+        const float det = a * (e*k-f*h) - b * (d*k-f*j) + z * (d*h-e*j);
+        const float unit = std::sqrt(j*j + h*h + k*k);
+        if (std::abs(det) > 1e-12f && unit > 0) {
+            float inv[3][4] = {{(e*k-f*h)/det, (z*h-b*k)/det, (b*f-z*e)/det, 0},
+                               {(f*j-d*k)/det, (a*k-z*j)/det, (z*d-a*f)/det, 0},
+                               {(d*h-e*j)/det, (b*j-a*h)/det, (a*e-b*d)/det, 0}};
+            for (int row = 0; row < 3; row++) {
+                inv[row][3] = -(inv[row][0]*m[0][3] + inv[row][1]*m[1][3] + inv[row][2]*m[2][3]);
+                for (int col = 0; col < 4; col++) c[48 + row*4 + col] = inv[row][col] * unit;
+            }
+            c[46] = 1;
+            c[62] = unit;
+            // the lamps' glints: the game's nearest kWaterLights lights in the view (as RtRelightPass places them)
+            constexpr uint32_t kWaterLights = 6;
+            static SceneLight all[256];
+            const uint32_t n = SceneLights(all, 256);
+            std::vector<std::array<float, 8>> closest;
+            for (uint32_t i = 0; i < n; i++) {
+                std::array<float, 8> v{};
+                for (int r = 0; r < 3; r++)
+                    v[r] = m[r][0] * all[i].pos[0] + m[r][1] * all[i].pos[1] + m[r][2] * all[i].pos[2] + m[r][3];
+                v[3] = all[i].radius * unit * 3;
+                if (v[2] + v[3] < 0) continue;
+                for (int k2 = 0; k2 < 3; k2++) v[4 + k2] = all[i].rgb[k2];
+                closest.push_back(v);
+            }
+            auto dist = [](const std::array<float, 8>& v) { return std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]) - v[3]; };
+            std::sort(closest.begin(), closest.end(), [&](const auto& x, const auto& y) { return dist(x) < dist(y); });
+            const uint32_t used = uint32_t(std::min<size_t>(closest.size(), kWaterLights));
+            for (uint32_t i = 0; i < used; i++) std::memcpy(&c[64 + 8 * i], closest[i].data(), sizeof(float) * 8);
+            c[61] = float(used);
+        }
+    }
+    static const bool water_test = std::getenv("XBE_WATER_TEST") != nullptr;
+    if (water_test && presents_ % 30 == 0) {  // XBE_WATER_TEST: the water_pick file (Reflectivity)
+        if (FILE* f = std::fopen("water_pick", "r")) {
+            int pick = 0, hi = 0, overlay = 1;  // "first last overlay"
+            if (std::fscanf(f, "%d %d %d", &pick, &hi, &overlay) >= 1 &&
+                (pick != water_pick_ || hi != water_pick_hi_ || overlay != water_overlay_))
+                LOGR("water test: showing #%d to #%d%s", pick, hi, overlay ? ", overlaid" : ", shaded");
+            std::fclose(f);
+            water_pick_ = pick, water_pick_hi_ = std::max(pick, hi), water_overlay_ = overlay;
+        }
+    }
+    c[60] = water_test ? float(water_overlay_) : 0.0f;
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
-    VkImageView views[4] = {rt.fb.view, depth ? ds->res.view : VK_NULL_HANDLE, mask ? rt.mask.view : VK_NULL_HANDLE,
-                            mask ? rt.mask_ds.view : VK_NULL_HANDLE};
+    const bool combined = depth && c[40] != 0 && WaterCopy(rt, *ds, false);
+    const bool water_background = st.water && rt.water_background.img && rt.water_background_frame == presents_ + 1;
+    c[45] = water_background ? 1.0f : 0.0f;
+    VkImageView views[4] = {rt.fb.view, depth ? (combined ? rt.post_depth.view : ds->res.view) : VK_NULL_HANDLE,
+                           mask ? rt.mask.view : VK_NULL_HANDLE, water_background ? rt.water_background.view : VK_NULL_HANDLE};
     for (VkImageView& v : views)
         if (!v && !null_descriptor_) v = dummy_.view;
-    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 48, views, 4);
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 112, views, 4);
     End();
 }
 

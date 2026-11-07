@@ -307,16 +307,19 @@ bool TextureIce(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool p
     return ice;
 }
 
-bool TextureWater(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool paletted) {
+bool TextureWater(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32_t* palette) {
     static std::unordered_map<uint64_t, bool> seen;
+    static const bool survey = std::getenv("XBE_WATER_TEST") != nullptr;
     std::lock_guard lock(g_lock);
     if (auto it = seen.find(key); it != seen.end()) return it->second;
     bool water = false;
     bool candidate = false;
     std::vector<uint32_t> px;
     double r = 0, g = 0, b = 0, l1 = 0, dev = 0, clear = 0;
-    if (!paletted && !d.cube && d.depth == 1 && !Format(d.format).depth && d.width >= 64 && d.height >= 64 &&
-        d.width <= 1024 && d.height <= 1024 && DecodeBgra(d, 0, guest, px) && px.size() >= size_t(d.width) * d.height) {
+    const uint32_t least = survey ? 16 : 64;
+    if (!d.cube && d.depth == 1 && !Format(d.format).depth && d.width >= least && d.height >= least &&
+        d.width <= 1024 && d.height <= 1024 && DecodeBgra(d, 0, guest, px, palette) &&
+        px.size() >= size_t(d.width) * d.height) {
         size_t n = size_t(d.width) * d.height;
         double l2 = 0;
         for (size_t i = 0; i < n; i++) {
@@ -332,6 +335,10 @@ bool TextureWater(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool
         double hi = std::max({r, g, b}), lo = std::min({r, g, b}), sat = hi > 0 ? (hi - lo) / hi : 0;
         // blue or green over red, not grey, not bright (ice and snow), even (not a patterned wall)
         candidate = std::max(b, g) > r + 0.05 && sat > 0.15 && l1 > 0.05 && l1 < 0.55 && dev < 0.12;
+        // XBE_WATER_TEST (finding a level's water): anything loosely blue, green or grey-blue, any size or alpha
+        // (=2: every texture, for water drawn in grey or black)
+        static const bool every = survey && std::getenv("XBE_WATER_TEST")[0] == '2';
+        if (survey) candidate = every || (std::max(b, g) > r + 0.015 && l1 > 0.03 && l1 < 0.75 && dev < 0.22);
         // Conservative auto-detection: the survey also finds suits, carpet, sky and splash sprites. Keep only
         // small square, opaque, smoothly varying patterns; the renderer additionally requires an upward-facing
         // surface and excludes the sky. Fine checker patterns (carpet) have a large adjacent-pixel difference.
@@ -349,10 +356,11 @@ bool TextureWater(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool
             water = rough / dev < 0.32;
         }
     }
+    if (survey) water = candidate;
     seen[key] = water;
     if (candidate) {
         static int said = 0;
-        if (said++ < 60)
+        if (said++ < (survey ? 400 : 60))
             LOGR("graphics: water? texture %016llx (%ux%u fmt %02X): mean %.2f %.2f %.2f, brightness %.2f, spread %.3f, %.0f%% see-through",
                  (unsigned long long)key, d.width, d.height, d.format, r, g, b, l1, dev, clear * 100);
         if (const char* dir = std::getenv("XBE_WATER_DUMP")) {

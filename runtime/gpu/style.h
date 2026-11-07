@@ -175,7 +175,8 @@ struct GraphicsStyle {
     // floor reflections (Vulkan, with Reflections on): 1 ice (a bright, bluish, smooth texture), 2 also polished floors
     // (a smooth grey one): reflecting where the surface faces up, more at a grazing view
     int floor_reflections = 0;
-    bool water = false;  // animated water, refraction, depth tint and shore foam (Vulkan; Reflections on)
+    bool water = true;  // the water shader (Vulkan): waves, reflections, refraction, depth colour and edge foam on the
+                        // textures a game names as water (AddWaterTextures, mods/reflections.toml [water])
     // texture packs: mods/textures/<hash>.png in place of the game's, and dumping the game's there
     bool texture_pack = true;
     bool dump_textures = false;
@@ -216,6 +217,14 @@ bool StylePassWanted();
 // it), 0 never; -1 when it is not listed
 float ReflectionOf(uint64_t texture_key);
 void CheckReflectionList();  // the render thread, once a frame (SaveStyleIfDue does it)
+// water (GraphicsStyle::water): a game's own water textures by their pack keys (GameInfo::init, before the first
+// frame), and mods/reflections.toml's [water] table ("key = true" adds one, false takes one out). 1 water, 0 listed
+// as not water, -1 not listed
+void AddWaterTextures(const uint64_t* keys, size_t n);
+int WaterTexture(uint64_t texture_key);
+// the renderer drew water in its last frame (set at each present): the water's passes run only then
+void SetWaterDrawn(bool drawn);
+bool WaterDrawn();
 // what the scene pass draws for each style's values with quality's AO and bloom over them
 float QualityAo(const GraphicsStyle& s);
 float QualityBloom(const GraphicsStyle& s);

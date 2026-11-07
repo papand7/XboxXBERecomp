@@ -625,12 +625,13 @@ float Cubic(float t, int i) {  // Catmull-Rom weight of tap i (0..3) around t
 }
 }  // namespace
 
-bool DecodeBgra(const TextureDesc& d, uint32_t level, const uint8_t* guest, std::vector<uint32_t>& out) {
+bool DecodeBgra(const TextureDesc& d, uint32_t level, const uint8_t* guest, std::vector<uint32_t>& out,
+                const uint32_t* palette) {
     const FormatInfo& fi = Format(d.format);
     if (fi.depth || fi.host == Host::None || fi.host == Host::R32F || fi.host == Host::R16Unorm) return false;
     std::vector<uint8_t> px;
     uint32_t pitch = 0;
-    DecodeLevel(d, level, 0, guest, nullptr, px, pitch);
+    DecodeLevel(d, level, 0, guest, palette, px, pitch);
     uint32_t w = std::max(1u, d.width >> level), h = std::max(1u, d.height >> level);
     if (fi.compressed) {
         DecodeBlocks(fi.host, w, h, px, pitch, out);

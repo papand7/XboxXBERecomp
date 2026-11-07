@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <imgui.h>
 #include <toml++/toml.hpp>
@@ -119,7 +120,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "snow_sparkle", "movie_upscale", "movie_43", "taa", "upscaler", "upscale_quality", "upscale_sharpness", "rt_denoise", "particles", "blood",
                                   "depth_of_field", "dof_strength", "hdr_tonemap", "auto_exposure",
                                   "motion_blur", "motion_blur_strength",
-                                  "smooth_turn", "contact_shadows", "floor_reflections"};
+                                  "smooth_turn", "contact_shadows", "floor_reflections", "water"};
     for (auto&& [k, v] : t) {
         bool ok = false;
         for (const char* n : known) ok |= k.str() == n;
@@ -709,9 +710,13 @@ void QualityValues(int q, uint32_t& aniso, bool& fxaa, bool& smaa, int& ao, bool
     aniso = v.aniso, fxaa = v.fxaa, smaa = v.smaa, ao = v.ao, bloom = v.bloom;
 }
 
+std::atomic<bool> g_water_drawn{false};
+void SetWaterDrawn(bool drawn) { g_water_drawn.store(drawn); }
+bool WaterDrawn() { return g_water_drawn.load(); }
+
 bool StylePassWanted() {
     return g_style.mode != kStyleOriginal || g_style.quality_ao > 0 || g_style.quality_bloom ||
-           (g_style.reflections != kReflectOff && g_style.mode != kStyleRetro);
+           ((g_style.reflections != kReflectOff || (g_style.water && WaterDrawn())) && g_style.mode != kStyleRetro);
 }
 std::atomic<int> g_views{1};
 void SetViewCount(int n) {
@@ -738,6 +743,8 @@ float QualityBloom(const GraphicsStyle& s) {
 
 namespace {
 std::unordered_map<uint64_t, float> g_reflect;
+std::unordered_map<uint64_t, bool> g_water_mod;  // [water]
+std::unordered_set<uint64_t> g_water_game;       // AddWaterTextures
 std::filesystem::file_time_type g_reflect_time{};
 std::chrono::steady_clock::time_point g_reflect_checked;
 bool g_reflect_read = false;
@@ -750,6 +757,7 @@ void ReadReflectionList() {
     g_reflect_read = true;
     g_reflect_time = ec ? std::filesystem::file_time_type{} : t;
     g_reflect.clear();
+    g_water_mod.clear();
     if (ec) return;
     try {
         toml::table tb = toml::parse_file(f.string());
@@ -766,7 +774,22 @@ void ReadReflectionList() {
                 }
                 g_reflect[key] = std::clamp(float(*s), 0.0f, 1.0f);
             }
-        LOGR("graphics: reflections.toml lists %zu textures", g_reflect.size());
+        if (const toml::table* list = tb["water"].as_table())
+            for (auto&& [k, v] : *list) {
+                std::string name(k.str());
+                char* end = nullptr;
+                uint64_t key = std::strtoull(name.c_str(), &end, 16);
+                std::optional<bool> on = v.value<bool>();
+                if (!on)
+                    if (std::optional<double> d = v.value<double>()) on = *d != 0;
+                if (name.size() != 16 || !end || *end || !on) {
+                    LOGR("graphics: reflections.toml: [water] '%s' is not a texture's 16 hex digits = true or false, ignored",
+                         name.c_str());
+                    continue;
+                }
+                g_water_mod[key] = *on;
+            }
+        LOGR("graphics: reflections.toml lists %zu textures, %zu water", g_reflect.size(), g_water_mod.size());
     } catch (const toml::parse_error& e) {
         LOGR("graphics: reflections.toml is not valid TOML (%s), not used", std::string(e.description()).c_str());
     }
@@ -776,6 +799,13 @@ void ReadReflectionList() {
 float ReflectionOf(uint64_t texture_key) {
     auto it = g_reflect.find(texture_key);
     return it == g_reflect.end() ? -1.0f : it->second;
+}
+
+void AddWaterTextures(const uint64_t* keys, size_t n) { g_water_game.insert(keys, keys + n); }
+
+int WaterTexture(uint64_t texture_key) {
+    if (auto it = g_water_mod.find(texture_key); it != g_water_mod.end()) return it->second ? 1 : 0;
+    return g_water_game.count(texture_key) ? 1 : -1;
 }
 
 void CheckReflectionList() {
@@ -945,7 +975,7 @@ void DrawStyleSettings(bool vulkan) {
     {
         int f = s.floor_reflections;
         if (ImGui::Combo("Floor reflections", &f, "Off\0Ice\0Ice and polished floors\0")) s.floor_reflections = f, changed = true;
-        changed |= ImGui::Checkbox("Water (with reflections on)", &s.water);
+        changed |= ImGui::Checkbox("Water", &s.water);
     }
     if (ImGui::CollapsingHeader("HDR tone mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
         int h = s.hdr_tonemap;
