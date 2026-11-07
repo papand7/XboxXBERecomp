@@ -1,6 +1,8 @@
 // The boot splash: GameInfo::splash .bmp or .png beside the exe, centred in a borderless window. The game boots behind
 // it with its window hidden and waits at its first frame until the splash has been up kMinimum, since this boot takes
-// a fraction of a second. No file, or a relaunch: no splash.
+// a fraction of a second. No file, or a relaunch: no splash. Off Windows there is none yet (Linux port phase 2: an SDL
+// window, once app::DecodeImage reads files there).
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -8,8 +10,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <wincodec.h>
-#include <wrl/client.h>
 
 #include <atomic>
 #include <chrono>
@@ -19,9 +19,8 @@
 #include <vector>
 
 #include "app/app.h"
+#include "app/image.h"
 #include "core/log.h"
-
-using Microsoft::WRL::ComPtr;
 
 namespace app {
 
@@ -35,27 +34,12 @@ std::chrono::steady_clock::time_point g_until;
 
 // premultiplied BGRA, as UpdateLayeredWindow wants it; a picture without alpha comes out opaque
 bool Read(const std::filesystem::path& path, std::vector<uint32_t>& pixels, UINT& w, UINT& h) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    ComPtr<IWICImagingFactory> wic;
-    ComPtr<IWICBitmapDecoder> decoder;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    ComPtr<IWICFormatConverter> converter;
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
-    if (SUCCEEDED(hr)) hr = wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
-    if (SUCCEEDED(hr)) hr = decoder->GetFrame(0, &frame);
-    if (SUCCEEDED(hr)) hr = wic->CreateFormatConverter(&converter);
-    if (SUCCEEDED(hr))
-        hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
-                                   WICBitmapPaletteTypeCustom);
-    if (SUCCEEDED(hr)) hr = converter->GetSize(&w, &h);
-    if (SUCCEEDED(hr) && w && h) {
-        pixels.resize(size_t(w) * h);
-        hr = converter->CopyPixels(nullptr, w * 4, UINT(pixels.size() * 4), reinterpret_cast<BYTE*>(pixels.data()));
-    }
-    if (FAILED(hr) || !w || !h) {
-        LOGW("splash: %s could not be read (%08X)", path.string().c_str(), unsigned(hr));
+    uint32_t pw = 0, ph = 0, error = 0;
+    if (!DecodeImage(path, pixels, pw, ph, true, 0, &error)) {
+        LOGW("splash: %s could not be read (%08X)", path.string().c_str(), unsigned(error));
         return false;
     }
+    w = pw, h = ph;
     return true;
 }
 
@@ -127,3 +111,13 @@ void CloseSplash() {
 }
 
 }  // namespace app
+
+#else
+#include "app/app.h"
+
+namespace app {
+bool OpenSplash() { return false; }
+void SplashFirstFrame() {}
+void CloseSplash() {}
+}  // namespace app
+#endif
