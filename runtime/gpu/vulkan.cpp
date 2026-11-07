@@ -527,6 +527,7 @@ struct Tex {
     bool solid = false;    // its alpha is all 1 (or it has none): drawn blended, it still covers
     uint8_t detail = 0;    // its ground detail's kind (gpu::TextureDetail), 0 none, kDetailUnknown not found yet
     int8_t ice = -1;       // ice (gpu::TextureIce: floor reflections), -1 not looked at yet
+    int8_t water = -1;     // water (gpu::TextureWater), -1 not looked at yet
 };
 
 // a draw's four texture stages
@@ -728,7 +729,11 @@ float linz(float d) { return 1.0 / max(1.0 - d, 1e-6); }
 float viewz(float d) { return p[9].w != 0 ? d * 4096 : linz(d); }
 float noise(float2 v) { return frac(sin(dot(v, float2(12.9898, 78.233))) * 43758.5453); }
 float3 aces(float3 a) { return saturate((a * (2.51 * a + 0.03)) / (a * (2.43 * a + 0.59) + 0.14)); }
-float3 grade(float3 c) {
+float sat(float3 c) {
+    float hi = max(max(c.r, c.g), c.b);
+    return hi > 1e-4 ? (hi - min(min(c.r, c.g), c.b)) / hi : 0;
+}
+float3 curves(float3 c) {
     // exposure with white kept white (a brighter exposure lifts the middle, it does not push snow past white): the
     // curve's output over its white's
     float e = p[1].x;
@@ -743,7 +748,23 @@ float3 grade(float3 c) {
     // contrast about the middle with black and white kept (a straight line through 0.5 pushed bright snow to white)
     c = saturate(c);
     c = c < 0.5 ? 0.5 * pow(2 * c, p[1].z) : 1 - 0.5 * pow(max(2 - 2 * c, 0), p[1].z);
-    c = lerp(luma(c).xxx, c, p[1].w);
+    return c;
+}
+float3 grade(float3 c) {
+    // the curves below work on each channel: a strong colour comes out stronger and its hue moves (an orange room
+    // toward a burnt yellow). A saturated colour takes most of the curves' change in brightness alone, its hue and
+    // saturation as they were; grey and pale colours (snow, concrete) keep the curves as they are
+    const float3 c0 = saturate(c);
+    const float hold = smoothstep(0.25, 0.75, sat(c0)) * 0.75;
+    c = curves(c);
+    float l0 = max(luma(c0), 1e-4), l1 = luma(c);
+    float3 cl = c0 * (l1 / l0);
+    float over = max(max(cl.r, cl.g), max(cl.b, 1));
+    cl = lerp(cl / over, 1, saturate((over - 1) * 0.5));
+    c = lerp(c, cl, hold);
+    // saturation as vibrance: a boost lifts dull colours and leaves strong ones nearly as they are
+    float k = p[1].w > 1 ? lerp(p[1].w, 1, smoothstep(0.2, 0.7, sat(c))) : p[1].w;
+    c = lerp(luma(c).xxx, c, k);
     c *= float3(1 + 0.1 * p[2].x, 1, 1 - 0.1 * p[2].x);
     return saturate(c);
 }
@@ -1528,7 +1549,7 @@ float4 adapt(O i) : SV_Target {
         }
     float mean = s / ws;
     // a bright scene (a sunlit day, a white-lit room) taken down more firmly than a dark one is lifted
-    float want = clamp(exp2((log2(0.18) - mean) * p[2].z * (mean > log2(0.18) ? 1.8 : 1)), p[2].w, p[3].x);
+    float want = clamp(exp2((log2(0.18) - mean) * p[2].z * (mean > log2(0.18) ? 2.8 : 1)), p[2].w, p[3].x);
     float was = p[1].y != 0 ? lastexp.Load(int3(0, 0, 0)).r : want;
     float e = exp2(lerp(log2(max(was, 1e-3)), log2(want), p[1].z));
     return float4(e, exp2(mean), want, 1);
@@ -2517,7 +2538,11 @@ float4 ps(O i) : SV_Target {
         float3 sun = p[2].xyz;
         float sl = saturate(dot(N, sun));
         if (sl > 0 && p[2].w > 0) sl *= open(o, sun, kFar);
-        ratio = p[5].w + p[3].rgb * (0.75 * p[2].w * sl) + added / max(baked, 0.04);
+        // a bright day's baked light already holds the sun: there full sun brings it back to itself and shade darkens
+        // it (it multiplied it by a third more, and pale concrete went past white); a dim night's is as it was
+        float full = p[5].w + 0.75 * p[2].w * dot(p[3].rgb, float3(0.3, 0.59, 0.11));
+        float k = lerp(1, 1 / max(full, 0.2), saturate((dot(baked, float3(0.3, 0.59, 0.11)) - 0.5) / 0.4));
+        ratio = (p[5].w + p[3].rgb * (0.75 * p[2].w * sl)) * k + added / max(baked, 0.04);
 #if STATS
         if (p[1].w != 0 && all((uint2(i.pos.xy) & 7) == 0)) {  // the outdoor baked light added up (the sun's colour)
             uint3 b = uint3(min(baked, 4) * 64 + 0.5);
@@ -2532,9 +2557,10 @@ float4 ps(O i) : SV_Target {
     if (test == 5 || test == 6) return float4(ratio * 0.5, 1);
     if (f < 0.03) return float4(c, 1);
     float3 fogc = p[4].rgb;
-    float3 L = saturate((c - fogc * (1 - f)) / f);
-    float3 relit = L * ratio;
-    return float4(max(lerp(fogc, relit, f), 0), 1);
+    // the surface's share of the colour (the fog's taken off) relit, the fog's share as it was: dividing by a thin
+    // fog's f and clipping to 1 first turned a fogged pale wall white
+    float3 haze = fogc * (1 - f);
+    return float4(haze + max(c - haze, 0) * ratio, 1);
 }
 )";
 
@@ -3325,6 +3351,7 @@ private:
     bool ViewUp(float aspect, float up[3]) const;  // the world's up in the view (rt_cams_), false unknown
     float stage_glass_ = 0;
     bool stage_solid_ = false, stage_seen_ = false;
+    bool stage_movie_ = false;  // stage 0's texture is a movie's frame (YUY2, 320 wide or more)
     bool draw_env_ = false;
     bool scene_wbuf_ = false;  // the scene's last 3D draw wrote W (D3DZB_USEW), not Z, to its depth  // the draw samples a cube map: the game's own environment reflection (shiny metal)
     float Reflectivity(const PsoKey& k);
@@ -5373,10 +5400,14 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
             tx.key = TextureKey(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.hash);
             tx.detail = kDetailUnknown;  // its kind found when first drawn with ground detail on
             tx.ice = -1;
+            tx.water = -1;
             TexturePackSeen(d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr,
                             palette.hash);
         }
     }
+    static const bool water_survey = std::getenv("XBE_WATER_DUMP") != nullptr;
+    if (tx.water < 0 && water_survey && !draw_2d_)
+        tx.water = TextureWater(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0) ? 1 : 0;
     if (tx.ice < 0 && Style().floor_reflections && !draw_2d_)
         tx.ice = TextureIce(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0) ? 1 : 0;
     if (tx.detail == kDetailUnknown && (Style().ground_detail || Style().displacement || Style().floor_reflections >= 2) &&
@@ -5384,6 +5415,7 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         tx.detail = TextureDetail(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0);
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
     stages.levels[stage] = tx.levels;
+    if (stage == 0) stage_movie_ = d.format == kFmtYuy2 && d.width >= 320 && d.height >= 200;
     // a movie's frame: drawn enlarged (its texel coordinates are over the guest's size, so a bigger picture fits)
     if (d.format == kFmtYuy2 && d.width >= 320 && d.height >= 200 && Style().movie_upscale && !palette.va) {
         if (VkImageView v = UpscaleMovie(tx, d)) {
@@ -5845,6 +5877,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     draw_ds_ = bound_ds_;
     draw_2d_ = a.pretransformed || ScreenDraw(s);
     stage_seen_ = false;
+    stage_movie_ = false;
     // the sky keeps the game's own pictures: a pack's are upscaled each apart, so a sky box's faces no longer meet
     // (a thin line at each edge of The Exchange's moon box)
     draw_seq_++;
@@ -5935,6 +5968,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (span == kSpanViewport) c.hud[0] = 1;
     }
     SqueezeBeyond(s, c.hud);
+    // a movie on a 4:3 frame stretched wide (movie_43): squeezed whole about the middle back to 4:3, the sides left
+    // as the frame's clear
+    if (stage_movie_ && draw_2d_ && stretch > 1.01f && Style().movie_43) c.hud[0] = -1.0f / stretch;
     FillSurfaceConstants(s, size, c);
     if (k.topo == uint32_t(Topology::Points)) {
         const Target* t = bound_rt_ ? bound_rt_ : bound_ds_;
@@ -8566,7 +8602,7 @@ void VulkanBackend::ToneResolve(Target& rt) {
     const Image& was = rt.tone_exp[(presents_ + 1) & 1];
     float c[16] = {1.0f / rt.w, 1.0f / rt.h, float(st.hdr_tonemap), st.exposure,
                    st.auto_exposure ? 1.0f : 0.0f, last ? 1.0f : 0.0f, 1.0f - std::exp(-dt * 1.5f), float(test),
-                   float(kMw), float(kMh), 0.25f, 0.5f,
+                   float(kMw), float(kMh), 0.25f, 0.35f,
                    1.15f, 0, 0, 0};
     Barrier();
     if (st.auto_exposure) {

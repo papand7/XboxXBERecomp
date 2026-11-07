@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -303,6 +305,54 @@ bool TextureIce(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool p
         if (said++ < 20) LOGR("graphics: floor reflections: texture %016llx (%ux%u) is ice", (unsigned long long)key, d.width, d.height);
     }
     return ice;
+}
+
+bool TextureWater(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool paletted) {
+    static std::unordered_map<uint64_t, bool> seen;
+    std::lock_guard lock(g_lock);
+    if (auto it = seen.find(key); it != seen.end()) return it->second;
+    bool water = false;
+    std::vector<uint32_t> px;
+    double r = 0, g = 0, b = 0, l1 = 0, dev = 0, clear = 0;
+    if (!paletted && !d.cube && d.depth == 1 && !Format(d.format).depth && d.width >= 16 && d.height >= 16 &&
+        d.width <= 1024 && d.height <= 1024 && DecodeBgra(d, 0, guest, px) && px.size() >= size_t(d.width) * d.height) {
+        size_t n = size_t(d.width) * d.height;
+        double l2 = 0;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t p = px[i];
+            if ((p >> 24) < 250) clear++;
+            float pr = float(p >> 16 & 0xFF) / 255.0f, pg = float(p >> 8 & 0xFF) / 255.0f, pb = float(p & 0xFF) / 255.0f;
+            r += pr, g += pg, b += pb;
+            float l = 0.299f * pr + 0.587f * pg + 0.114f * pb;
+            l1 += l, l2 += l * l;
+        }
+        r /= double(n), g /= double(n), b /= double(n), l1 /= double(n), clear /= double(n);
+        dev = std::sqrt(std::max(0.0, l2 / double(n) - l1 * l1));
+        double hi = std::max({r, g, b}), lo = std::min({r, g, b}), sat = hi > 0 ? (hi - lo) / hi : 0;
+        // blue or green over red, not grey, not bright (ice and snow), even (not a patterned wall)
+        water = std::max(b, g) > r + 0.05 && sat > 0.15 && l1 > 0.05 && l1 < 0.55 && dev < 0.12;
+    }
+    seen[key] = water;
+    if (water) {
+        static int said = 0;
+        if (said++ < 60)
+            LOGR("graphics: water? texture %016llx (%ux%u fmt %02X): mean %.2f %.2f %.2f, brightness %.2f, spread %.3f, %.0f%% see-through",
+                 (unsigned long long)key, d.width, d.height, d.format, r, g, b, l1, dev, clear * 100);
+        if (const char* dir = std::getenv("XBE_WATER_DUMP")) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "/water_%016llx.tga", (unsigned long long)key);
+            if (FILE* f = std::fopen((std::string(dir) + name).c_str(), "wb")) {
+                uint8_t head[18] = {0, 0, 2};
+                head[12] = uint8_t(d.width), head[13] = uint8_t(d.width >> 8);
+                head[14] = uint8_t(d.height), head[15] = uint8_t(d.height >> 8);
+                head[16] = 32, head[17] = 0x28;
+                std::fwrite(head, 1, sizeof head, f);
+                std::fwrite(px.data(), 4, size_t(d.width) * d.height, f);
+                std::fclose(f);
+            }
+        }
+    }
+    return water;
 }
 
 void DetailPicture(uint8_t kind, std::vector<std::vector<uint32_t>>& levels) {

@@ -16,6 +16,9 @@ constexpr uint8_t kDetailUnknown = 0xFF;  // a texture not looked at yet
 uint8_t TextureDetail(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool paletted);
 // ice (floor reflections): an opaque texture bright, bluish and smooth (its brightness hardly varying)
 bool TextureIce(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool paletted);
+// water (the water shader): a tiling texture blue, green or teal, darker than ice and fairly even. XBE_WATER_DUMP=folder
+// writes each one found (water_<key>.tga) and logs it, to tell real water from blue walls
+bool TextureWater(uint64_t key, const TextureDesc& d, const uint8_t* guest, bool paletted);
 // a kind's detail picture, made here (no files): kDetailSize square B8G8R8A8 levels, R and G the bumps' normal x and
 // y, B the brightness (0.5 as it is), A the height
 constexpr uint32_t kDetailSize = 256;
