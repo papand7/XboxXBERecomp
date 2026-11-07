@@ -728,11 +728,20 @@ float viewz(float d) { return p[9].w != 0 ? d * 4096 : linz(d); }
 float noise(float2 v) { return frac(sin(dot(v, float2(12.9898, 78.233))) * 43758.5453); }
 float3 aces(float3 a) { return saturate((a * (2.51 * a + 0.03)) / (a * (2.43 * a + 0.59) + 0.14)); }
 float3 grade(float3 c) {
-    c *= p[1].x;
-    // filmic: an S-curve with mid grey (0.18) and white kept where they were, so a night stays a night
-    if (p[1].y == 1) c = saturate(aces(c * 0.5) / 0.616);
-    if (p[1].y == 2) { float3 x = c * 1.25; c = saturate(x * (1 + x / 2.25) / (1 + x) / 0.871); }
-    c = (c - 0.5) * p[1].z + 0.5;
+    // exposure with white kept white (a brighter exposure lifts the middle, it does not push snow past white): the
+    // curve's output over its white's
+    float e = p[1].x;
+    if (p[1].y == 1) c = saturate(aces(c * e * 0.5) / aces((e * 0.5).xxx));  // filmic: an S-curve
+    else if (p[1].y == 2) {
+        float3 x = c * e * 1.25;
+        float w = e * 1.25;
+        c = saturate(x * (1 + x / 2.25) / (1 + x) / (w * (1 + w / 2.25) / (1 + w)));
+    } else {
+        c = saturate(c * e / (1 + (e - 1) * saturate(c)));
+    }
+    // contrast about the middle with black and white kept (a straight line through 0.5 pushed bright snow to white)
+    c = saturate(c);
+    c = c < 0.5 ? 0.5 * pow(2 * c, p[1].z) : 1 - 0.5 * pow(max(2 - 2 * c, 0), p[1].z);
     c = lerp(luma(c).xxx, c, p[1].w);
     c *= float3(1 + 0.1 * p[2].x, 1, 1 - 0.1 * p[2].x);
     return saturate(c);
@@ -6808,7 +6817,9 @@ void VulkanBackend::DrawGlow(const Assembled& a, PsoKey k, const DrawShaders& sh
                                               : std::max(0.0f, seen.steady - 0.01f * float(presents_ + 1 - seen.frame));
         seen.frame = presents_ + 1;
     }
-    const float steady_light = RtWanted() && Style().rt_lighting ? 0.0f : 0.3f;
+    // none: the level's own lighting has its lamps (and ray tracing's); a steady glow's light came and went with the
+    // view, the room darkening as the lamp left the screen
+    const float steady_light = 0.0f;
     const float s = seen.steady * seen.steady * (3 - 2 * seen.steady);
     const float weight = 1.0f + (steady_light - 1.0f) * s;
     if (weight < 0.01f) return;
