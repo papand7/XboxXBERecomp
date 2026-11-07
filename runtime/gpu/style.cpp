@@ -111,7 +111,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
                                   "effect_lights", "light_strength", "atmosphere", "shaft_strength", "fog_strength", "bounce_light", "bounce_strength",
                                   "materials", "material_strength", "surface_depth", "relief_high", "displacement", "displace_depth",
                                   "ground_detail", "detail_strength", "detail_distance",
-                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "snow_sparkle", "blood",
+                                  "ray_tracing", "rt_ao", "rt_radius", "rt_rays", "rt_shadows", "rt_lighting", "rt_sun", "rt_gi", "rt_gi_strength", "rt_volumetric", "rt_vol_strength", "weather", "snow_amount", "footprints", "snow_sparkle", "movie_upscale", "blood",
                                   "depth_of_field", "dof_strength", "hdr_tonemap", "auto_exposure",
                                   "motion_blur", "motion_blur_strength",
                                   "smooth_turn", "contact_shadows", "floor_reflections"};
@@ -208,6 +208,7 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     num("snow_amount", s.snow_amount);
     flag("footprints", s.footprints);
     flag("snow_sparkle", s.snow_sparkle);
+    flag("movie_upscale", s.movie_upscale);
     flag("blood", s.blood);
     named("depth_of_field", s.dof, kDofNames, 3);
     num("dof_strength", s.dof_strength);
@@ -290,6 +291,7 @@ toml::table Write(const GraphicsStyle& s) {
                        {"snow_amount", double(s.snow_amount)},
                        {"footprints", s.footprints},
                        {"snow_sparkle", s.snow_sparkle},
+                       {"movie_upscale", s.movie_upscale},
                        {"blood", s.blood},
                        {"depth_of_field", kDofNames[s.dof]},
                        {"dof_strength", double(s.dof_strength)},
@@ -580,6 +582,7 @@ void ApplyPreset(const StylePreset& p) {
     g_style.snow_amount = keep.snow_amount;
     g_style.footprints = keep.footprints;
     g_style.snow_sparkle = keep.snow_sparkle;
+    g_style.movie_upscale = keep.movie_upscale;
     g_style.blood = keep.blood;
     g_style.dof = keep.dof;
     g_style.dof_strength = keep.dof_strength;
@@ -923,6 +926,10 @@ void DrawStyleSettings(bool vulkan) {
         changed |= ImGui::Checkbox("Footprints in the snow", &s.footprints);
         changed |= ImGui::Checkbox("Snow sparkle", &s.snow_sparkle);
         ImGui::TextDisabled("Falling snow and footprints (Vulkan; kept from under roofs with ray tracing).");
+    }
+    if (ImGui::CollapsingHeader("Movies", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::Checkbox("Upscale movies", &s.movie_upscale);
+        ImGui::TextDisabled("The 640x480 movies enlarged to the screen with edge-aware filtering and sharpening (Vulkan).");
     }
     if (ImGui::CollapsingHeader("Materials (PBR)", ImGuiTreeNodeFlags_DefaultOpen)) {
         changed |= ImGui::Checkbox("Normal and roughness maps", &s.materials);

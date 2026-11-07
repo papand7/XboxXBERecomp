@@ -200,6 +200,7 @@ constexpr VkDeviceSize kBlockSize = 64u << 20;    // device memory blocks images
 constexpr int kLateSlots = 3;                   // copies in flight per surface locked without a wait
 constexpr uint32_t kQueries = 4096;             // occlusion queries
 constexpr VkFormat kBgra = VK_FORMAT_B8G8R8A8_UNORM;
+constexpr uint32_t kFmtYuy2 = 0x24;  // the console's YUY2 (a movie's frames)
 // descriptor bindings, set 0, as DXC's register shifts lay them out: b0 b1, t0-t3, s0-s3
 constexpr uint32_t kBindVsc = 0, kBindDc = 1, kBindTex = 2, kBindSmp = 6, kBindings = 10;
 // after them: u0, where a ray traced frame's vertex shaders write the scene's positions (VulkanBackend::RtCapture),
@@ -1428,6 +1429,65 @@ float4 comp(O i) : SV_Target {
 // b1 p[4]: [0] 1/width, 1/height, curve (1 AgX, 2 ACES), exposure; [1] auto exposure, a last exposure, the ease
 // (0 to 1), test; [2] the meter's width and height, how much of the way to mid grey, the darkest exposure; [3] the
 // brightest. t0 the scene, t1 the meter, t2 the last exposure, t3 this frame's.
+// movies (GraphicsStyle::movie_upscale): a movie's frame (YUY2, decoded to BGRA when uploaded) enlarged on the GPU before
+// it is drawn: up, Lanczos 2 over 4x4 texels kept within the nearest 2x2's range (no ringing at hard edges), then sharp,
+// contrast adaptive sharpening (as AMD's RCAS: each pixel pushed from its four neighbours only as far as keeps it within
+// their range). b1 p[2]: [0] the source's 1/width, 1/height, width, height; [1] the output's 1/width, 1/height, the
+// sharpening (0 to 1). t0 the source (up) or the enlarged frame (sharp).
+const char* kMovieHlsl = R"(
+cbuffer P : register(b1) { float4 p[2]; };
+Texture2D src : register(t0);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float lanczos2(float x) {
+    x = abs(x);
+    if (x < 1e-4) return 1;
+    if (x >= 2) return 0;
+    float a = 3.14159265 * x;
+    return 2 * sin(a) * sin(a * 0.5) / (a * a);
+}
+float4 up(O i) : SV_Target {
+    float2 pos = i.uv * p[0].zw - 0.5;
+    float2 base = floor(pos), f = pos - base;
+    float3 sum = 0, mn = 1e9, mx = -1e9;
+    float ws = 0, alpha = 1;
+    [unroll] for (int y = -1; y <= 2; y++) {
+        float wy = lanczos2(y - f.y);
+        [unroll] for (int x = -1; x <= 2; x++) {
+            float4 c = src.SampleLevel(pt, (base + float2(x, y) + 0.5) * p[0].xy, 0);
+            float w = lanczos2(x - f.x) * wy;
+            sum += c.rgb * w;
+            ws += w;
+            if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
+                mn = min(mn, c.rgb), mx = max(mx, c.rgb);
+                if (x == int(f.x + 0.5) && y == int(f.y + 0.5)) alpha = c.a;
+            }
+        }
+    }
+    return float4(clamp(sum / ws, mn, mx), alpha);
+}
+float4 sharp(O i) : SV_Target {
+    float2 d = p[1].xy;
+    float4 e = src.SampleLevel(pt, i.uv, 0);
+    float3 b = src.SampleLevel(pt, i.uv + float2(0, -d.y), 0).rgb, h = src.SampleLevel(pt, i.uv + float2(0, d.y), 0).rgb;
+    float3 l = src.SampleLevel(pt, i.uv + float2(-d.x, 0), 0).rgb, r = src.SampleLevel(pt, i.uv + float2(d.x, 0), 0).rgb;
+    float3 mn = min(min(b, h), min(l, r)), mx = max(max(b, h), max(l, r));
+    float3 hit_min = mn / (4 * mx + 1e-4);
+    float3 hit_max = (1 - mx) / (4 * mn - 4 - 1e-4);
+    float3 lobe3 = max(-hit_min, hit_max);
+    float lobe = max(-0.1875, min(max(lobe3.r, max(lobe3.g, lobe3.b)), 0)) * p[1].z;
+    return float4(saturate((lobe * (b + h + l + r) + e.rgb) / (4 * lobe + 1)), e.a);
+}
+)";
+
 const char* kToneHlsl = R"(
 cbuffer P : register(b1) { float4 p[4]; };
 Texture2D scene : register(t0);
@@ -2991,6 +3051,7 @@ private:
     void UploadLevel(const Image& im, uint32_t level, uint32_t layer, uint32_t w, uint32_t h, uint32_t depth,
                      const void* p, size_t bytes);
     VkImageView BindReplacement(const Replacement& r, const TextureDesc& d, uint32_t& levels);
+    VkImageView UpscaleMovie(Tex& tx, const TextureDesc& d);
     void CopyCubeTargets(Tex& tx, const TextureDesc& d);
     void EnsurePixelShader(const PixelKey& pk, DrawShaders& sh);
     VkPipeline EnsurePipeline(const PsoKey& k);
@@ -3086,6 +3147,13 @@ private:
     std::unordered_map<uint64_t, Target> targets_;
     std::unordered_map<uint32_t, uint64_t> target_used_;  // target address to the frame it was last used
     std::unordered_map<uint64_t, Tex> textures_;          // by data address, a P8 texture's with its palette's above
+    // movies enlarged (UpscaleMovie), by the frame's address: the Lanczos pass's image, the sharpened one, the upload
+    // they were made from, the frame last drawn
+    struct MovieUp {
+        Image up, out;
+        uint64_t sig = 0, frame = 0;
+    };
+    std::unordered_map<uint32_t, MovieUp> movie_up_;
     std::unordered_map<uint32_t, uint32_t> reloads_;      // targets reloaded from guest memory, for the log
     std::unordered_map<uint32_t, Late> late_;
     std::mutex late_lock_;                    // DeliverLate runs on the title's thread
@@ -5316,10 +5384,77 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         tx.detail = TextureDetail(tx.key, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va != 0);
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
     stages.levels[stage] = tx.levels;
+    // a movie's frame: drawn enlarged (its texel coordinates are over the guest's size, so a bigger picture fits)
+    if (d.format == kFmtYuy2 && d.width >= 320 && d.height >= 200 && Style().movie_upscale && !palette.va) {
+        if (VkImageView v = UpscaleMovie(tx, d)) {
+            stages.levels[stage] = 1;
+            if (stage == 0)
+                stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_detail_ = tx.detail,
+                stage_ice_ = false, stage_seen_ = true;
+            return v;
+        }
+    }
     if (fi.depth) stages.info[stage].shadow = ShadowDepthKind(d.format);
     if (stage == 0)
         stage_key_ = tx.key, stage_glass_ = tx.glass, stage_solid_ = tx.solid, stage_detail_ = tx.detail, stage_ice_ = tx.ice > 0, stage_seen_ = true;
     return tx.img.view;
+}
+
+// a movie's frame enlarged to the screen's height (1.5 to 4 times) by kMovieHlsl's up and sharpened by its sharp, made
+// again when a new frame is uploaded; frames not drawn for a few seconds are let go
+VkImageView VulkanBackend::UpscaleMovie(Tex& tx, const TextureDesc& d) {
+    for (auto it = movie_up_.begin(); it != movie_up_.end();) {
+        if (it->second.frame + 300 < presents_ + 1) {
+            DropImage(it->second.up);
+            DropImage(it->second.out);
+            it = movie_up_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    uint64_t vh, uh, sh;
+    if (!tx.img || !Compile(kMovieHlsl, "vs", "vs_5_0", vh) || !Compile(kMovieHlsl, "up", "ps_5_0", uh) ||
+        !Compile(kMovieHlsl, "sharp", "ps_5_0", sh)) {
+        LOG_FIRST(1, "vulkan: the movie upscale did not compile; movies drawn as they are");
+        return VK_NULL_HANDLE;
+    }
+    VkPipeline pu = PassPipeline({vh, uh, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline ps = PassPipeline({vh, sh, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pu || !ps) return VK_NULL_HANDLE;
+    const float scale = std::clamp(float(bb_h_ ? bb_h_ : 1080) / float(d.height), 1.5f, 4.0f);
+    const uint32_t w = uint32_t(float(d.width) * scale + 0.5f), h = uint32_t(float(d.height) * scale + 0.5f);
+    MovieUp& m = movie_up_[d.data];
+    m.frame = presents_ + 1;
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    for (Image* im : {&m.up, &m.out}) {
+        if (im->img && (im->w != w || im->h != h)) DropImage(*im), m.sig = 0;
+        if (!im->img && !MakeImage(*im, VK_IMAGE_TYPE_2D, kBgra, w, h, 1, 1, 1, u)) {
+            DropImage(m.up);
+            DropImage(m.out);
+            movie_up_.erase(d.data);
+            return VK_NULL_HANDLE;
+        }
+    }
+    if (m.sig != tx.sig) {
+        m.sig = tx.sig;
+        End();
+        Barrier();
+        float c[8] = {1.0f / float(d.width), 1.0f / float(d.height), float(d.width), float(d.height),
+                      1.0f / float(w), 1.0f / float(h), 0.8f, 0};
+        VkViewport vp{0, 0, float(w), float(h), 0, 1};
+        VkRect2D sc{{0, 0}, {w, h}};
+        VkImageView a[1] = {tx.img.view};
+        FullScreen(pu, {m.up.att, VK_NULL_HANDLE, w, h}, vp, sc, c, 8, a, 1);
+        End();
+        Barrier();
+        VkImageView b[1] = {m.up.view};
+        FullScreen(ps, {m.out.att, VK_NULL_HANDLE, w, h}, vp, sc, c, 8, b, 1);
+        End();
+        Barrier();
+        static bool said = false;
+        if (!said) said = true, LOGR("vulkan: movies upscaled (%ux%u to %ux%u, Lanczos and sharpening)", d.width, d.height, w, h);
+    }
+    return m.out.view;
 }
 
 VkImageView VulkanBackend::BindReplacement(const Replacement& r, const TextureDesc& d, uint32_t& levels) {

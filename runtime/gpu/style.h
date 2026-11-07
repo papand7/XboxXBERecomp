@@ -119,6 +119,9 @@ struct GraphicsStyle {
     float snow_amount = 1.0f;  // 0.25 to 3 (3 a blizzard)
     bool footprints = true;
     bool snow_sparkle = true;  // tiny glints on the snowy ground near the view, twinkling as it moves
+    // movies (Vulkan): a movie's 640x480 frame enlarged to the screen's size on the GPU before it is drawn, edge-aware
+    // (Lanczos, kept within its neighbours so edges do not ring) and sharpened, in place of a plain stretch
+    bool movie_upscale = true;
     // blood (every style and renderer, drawn over the picture: app/blood.cpp): a spray where a player's shot hits a
     // character, and red at the edges of a player's view as they are hit, fading
     bool blood = false;
