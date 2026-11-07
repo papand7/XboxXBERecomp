@@ -19,6 +19,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "core/netplay.h"
 #include "app/app.h"
@@ -58,6 +59,7 @@ struct HashPacket {
 #pragma pack(pop)
 
 SOCKET g_sock = INVALID_SOCKET;
+uint16_t g_bound_port = 0;  // the host's port (network order), shown while waiting
 bool g_configured = false, g_host = false;
 std::atomic<bool> g_active{false};
 int g_players = 1, g_me = 0, g_delay = 2;
@@ -211,6 +213,44 @@ void Pump(int wait_ms) {
     }
 }
 
+// while the lobby waits (before the title draws anything): the window says so, in its title and on it, and Escape
+// gives up (the title then starts alone)
+constexpr wchar_t kWaitBox[] = L"Network play";
+std::atomic<bool> g_wait_box{false}, g_wait_over{false}, g_wait_cancel{false};
+void WaitOver() {
+    g_wait_over = true;
+    for (int i = 0; i < 20; i++) {
+        if (HWND box = FindWindowW(L"#32770", kWaitBox)) {
+            PostMessageW(box, WM_CLOSE, 0, 0);
+            return;
+        }
+        if (!g_wait_box) return;
+        Sleep(10);
+    }
+}
+
+// while the lobby waits (before the title draws anything): a box over the window says so, and its button (or Escape
+// in the window) gives up; the title then starts alone. The box closes by itself once everyone is in
+bool Waiting(const std::wstring& text) {
+    HWND w = static_cast<HWND>(app::Window());
+    if (w) SetWindowTextW(w, (std::wstring(app::kGame.title) + L" - " + text).c_str());
+    if (!g_wait_box.exchange(true)) {
+        std::wstring body = text + L"\n\nThe game starts on both PCs once the other player is in.\n\n"
+                                   L"Press OK to stop waiting and play alone.";
+        std::thread([w, body] {
+            MessageBoxW(w, body.c_str(), kWaitBox, MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+            if (!g_wait_over) g_wait_cancel = true;
+        }).detach();
+    }
+    if (g_wait_cancel || (w && GetForegroundWindow() == w && (GetAsyncKeyState(VK_ESCAPE) & 0x8000))) {
+        LOGR("netplay: waiting given up; playing alone");
+        if (w) SetWindowTextW(w, app::kGame.title);
+        WaitOver();
+        return false;
+    }
+    return true;
+}
+
 bool Lobby() {
     char buf[1500];
     sockaddr_in from{};
@@ -218,6 +258,9 @@ bool Lobby() {
     if (g_host) {
         int joined = 1;
         while (joined < g_players) {
+            if (!Waiting(L"Network play: waiting for player " + std::to_wstring(joined + 1) +
+                         L" to join (this PC hosts, UDP port " + std::to_wstring(ntohs(g_bound_port)) + L")"))
+                return false;
             if (Recv(buf, sizeof buf, from, 20) < int(sizeof(Header))) continue;
             const Header& h = *reinterpret_cast<Header*>(buf);
             if (h.type != kHello) continue;
@@ -247,6 +290,8 @@ bool Lobby() {
         return true;
     }
     for (;;) {
+        if (!Waiting(L"Network play: joining the host..."))
+            return false;
         auto now = std::chrono::steady_clock::now();
         if (now - said > std::chrono::seconds(1)) {
             Header h = Head(kHello);
@@ -307,9 +352,12 @@ bool Start() {
         g_host_addr.sin_addr = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr;
         freeaddrinfo(res);
     }
+    g_bound_port = htons(port);
     if (g_host) LOGR("netplay: hosting on UDP port %u, waiting for %d players", port, g_players);
     else LOGR("netplay: joining %s:%u", addr.c_str(), port);
-    if (!Lobby()) return false;
+    const bool joined = Lobby();
+    WaitOver();
+    if (!joined) return false;
     // the first frames, before anyone's controller can arrive: nothing held
     for (int p = 0; p < g_players; p++) {
         g_have[p] = uint32_t(g_delay);
