@@ -196,6 +196,10 @@ float QualityBloom(const GraphicsStyle& s);
 void DrawStyleSettings(bool vulkan);
 bool StyleRendererActive();  // the Vulkan renderer runs (set by it)
 void SetStyleRendererActive(bool on);
+// the title's views on screen (a split screen's players): over one, what takes one full screen camera (ray tracing,
+// snow, motion blur, contact shadows, depth of field, GTAO, effect lights, reflections, smooth turning) is left out
+void SetViewCount(int n);
+int ViewCount();
 bool RayTracingSupported();  // the Vulkan renderer's GPU has ray queries (set by it)
 void SetRayTracingSupported(bool on);
 // the player aims down the sights (the game's thread, each frame): depth of field's focus blurs more

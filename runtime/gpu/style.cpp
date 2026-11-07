@@ -655,6 +655,12 @@ bool StylePassWanted() {
     return g_style.mode != kStyleOriginal || g_style.quality_ao > 0 || g_style.quality_bloom ||
            (g_style.reflections != kReflectOff && g_style.mode != kStyleRetro);
 }
+std::atomic<int> g_views{1};
+void SetViewCount(int n) {
+    if (g_views.exchange(n) != n) LOGR("graphics: %d views on screen%s", n, n > 1 ? " (one-camera effects left out)" : "");
+}
+int ViewCount() { return g_views.load(); }
+
 bool ScenePassWanted() {
     return StylePassWanted() ||
            ((app::Get().smaa || g_style.effect_lights || g_style.atmosphere || g_style.bounce_light || g_style.dof ||

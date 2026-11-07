@@ -3128,7 +3128,7 @@ private:
     void ContactPass(Target& rt, Target* ds);     // contact shadows (GraphicsStyle::contact_shadows)
     // smooth turning (GraphicsStyle::smooth_turn): the frame last presented, a frame turned from it between presents
     void MidFrame() override;
-    bool WarpWanted() const { return Style().smooth_turn && refresh_hz_ >= 100; }
+    bool WarpWanted() const { return Style().smooth_turn && refresh_hz_ >= 100 && ViewCount() < 2; }
     Target* warp_t_ = nullptr;
     uint64_t warp_frames_ = 0;  // in-between frames presented (the perf log)
     std::chrono::steady_clock::time_point last_present_{};  // the last real present, the interval between them eased
@@ -3166,7 +3166,7 @@ private:
         VkAccelerationStructureKHR blas = VK_NULL_HANDLE, tlas = VK_NULL_HANDLE, gun_blas = VK_NULL_HANDLE;
         uint32_t vert_cap = 0;
     };
-    bool RtWanted() const { return rt_ok_ && Style().ray_tracing && Style().mode != kStyleRetro; }
+    bool RtWanted() const { return rt_ok_ && Style().ray_tracing && Style().mode != kStyleRetro && ViewCount() < 2; }
     bool rt_built_ = false;  // this frame's acceleration structure is built (the scene pass, before its passes)
     bool RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, VkImageView tex, uint32_t push[4]);
     // a W-buffered scene's sky draw (SkyDraw): the frame's own count, the result kept for the draw
@@ -3212,7 +3212,7 @@ private:
     void ToneResolve(Target& rt);
     // snow (GraphicsStyle::weather): the frame's world triangles and those on snow (how snowy the level looks, eased),
     // the footprints made (in the world's units) and each player's last step
-    bool WeatherWanted() const { return Style().weather != 0 && Style().mode != kStyleRetro; }
+    bool WeatherWanted() const { return Style().weather != 0 && Style().mode != kStyleRetro && ViewCount() < 2; }
     void WeatherPass(Target& rt, Target* ds);
     bool game_snow_ = false;  // the game drew its own snow this frame (it snows here)
     float snow_level_ = 0;
@@ -7899,18 +7899,19 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     if (rt_built_ && Style().rt_ao > 0) RtPass(rt, ds), timed(1);
     if (rt_built_) RtReflectPass(rt, ds), timed(2);
     gtao_drawn_ = false;
-    if (!rt_drawn_ && QualityAo(Style()) > 0 && Style().mode != kStyleRetro && scene_wbuf_) GtaoPass(rt, ds), timed(3);
-    if (Style().contact_shadows && Style().mode != kStyleRetro && !(rt_built_ && Style().rt_lighting) && scene_wbuf_)
+    const bool one_view = ViewCount() < 2;  // a split screen: the one-camera passes left out
+    if (!rt_drawn_ && QualityAo(Style()) > 0 && Style().mode != kStyleRetro && scene_wbuf_ && one_view) GtaoPass(rt, ds), timed(3);
+    if (Style().contact_shadows && Style().mode != kStyleRetro && !(rt_built_ && Style().rt_lighting) && scene_wbuf_ && one_view)
         ContactPass(rt, ds), timed(20);
-    if (Style().effect_lights && Style().mode != kStyleRetro) LightPass(rt, ds), timed(4);
+    if (Style().effect_lights && Style().mode != kStyleRetro && one_view) LightPass(rt, ds), timed(4);
     if (Style().bounce_light && Style().mode != kStyleRetro && !rt_gi_drawn_) BouncePass(rt, ds), timed(5);
     if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds), timed(6);
     if (WeatherWanted()) WeatherPass(rt, ds), timed(7);
     if (tone_drawn_) ToneResolve(rt), timed(8);
     if (StylePassWanted()) StylePass(rt, ds), timed(9);
     if (app::Get().smaa && Style().mode != kStyleRetro) SmaaPass(rt), timed(10);
-    if (DofWanted()) DofPass(rt, ds), timed(11);
-    if (Style().motion_blur && Style().mode != kStyleRetro) MotionBlurPass(rt, ds), timed(19);
+    if (DofWanted() && one_view) DofPass(rt, ds), timed(11);
+    if (Style().motion_blur && Style().mode != kStyleRetro && one_view) MotionBlurPass(rt, ds), timed(19);
     End();
     // HDR: the finished scene before the HUD, which HdrOut compares the presented frame with
     // smooth turning: the copy with the gun marked (no HDR chain then)
@@ -8023,7 +8024,7 @@ void VulkanBackend::StylePass(Target& rt, Target* ds) {
     // reflections, when a reflective draw made this frame's mask; an assumed 60 degree vertical view
     bool mask = depth && rt.mask.img && rt.mask_frame == presents_ + 1 && st.reflections != kReflectOff &&
                 st.mode != kStyleRetro && !rt_reflected_;
-    c[32] = mask ? st.reflection_strength : 0.0f;
+    c[32] = mask && ViewCount() < 2 ? st.reflection_strength : 0.0f;
     c[33] = st.reflections == kReflectHigh ? 48.0f : 20.0f;
     c[34] = 0.5774f;
     c[35] = float(rt.w) / float(rt.h);
