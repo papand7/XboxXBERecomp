@@ -360,3 +360,15 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 
 vcomp140.dll: Microsoft Visual C++ OpenMP runtime, redistributed with realesrgan-ncnn-vulkan under the Visual Studio redistribution terms.
+
+
+NVIDIA DLSS Super Resolution / NGX SDK v310.9.16 (https://github.com/NVIDIA/DLSS): nvngx_dlss.dll beside the game's
+executables and the NGX loader library linked into them (when built with XBE_DLSS, the default)
+
+Copyright (c) NVIDIA Corporation. All rights reserved. Used and redistributed in object code form under the NVIDIA
+RTX SDKs License (v. March 14, 2024; https://github.com/NVIDIA/DLSS/blob/v310.9.16/LICENSE.txt), which is not an open
+source licence and is not changed by this project's MIT licence. The NVIDIA software is provided AS IS, without
+warranty of any kind. You may not reverse engineer, decompile or disassemble it, remove its notices, circumvent any of
+its technical limits, distribute it on its own, or use it in any way that would subject it to an open source licence.
+It is for use on systems with NVIDIA GPUs. NVIDIA may update it over the air through its driver. NVIDIA, RTX and DLSS
+are trademarks of NVIDIA Corporation; this project is not sponsored or endorsed by NVIDIA.
