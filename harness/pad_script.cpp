@@ -127,6 +127,9 @@ bool TakeMouse(float& x, float& y) {
 }
 
 bool UsingKeyboard() { return g_keyboard; }
+// no keyboard or window headless: no key is ever held
+bool KeyDown(int) { return false; }
+bool GameFocused() { return false; }
 uint32_t MouseButtons() { return g_buttons; }
 // a held WHEELU or WHEELD gives one notch a poll
 int TakeWheel() {

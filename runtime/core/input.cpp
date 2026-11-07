@@ -2,6 +2,7 @@
 #include "core/netplay.h"
 #include "core/input.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -9,6 +10,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include "core/vk_codes.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -68,8 +72,10 @@ void RemovePad(SDL_JoystickID id) {
     }
 }
 
-// once a millisecond at most, however many ports and threads read
+// once a millisecond at most, however many ports and threads read. Off Windows the window thread pumps SDL's events
+// (video needs it on that thread) and hands the device notices over (HandleSdlEvent).
 void UpdatePads() {
+#ifdef _WIN32
     static uint64_t last = 0;
     uint64_t now = SDL_GetTicks();
     if (!g_sdl || now == last) return;
@@ -80,9 +86,22 @@ void UpdatePads() {
         if (e.type == SDL_EVENT_GAMEPAD_ADDED) AddPad(e.gdevice.which);
         else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) RemovePad(e.gdevice.which);
     }
+#endif
 }
 
 }  // namespace
+
+#ifndef _WIN32
+bool HandleSdlEvent(const void* event) {
+    const SDL_Event& e = *static_cast<const SDL_Event*>(event);
+    if (e.type != SDL_EVENT_GAMEPAD_ADDED && e.type != SDL_EVENT_GAMEPAD_REMOVED) return false;
+    std::lock_guard lock(g_lock);
+    if (!g_sdl) return true;
+    if (e.type == SDL_EVENT_GAMEPAD_ADDED) AddPad(e.gdevice.which);
+    else RemovePad(e.gdevice.which);
+    return true;
+}
+#endif
 
 void Init() {
     // WGI reads the triggers apart and HIDAPI takes PlayStation and Switch pads. Reads come from the guest's threads,
@@ -213,10 +232,116 @@ int TakeWheel() {
 
 std::atomic<uint32_t> g_script_mouse{0};  // XBE_PAD_CMD's CLICKL and CLICKR, held while their press is
 
+#ifdef _WIN32
+bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+bool GameFocused() {
+    HWND hwnd = static_cast<HWND>(app::Window());
+    return hwnd && GetForegroundWindow() == hwnd;
+}
+#else
+namespace {
+// a virtual key's SDL scancode, SDL_SCANCODE_UNKNOWN for the ones without one (mouse buttons and the either-side
+// modifiers are KeyDown's own)
+SDL_Scancode Scancode(int vk) {
+    if (vk >= 'A' && vk <= 'Z') return SDL_Scancode(SDL_SCANCODE_A + (vk - 'A'));
+    if (vk >= '1' && vk <= '9') return SDL_Scancode(SDL_SCANCODE_1 + (vk - '1'));
+    if (vk == '0') return SDL_SCANCODE_0;
+    if (vk >= VK_F1 && vk <= VK_F12) return SDL_Scancode(SDL_SCANCODE_F1 + (vk - VK_F1));
+    if (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9) return SDL_Scancode(SDL_SCANCODE_KP_1 + (vk - VK_NUMPAD1));
+    switch (vk) {
+        case VK_NUMPAD0: return SDL_SCANCODE_KP_0;
+        case VK_BACK: return SDL_SCANCODE_BACKSPACE;
+        case VK_TAB: return SDL_SCANCODE_TAB;
+        case VK_CLEAR: return SDL_SCANCODE_CLEAR;
+        case VK_RETURN: return SDL_SCANCODE_RETURN;
+        case VK_PAUSE: return SDL_SCANCODE_PAUSE;
+        case VK_CAPITAL: return SDL_SCANCODE_CAPSLOCK;
+        case VK_ESCAPE: return SDL_SCANCODE_ESCAPE;
+        case VK_SPACE: return SDL_SCANCODE_SPACE;
+        case VK_PRIOR: return SDL_SCANCODE_PAGEUP;
+        case VK_NEXT: return SDL_SCANCODE_PAGEDOWN;
+        case VK_END: return SDL_SCANCODE_END;
+        case VK_HOME: return SDL_SCANCODE_HOME;
+        case VK_LEFT: return SDL_SCANCODE_LEFT;
+        case VK_UP: return SDL_SCANCODE_UP;
+        case VK_RIGHT: return SDL_SCANCODE_RIGHT;
+        case VK_DOWN: return SDL_SCANCODE_DOWN;
+        case VK_SNAPSHOT: return SDL_SCANCODE_PRINTSCREEN;
+        case VK_INSERT: return SDL_SCANCODE_INSERT;
+        case VK_DELETE: return SDL_SCANCODE_DELETE;
+        case VK_LWIN: return SDL_SCANCODE_LGUI;
+        case VK_RWIN: return SDL_SCANCODE_RGUI;
+        case VK_APPS: return SDL_SCANCODE_APPLICATION;
+        case VK_MULTIPLY: return SDL_SCANCODE_KP_MULTIPLY;
+        case VK_ADD: return SDL_SCANCODE_KP_PLUS;
+        case VK_SEPARATOR: return SDL_SCANCODE_KP_COMMA;
+        case VK_SUBTRACT: return SDL_SCANCODE_KP_MINUS;
+        case VK_DECIMAL: return SDL_SCANCODE_KP_PERIOD;
+        case VK_DIVIDE: return SDL_SCANCODE_KP_DIVIDE;
+        case VK_NUMLOCK: return SDL_SCANCODE_NUMLOCKCLEAR;
+        case VK_SCROLL: return SDL_SCANCODE_SCROLLLOCK;
+        case VK_LSHIFT: return SDL_SCANCODE_LSHIFT;
+        case VK_RSHIFT: return SDL_SCANCODE_RSHIFT;
+        case VK_LCONTROL: return SDL_SCANCODE_LCTRL;
+        case VK_RCONTROL: return SDL_SCANCODE_RCTRL;
+        case VK_LMENU: return SDL_SCANCODE_LALT;
+        case VK_RMENU: return SDL_SCANCODE_RALT;
+        case VK_OEM_1: return SDL_SCANCODE_SEMICOLON;
+        case VK_OEM_PLUS: return SDL_SCANCODE_EQUALS;
+        case VK_OEM_COMMA: return SDL_SCANCODE_COMMA;
+        case VK_OEM_MINUS: return SDL_SCANCODE_MINUS;
+        case VK_OEM_PERIOD: return SDL_SCANCODE_PERIOD;
+        case VK_OEM_2: return SDL_SCANCODE_SLASH;
+        case VK_OEM_3: return SDL_SCANCODE_GRAVE;
+        case VK_OEM_4: return SDL_SCANCODE_LEFTBRACKET;
+        case VK_OEM_5: return SDL_SCANCODE_BACKSLASH;
+        case VK_OEM_6: return SDL_SCANCODE_RIGHTBRACKET;
+        case VK_OEM_7: return SDL_SCANCODE_APOSTROPHE;
+        case VK_OEM_102: return SDL_SCANCODE_NONUSBACKSLASH;
+        default: return SDL_SCANCODE_UNKNOWN;
+    }
+}
+}  // namespace
+
+// SDL's state, as the window thread's event pump last left it (read from any thread: a byte or a word each)
+bool KeyDown(int vk) {
+    if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2) {
+        SDL_MouseButtonFlags b = SDL_GetMouseState(nullptr, nullptr);
+        SDL_MouseButtonFlags mask = vk == VK_LBUTTON   ? SDL_BUTTON_LMASK
+                                    : vk == VK_RBUTTON ? SDL_BUTTON_RMASK
+                                    : vk == VK_MBUTTON ? SDL_BUTTON_MMASK
+                                    : vk == VK_XBUTTON1 ? SDL_BUTTON_X1MASK
+                                                        : SDL_BUTTON_X2MASK;
+        return (b & mask) != 0;
+    }
+    int count = 0;
+    const bool* keys = SDL_GetKeyboardState(&count);
+    auto down = [&](SDL_Scancode s) { return keys && s > SDL_SCANCODE_UNKNOWN && int(s) < count && keys[s]; };
+    switch (vk) {
+        case VK_SHIFT: return down(SDL_SCANCODE_LSHIFT) || down(SDL_SCANCODE_RSHIFT);
+        case VK_CONTROL: return down(SDL_SCANCODE_LCTRL) || down(SDL_SCANCODE_RCTRL);
+        case VK_MENU: return down(SDL_SCANCODE_LALT) || down(SDL_SCANCODE_RALT);
+        default: return down(Scancode(vk));
+    }
+}
+
+bool GameFocused() {
+    SDL_Window* w = static_cast<SDL_Window*>(app::Window());
+    return w && (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS) != 0;
+}
+#endif
+
 namespace {
 // the primary and secondary buttons: GetAsyncKeyState reads the physical ones, swapped for a left handed mouse
+// (SDL's are the physical ones as well; its swap setting is not read)
+#ifdef _WIN32
 uint16_t PrimaryButton() { return GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON; }
 uint16_t SecondaryButton() { return GetSystemMetrics(SM_SWAPBUTTON) ? VK_LBUTTON : VK_RBUTTON; }
+#else
+uint16_t PrimaryButton() { return VK_LBUTTON; }
+uint16_t SecondaryButton() { return VK_RBUTTON; }
+#endif
 
 // a key binding's mouse_left / mouse_right are the primary and secondary buttons, as the window's messages have them
 uint16_t PhysicalKey(uint16_t vk) {
@@ -228,8 +353,8 @@ uint16_t PhysicalKey(uint16_t vk) {
 
 uint32_t MouseButtons() {
     if ((!MouseLooking() && !MousePointing()) || app::KeyCaptureBusy()) return g_script_mouse;
-    return g_script_mouse | uint32_t((GetAsyncKeyState(PrimaryButton()) & 0x8000) ? 1 : 0) |
-           ((GetAsyncKeyState(SecondaryButton()) & 0x8000) ? 2 : 0) | ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) ? 4 : 0);
+    return g_script_mouse | uint32_t(KeyDown(PrimaryButton()) ? 1 : 0) | (KeyDown(SecondaryButton()) ? 2 : 0) |
+           (KeyDown(VK_MBUTTON) ? 4 : 0);
 }
 
 std::array<uint16_t, 2> ControlKeys(int c) {
@@ -262,15 +387,13 @@ bool PeekMouse(float& x, float& y) {
 }
 
 bool MousePointing() {
-    HWND hwnd = static_cast<HWND>(app::Window());
-    return app::kGame.menu_up && app::kGame.menu_up() && hwnd && GetForegroundWindow() == hwnd && !app::OverlayOpen();
+    return app::kGame.menu_up && app::kGame.menu_up() && GameFocused() && !app::OverlayOpen();
 }
 
 bool MouseLooking() {
     const app::Settings& s = app::Get();
-    HWND hwnd = static_cast<HWND>(app::Window());
-    return app::kGame.mouse_look && s.mouse_look && s.keyboard && hwnd && GetForegroundWindow() == hwnd &&
-           !app::OverlayOpen() && !(app::kGame.menu_up && app::kGame.menu_up());
+    return app::kGame.mouse_look && s.mouse_look && s.keyboard && GameFocused() && !app::OverlayOpen() &&
+           !(app::kGame.menu_up && app::kGame.menu_up());
 }
 
 const char* ControlName(int c) { return c >= 0 && c < kControls ? kNames[c] : ""; }
@@ -410,17 +533,16 @@ Pad Poll(int port) {
     }
     // the keyboard is controller 1, plugged in while keyboard play is on (alt-tabbing away must not unplug it), its
     // keys read while the game window has the focus
-    HWND hwnd = static_cast<HWND>(app::Window());
     if (port == 0) {
         bool pad_used = false, key_used = false;
         for (int c = 0; c < kControls; c++) pad_used |= in[c] >= 0.5f;
         if (s.keyboard && !p.connected) key_used = true;  // nothing else to play with
         if (s.keyboard) p.connected = true;
-        if (s.keyboard && hwnd && GetForegroundWindow() == hwnd && !app::KeyCaptureBusy()) {
+        if (s.keyboard && GameFocused() && !app::KeyCaptureBusy()) {
             for (int c = 0; c < kControls; c++) {
                 std::array<uint16_t, 2> keys = c < int(s.keys.size()) ? s.keys[c] : app::DefaultKeys(c);
                 for (uint16_t k : keys)
-                    if (k && (GetAsyncKeyState(PhysicalKey(k)) & 0x8000)) out[c] = 1.0f, key_used = true;
+                    if (k && KeyDown(PhysicalKey(k))) out[c] = 1.0f, key_used = true;
             }
         }
         if (pad_used) {
@@ -481,3 +603,35 @@ void Rumble(int port, uint16_t left, uint16_t right) {
 }
 
 }  // namespace input
+
+#ifndef _WIN32
+// ---- no steering wheel support off Windows yet (core/wheel.cpp is DirectInput): no devices, nothing bound
+namespace input {
+void WheelInit(void*) {}
+void WheelSetup() {}
+bool WheelRead(float*, bool* steers) {
+    if (steers) *steers = false;
+    return false;
+}
+void WheelFeedback(const WheelFeel&, uint16_t, uint16_t) {}
+WheelInfo Wheel() { return {}; }
+void WheelTestForce(float) {}
+}  // namespace input
+
+namespace app {
+void WheelDetectStart(WheelDetect, Settings::WheelBind&) {}
+void WheelDetectCancel() {}
+WheelDetect WheelDetecting(const Settings::WheelBind*) { return WheelDetect::None; }
+bool WheelDetectPoll() { return false; }
+const char* WheelAxisName(int axis) {
+    static const char* kNames[8] = {"X", "Y", "Z", "Rx", "Ry", "Rz", "Slider 1", "Slider 2"};
+    return kNames[std::clamp(axis, 0, 7)];
+}
+std::string WheelBindText(const Settings::WheelBind& b) {
+    if (b.axis < 0 && b.button < 0) return "-";
+    std::string dev = b.device.empty() ? "the wheel" : b.device;
+    if (b.axis >= 0) return dev + ": " + WheelAxisName(b.axis) + " axis";
+    return dev + ": button " + std::to_string(b.button);
+}
+}  // namespace app
+#endif

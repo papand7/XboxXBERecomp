@@ -27,9 +27,22 @@ const char* ControlLabel(int c); // shown to the player, "D-pad up" ...
 int ControlByName(const char* name);  // -1 when unknown
 
 void Init();  // window thread, before boot
+#ifndef _WIN32
+// the window thread's SDL events (an SDL_Event*), each one: true when it was a controller plugged in or out, taken here
+bool HandleSdlEvent(const void* event);
+#endif
 // the controller on that port, then GameInfo::pad
 Pad Poll(int port);
-// raw mouse movement, from the window thread (WM_INPUT): read into controller 1's right stick (Settings::mouse_look)
+// the keyboard and mouse by Windows virtual key code (core/vk_codes.h; the settings and key bindings store them), any
+// thread: held now wherever the focus is, mouse buttons VK_LBUTTON .. VK_XBUTTON2 the physical ones (Windows:
+// GetAsyncKeyState; elsewhere SDL's keyboard and mouse state, the codes mapped to scancodes)
+bool KeyDown(int vk);
+// the game window has the keyboard (Windows: it is the foreground window)
+bool GameFocused();
+// held while the game window has the keyboard
+inline bool KeyHeld(int vk) { return GameFocused() && KeyDown(vk); }
+// raw mouse movement, from the window thread (Windows WM_INPUT, SDL's relative mouse motion): read into controller 1's
+// right stick (Settings::mouse_look) or taken by the title (TakeMouse)
 void MouseMoved(int dx, int dy);
 // the mouse plays the right stick now: mouse look on, the game window in front, the settings window shut
 bool MouseLooking();
@@ -52,7 +65,7 @@ std::array<uint16_t, 2> ControlKeys(int c);
 // positive), and the buttons held (1 left, 2 right, 4 middle)
 int TakeWheel();
 uint32_t MouseButtons();
-void MouseWheel(int delta);  // window thread, WHEEL_DELTA (120) a notch
+void MouseWheel(int delta);  // window thread, WHEEL_DELTA (120) a notch (an SDL wheel step is one notch)
 void Rumble(int port, uint16_t left, uint16_t right);
 // the physical controls held on any controller, a bit per Control, from the last polls (the settings window's
 // navigation)
