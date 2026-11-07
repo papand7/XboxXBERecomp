@@ -3863,6 +3863,11 @@ private:
     uint64_t up_reactive_frame_ = 0;
     Fsr2 fsr_;
     bool fsr_tried_ = false, fsr_ok_ = false;
+    // NVIDIA DLSS (GraphicsStyle::upscaler 2): its Vulkan extensions all offered and on (instance, device), NGX
+    // started on the device (CreateDevice); else the DLSS choice upscales with FSR 2
+    Dlss dlss_;
+    bool dlss_inst_ = false, dlss_dev_ = false, dlss_ok_ = false;
+    bool UpscaleDlss() const { return dlss_ok_ && Style().upscaler == kUpscalerDlss; }
     Image up_depth_, up_motion_, up_out_;
     uint64_t up_frame_ = 0;  // the frame (presents_ + 1) last upscaled
     std::chrono::steady_clock::time_point up_time_{};
@@ -4166,6 +4171,17 @@ bool VulkanBackend::CreateInstance() {
         for (auto& e : ep)
             if (!std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
                 exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME), colorspaces_ = true;
+        // DLSS's (gpu/upscale_dlss.cpp), where this loader offers them all
+        static const std::vector<std::string> dlss = DlssInstanceExtensions();
+        dlss_inst_ = DlssBuiltIn();
+        for (const std::string& want : dlss) {
+            const bool offered = std::any_of(ep.begin(), ep.end(), [&](auto& e) { return want == e.extensionName; });
+            dlss_inst_ = dlss_inst_ && offered;
+        }
+        if (dlss_inst_)
+            for (const std::string& want : dlss)
+                if (std::none_of(exts.begin(), exts.end(), [&](const char* x) { return want == x; })) exts.push_back(want.c_str());
+        if (DlssBuiltIn() && !dlss_inst_) LOGR("vulkan: the Vulkan loader lacks DLSS's instance extensions; no DLSS");
     }
     std::vector<const char*> layers;
     if (DebugWanted()) {
@@ -4289,6 +4305,19 @@ bool VulkanBackend::CreateDevice() {
                    HasExtension(ext, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
                    HasExtension(ext, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     if (HasExtension(ext, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)) want.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    // DLSS's (gpu/upscale_dlss.cpp): an NVIDIA GPU offering them all (NGX itself checks it is an RTX one)
+    static std::vector<std::string> dlss_exts;
+    dlss_dev_ = dlss_inst_ && props_.vendorID == 0x10DE;
+    if (dlss_dev_) {
+        dlss_exts = DlssDeviceExtensions(instance_, pd_);
+        for (const std::string& e : dlss_exts) dlss_dev_ = dlss_dev_ && HasExtension(ext, e.c_str());
+        if (dlss_dev_) {
+            for (const std::string& e : dlss_exts)
+                if (std::none_of(want.begin(), want.end(), [&](const char* x) { return e == x; })) want.push_back(e.c_str());
+        } else {
+            LOGR("vulkan: the GPU lacks DLSS's device extensions; no DLSS");
+        }
+    }
 
     // what the device offers
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
@@ -4336,6 +4365,8 @@ bool VulkanBackend::CreateDevice() {
     on.features.occlusionQueryPrecise = f2.features.occlusionQueryPrecise;
     on.features.depthBiasClamp = f2.features.depthBiasClamp;
     on.features.fragmentStoresAndAtomics = f2.features.fragmentStoresAndAtomics;
+    // NGX (DLSS) reads its buffers by address
+    if (dlss_dev_) on12.bufferDeviceAddress = f12.bufferDeviceAddress;
     // FSR 2's compute shaders (gpu/upscale_fsr.cpp): storage images without a format, wave64 where it asks for it
     on.features.shaderStorageImageReadWithoutFormat = f2.features.shaderStorageImageReadWithoutFormat;
     on.features.shaderStorageImageWriteWithoutFormat = f2.features.shaderStorageImageWriteWithoutFormat;
@@ -4418,6 +4449,8 @@ bool VulkanBackend::CreateDevice() {
         rt_scratch_align_ = std::max<VkDeviceSize>(ap.minAccelerationStructureScratchOffsetAlignment, 256);
     }
     SetRayTracingSupported(rt_ok_);
+    // DLSS: NGX started on the device where its extensions are on; the settings offer it when it runs here
+    if (dlss_dev_) dlss_ok_ = dlss_.Init(instance_, pd_, dev_, vkGetInstanceProcAddr, vkGetDeviceProcAddr);
     LOGR("vulkan: ray tracing (ray queries) %s", rt_ok_ ? "available" : rt_off ? "turned off (XBE_NO_RT)" : "not offered by this GPU or driver");
     vkGetDeviceQueue(dev_, family_, 0, &queue_);
     alloc_.Init(pd_, dev_);
@@ -4821,6 +4854,7 @@ VulkanBackend::~VulkanBackend() {
     if (cmd_) Submit();
     vkDeviceWaitIdle(dev_);
     fsr_.Destroy();
+    dlss_.Shutdown();
     for (auto& [serial, f] : retire_) f();
     retire_.clear();
     for (auto& [k, m] : modules_) vkDestroyShaderModule(dev_, m, nullptr);
@@ -10052,7 +10086,8 @@ bool VulkanBackend::TaaWanted() const {
 
 bool VulkanBackend::UpscaleWanted() const {
     const GraphicsStyle& st = Style();
-    return st.upscaler == kUpscalerFsr && st.mode != kStyleRetro && ViewCount() < 2 && scene_wbuf_;
+    return (st.upscaler == kUpscalerFsr || st.upscaler == kUpscalerDlss) && st.mode != kStyleRetro && ViewCount() < 2 &&
+           scene_wbuf_;
 }
 
 float VulkanBackend::UpscaleShrinkRatio() const { return UpscaleWanted() ? UpscaleRatio(Style().upscale_quality) : 1.0f; }
@@ -10226,7 +10261,8 @@ void VulkanBackend::UpscalePass(Target& rt, Target* ds) {
     const VkImageUsageFlags in = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (!ensure(up_depth_, VK_FORMAT_R32_SFLOAT, rt.w, rt.h, in) || !ensure(up_motion_, VK_FORMAT_R16G16_SFLOAT, rt.w, rt.h, in) ||
         !ensure(up_out_, VK_FORMAT_R8G8B8A8_UNORM, dw, dhh,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {  // DLSS clears it first
         LOG_FIRST(1, "vulkan: no memory for the upscaler; none");
         return;
     }
@@ -10250,8 +10286,15 @@ void VulkanBackend::UpscalePass(Target& rt, Target* ds) {
     FullScreen(pm, {up_motion_.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 36, v, 2);
     End();
     Barrier();
-    // a new context for new sizes: the frames in flight done with the old one first
-    if (!fsr_.Same(rt.w, rt.h, dw, dhh, false)) vkDeviceWaitIdle(dev_), fsr_.Destroy();
+    // a new context for new sizes: the frames in flight done with the old one first; the other upscaler's let go
+    const bool dlss = UpscaleDlss();
+    const int quality = Style().upscale_quality;
+    if (dlss ? !dlss_.Same(rt.w, rt.h, dw, dhh, quality) || fsr_.Ready() : !fsr_.Same(rt.w, rt.h, dw, dhh, false) || dlss_.Ready())
+        vkDeviceWaitIdle(dev_), fsr_.Destroy(), dlss_.Destroy();
+    if (!dlss && Style().upscaler == kUpscalerDlss) {
+        static bool said = false;
+        if (!said) said = true, LOGR("vulkan: DLSS is not available on this PC; upscaling with FSR 2");
+    }
     FsrDispatch d;
     d.cmd = Cmd();
     d.color = {rt.res.img, rt.res.view, rt.res.fmt, rt.w, rt.h};
@@ -10269,9 +10312,10 @@ void VulkanBackend::UpscalePass(Target& rt, Target* ds) {
     up_time_ = now;
     d.near_z = near_z, d.far_z = far_z, d.fov_y = 2.0f * std::atan(0.5774f);
     d.reset = up_frame_ != presents_ || !rp_ok_;
-    const bool ok = fsr_.Dispatch(d, dw, dhh);
+    const bool ok = dlss ? dlss_.Dispatch(d, dw, dhh, quality) : fsr_.Dispatch(d, dw, dhh);
     dirty_ = true;
     Barrier();
+    ForgetDrawState();
     // the screen-sized images back for the HUD; FSR's picture into the colour one
     if (rt.up_small) UpscaleExpand(rt, !ok);
     if (ds->up_small) UpscaleExpand(*ds, true);
@@ -10286,10 +10330,11 @@ void VulkanBackend::UpscalePass(Target& rt, Target* ds) {
     Barrier();
     up_frame_ = presents_ + 1;
     static uint64_t said = 0;
-    const uint64_t key = uint64_t(d.render_w) << 32 | dw;
+    const uint64_t key = (uint64_t(d.render_w) << 32 | dw) ^ (dlss ? 1ull << 63 : 0);
     if (said != key) {
         said = key;
-        LOGR("vulkan: FSR 2 upscaling %ux%u -> %ux%u (sharpness %.2f)", d.render_w, d.render_h, dw, dhh, d.sharpness);
+        if (dlss) LOGR("vulkan: DLSS upscaling %ux%u -> %ux%u", d.render_w, d.render_h, dw, dhh);
+        else LOGR("vulkan: FSR 2 upscaling %ux%u -> %ux%u (sharpness %.2f)", d.render_w, d.render_h, dw, dhh, d.sharpness);
     }
 }
 

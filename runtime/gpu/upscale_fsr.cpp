@@ -52,13 +52,16 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev, const
 
 namespace gpu {
 
-bool UpscalerAvailable(int upscaler) { return upscaler == kUpscalerOff || upscaler == kUpscalerFsr; }
+bool UpscalerAvailable(int upscaler) {
+    return upscaler == kUpscalerOff || upscaler == kUpscalerFsr || (upscaler == kUpscalerDlss && DlssAvailable());
+}
 
 float UpscaleRatio(int quality) {
     switch (quality) {
         case kUpscaleQuality: return 1.5f;
         case kUpscaleBalanced: return 1.7f;
         case kUpscalePerformance: return 2.0f;
+        case kUpscaleUltraPerformance: return 3.0f;
         default: return 1.0f;
     }
 }

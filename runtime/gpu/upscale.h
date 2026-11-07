@@ -1,9 +1,11 @@
 #pragma once
 // Temporal upscalers for the Vulkan renderer (GraphicsStyle::upscaler): AMD FSR 2 (MIT; built from the fetched
-// FidelityFX-FSR2 sources, gpu/upscale_fsr.cpp). NVIDIA DLSS and Intel XeSS are vendor SDKs under their own licences
-// with binaries (nvngx_dlss.dll, libxess.dll): neither is fetched or built in; the settings show them as not
-// installed (UpscalerAvailable). The includer has Vulkan's types already (vulkan.cpp, with VK_NO_PROTOTYPES).
+// FidelityFX-FSR2 sources, gpu/upscale_fsr.cpp) and NVIDIA DLSS Super Resolution (gpu/upscale_dlss.cpp: NVIDIA's NGX
+// SDK under the NVIDIA RTX SDKs licence, fetched by CMake when XBE_DLSS is on, never committed; its runtime
+// nvngx_dlss.dll goes beside each exe). The includer has Vulkan's types already (vulkan.cpp, with VK_NO_PROTOTYPES).
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "gpu/style.h"
 
@@ -63,6 +65,45 @@ private:
     uint32_t rw_ = 0, rh_ = 0, dw_ = 0, dh_ = 0;
     bool hdr_ = false, failed_ = false;
     VkPhysicalDevice pd_ = VK_NULL_HANDLE;
+    VkDevice dev_ = VK_NULL_HANDLE;
+    PFN_vkGetDeviceProcAddr gdpa_ = nullptr;
+};
+
+// NVIDIA DLSS: built in (CMake found NVIDIA's SDK), and usable on this PC (Dlss::Init found nvngx_dlss.dll, the
+// driver's NGX and an RTX GPU)
+bool DlssBuiltIn();
+bool DlssAvailable();
+// the Vulkan extensions DLSS asks for: the instance's before it is made, the device's for the GPU picked. The
+// renderer turns them on where offered; DLSS is tried only when all are (none when not built in).
+std::vector<std::string> DlssInstanceExtensions();
+std::vector<std::string> DlssDeviceExtensions(VkInstance instance, VkPhysicalDevice pd);
+
+// a DLSS Super Resolution feature over the same inputs as FSR 2 (FsrDispatch), made again when the sizes or the
+// quality change. Quality: GraphicsStyle::upscale_quality (Native is DLAA).
+class Dlss {
+public:
+    ~Dlss() { Shutdown(); }
+    // NGX on the device: false (logged) when the dll, the driver or the GPU cannot run DLSS
+    bool Init(VkInstance instance, VkPhysicalDevice pd, VkDevice dev, PFN_vkGetInstanceProcAddr gipa,
+              PFN_vkGetDeviceProcAddr gdpa);
+    // as Fsr2::Dispatch (the inputs left in GENERAL); no sharpening (DLSS has none of its own since 2.5.1)
+    bool Dispatch(const FsrDispatch& d, uint32_t display_w, uint32_t display_h, int quality);
+    // the feature let go (the GPU must be done with it: the caller waits)
+    void Destroy();
+    // NGX let go, before the device (Destroy first)
+    void Shutdown();
+    bool Ready() const { return handle_ != nullptr; }
+    bool Same(uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh, int quality) const {
+        return !handle_ || (rw == rw_ && rh == rh_ && dw == dw_ && dh == dh_ && quality == quality_);
+    }
+
+private:
+    bool Ensure(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh, int quality);
+    void* handle_ = nullptr;  // NVSDK_NGX_Handle
+    void* params_ = nullptr;  // NVSDK_NGX_Parameter (the capability parameters)
+    uint32_t rw_ = 0, rh_ = 0, dw_ = 0, dh_ = 0;
+    int quality_ = -1;
+    bool failed_ = false;
     VkDevice dev_ = VK_NULL_HANDLE;
     PFN_vkGetDeviceProcAddr gdpa_ = nullptr;
 };

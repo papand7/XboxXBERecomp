@@ -41,8 +41,8 @@ const char* kTonemaps[] = {"off", "filmic", "reinhard"};
 const char* kReflectNames[] = {"off", "low", "high"};
 const char* kDofNames[] = {"off", "distance", "focus"};
 const char* kHdrToneNames[] = {"off", "agx", "aces"};
-const char* kUpscalerNames[] = {"off", "fsr", "dlss", "xess"};
-const char* kUpscaleQualityNames[] = {"native", "quality", "balanced", "performance"};
+const char* kUpscalerNames[] = {"off", "fsr", "dlss"};
+const char* kUpscaleQualityNames[] = {"native", "quality", "balanced", "performance", "ultra_performance"};
 
 std::filesystem::path StyleFile() { return app::ExeDir() / "graphics.toml"; }
 
@@ -94,8 +94,8 @@ void Clamp(GraphicsStyle& s) {
     s.hdr_tonemap = std::clamp(s.hdr_tonemap, 0, int(kHdrTones) - 1);
     s.motion_blur_strength = std::clamp(s.motion_blur_strength, 0.0f, 2.0f);
     s.floor_reflections = std::clamp(s.floor_reflections, 0, 2);
-    s.upscaler = std::clamp(s.upscaler, 0, 3);
-    s.upscale_quality = std::clamp(s.upscale_quality, 0, 3);
+    s.upscaler = std::clamp(s.upscaler, 0, int(kUpscalers) - 1);
+    s.upscale_quality = std::clamp(s.upscale_quality, 0, int(kUpscaleQualities) - 1);
     s.upscale_sharpness = std::clamp(s.upscale_sharpness, 0.0f, 1.0f);
 }
 
@@ -218,8 +218,10 @@ void Read(const toml::table& t, GraphicsStyle& s, const std::string& where) {
     flag("movie_upscale", s.movie_upscale);
     flag("movie_43", s.movie_43);
     flag("taa", s.taa);
-    named("upscaler", s.upscaler, kUpscalerNames, 4);
-    named("upscale_quality", s.upscale_quality, kUpscaleQualityNames, 4);
+    // Intel XeSS was a choice once (never built in, drawn as off): an old file's 'xess' is off
+    if (auto v = t["upscaler"].value<std::string>(); v && *v == "xess") s.upscaler = kUpscalerOff;
+    else named("upscaler", s.upscaler, kUpscalerNames, int(kUpscalers));
+    named("upscale_quality", s.upscale_quality, kUpscaleQualityNames, int(kUpscaleQualities));
     num("upscale_sharpness", s.upscale_sharpness);
     flag("rt_denoise", s.rt_denoise);
     flag("particles", s.particles);

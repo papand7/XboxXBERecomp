@@ -76,6 +76,77 @@ target_compile_definitions(xbe_fsr2 PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARN
     _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS _SILENCE_ALL_CXX20_DEPRECATION_WARNINGS)
 target_compile_options(xbe_fsr2 PRIVATE -w)
 
+# NVIDIA DLSS Super Resolution (gpu/upscale_dlss.cpp): NVIDIA's NGX SDK under the NVIDIA RTX SDKs licence (its
+# terms in sdk/THIRD_PARTY.txt; building with it accepts them). Its headers, static loader library and the
+# nvngx_dlss.dll runtime are downloaded one by one from NVIDIA's DLSS repository at the tag's commit (the tag's archive
+# carries every platform's binaries, about 1 GB), each checked against its SHA-256, into the build folder: never
+# committed. The dll goes beside each exe. XBE_DLSS=OFF, or a failed download, builds without it (DLSS not available).
+option(XBE_DLSS "Fetch NVIDIA's DLSS SDK (NVIDIA RTX SDKs licence) and build the DLSS upscaler" ON)
+set(XBE_DLSS_FOUND OFF)
+if(XBE_DLSS AND WIN32)
+    set(XBE_DLSS_TAG v310.9.16)
+    set(XBE_DLSS_COMMIT 9981c6350dc58c0ce21f024fd65e31e851c31689)
+    set(XBE_DLSS_DIR ${CMAKE_BINARY_DIR}/_deps/dlss-${XBE_DLSS_TAG})
+    set(XBE_DLSS_FILES
+        include/nvsdk_ngx.h dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848
+        include/nvsdk_ngx_defs.h ea23f33497cd274860d1c25a97644fce807dcb0037c594547203343103fad03e
+        include/nvsdk_ngx_defs_vk.h 0a24d0861ace7d6b9362a67b7f08bea1b33ea123c5ce730b19133de8a891d031
+        include/nvsdk_ngx_helpers.h 5bcbadfe7478b802cf6d3aca4dc5ddd7d0889b99726e69c63f9e9bd555f44471
+        include/nvsdk_ngx_helpers_cuda.h f2851a76107bdf4fbcb7b261f3c35573c312d8ecb4bc18fb02d9e2cec7705042
+        include/nvsdk_ngx_helpers_d3d.h ec75224f36ed6580baaf250fa83620405ad81a1d98c2c436654a0c9cf6a6b8ba
+        include/nvsdk_ngx_helpers_vk.h c192bff72138f12f770db48e12c1d8f712dfc81ea0e8e055ebb27d8dd1b31623
+        include/nvsdk_ngx_loader.h abdf5f66a692620538357d29fdf78e3e2a677ee8140b7a638962ecb766585e75
+        include/nvsdk_ngx_params.h 943bc8cc5cdae03b6303016fbad3183636f2335ae27a2d18776798c3b4efabbc
+        include/nvsdk_ngx_vk.h 2d364ce7132881eb669e9498fd570d74cba563b1fbebc82c235f8e1ad2dd8b6d
+        lib/Windows_x86_64/x64/nvsdk_ngx_d.lib bc43df9ec032004fde681d3e3afd01cde239e03a0125b822e88674c84287f99c
+        lib/Windows_x86_64/rel/nvngx_dlss.dll d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e
+        LICENSE.txt d4216e39ebef5f9b50a6712ebb37beeb5379862a67733a9999c651f21592aaf0)
+    set(XBE_DLSS_FOUND ON)
+    list(LENGTH XBE_DLSS_FILES n)
+    math(EXPR last "${n} - 1")
+    foreach(i RANGE 0 ${last} 2)
+        math(EXPR j "${i} + 1")
+        list(GET XBE_DLSS_FILES ${i} f)
+        list(GET XBE_DLSS_FILES ${j} want)
+        set(dst ${XBE_DLSS_DIR}/${f})
+        set(have "")
+        if(EXISTS ${dst})
+            file(SHA256 ${dst} have)
+        endif()
+        if(NOT have STREQUAL want)
+            message(STATUS "DLSS SDK ${XBE_DLSS_TAG}: ${f}")
+            file(DOWNLOAD https://raw.githubusercontent.com/NVIDIA/DLSS/${XBE_DLSS_COMMIT}/${f} ${dst}.part
+                STATUS st TLS_VERIFY ON)
+            list(GET st 0 code)
+            set(have "")
+            if(code EQUAL 0)
+                file(SHA256 ${dst}.part have)
+            endif()
+            if(have STREQUAL want)
+                file(RENAME ${dst}.part ${dst})
+            else()
+                file(REMOVE ${dst}.part)
+                message(WARNING "DLSS SDK: ${f} could not be fetched or did not match its hash (${st}); built without DLSS")
+                set(XBE_DLSS_FOUND OFF)
+                break()
+            endif()
+        endif()
+    endforeach()
+    if(XBE_DLSS_FOUND)
+        set(XBE_DLSS_LIB ${XBE_DLSS_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib)
+        set(XBE_DLSS_DLL ${XBE_DLSS_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll)
+        message(STATUS "DLSS SDK ${XBE_DLSS_TAG} (NVIDIA RTX SDKs licence): DLSS built in")
+    endif()
+endif()
+if(XBE_DLSS_FOUND)
+    set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/upscale_dlss.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include;${XBE_DLSS_DIR}/include"
+        COMPILE_DEFINITIONS "XBE_DLSS=1")
+else()
+    set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/upscale_dlss.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include")
+endif()
+
 # hd_pack (tools/hd_pack): a texture pack upscaled on the player's PC by Real-ESRGAN (BSD-3; its ncnn Vulkan build,
 # MIT, with the realesrgan-x4plus models), copied beside each game exe in tools/
 if(WIN32)
@@ -169,6 +240,12 @@ function(add_xbe_image target xbe config partitions game_dir)
     # the Vulkan renderer's shader compiler, beside the exe
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll $<TARGET_FILE_DIR:${target}>)
+    # DLSS: NGX's loader linked in, NVIDIA's runtime beside the exe (the launcher copies the build's dlls to play\)
+    if(XBE_DLSS_FOUND)
+        target_link_libraries(${target} PRIVATE ${XBE_DLSS_LIB})
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_DLSS_DLL} $<TARGET_FILE_DIR:${target}>)
+    endif()
     # the texture pack tool and its upscaler, in tools\ beside the exe
     if(WIN32)
         add_dependencies(${target} hd_pack)

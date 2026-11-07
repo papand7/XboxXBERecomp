@@ -21,8 +21,15 @@ enum Reflections : int { kReflectOff, kReflectLow, kReflectHigh, kReflectLevels 
 enum DepthOfField : int { kDofOff, kDofDistance, kDofFocus, kDofModes };
 enum HdrTonemap : int { kHdrToneOff, kHdrToneAgx, kHdrToneAces, kHdrTones };
 // GraphicsStyle::upscaler and upscale_quality (gpu/upscale.h)
-enum Upscaler : int { kUpscalerOff, kUpscalerFsr, kUpscalerDlss, kUpscalerXess, kUpscalers };
-enum UpscaleQuality : int { kUpscaleNative, kUpscaleQuality, kUpscaleBalanced, kUpscalePerformance, kUpscaleQualities };
+enum Upscaler : int { kUpscalerOff, kUpscalerFsr, kUpscalerDlss, kUpscalers };
+enum UpscaleQuality : int {
+    kUpscaleNative,
+    kUpscaleQuality,
+    kUpscaleBalanced,
+    kUpscalePerformance,
+    kUpscaleUltraPerformance,
+    kUpscaleQualities
+};
 
 struct GraphicsStyle {
     std::string preset = "original";  // the preset the values came from ("" once edited)
@@ -133,13 +140,14 @@ struct GraphicsStyle {
     // TAA (Vulkan): the 3D scene jittered by a sub-pixel each frame and blended with the frames before (reprojected by
     // the camera, held within each pixel's neighbours' range): smooth, steady edges; SMAA is left out meanwhile
     bool taa = false;
-    // temporal upscaler (Vulkan; every style but Retro; one view; gpu/upscale.h): 0 off, 1 AMD FSR 2, 2 NVIDIA DLSS,
-    // 3 Intel XeSS (DLSS and XeSS not built in: off). The 3D scene drawn at the screen's size over the quality's
-    // ratio (0 Native AA 1x, 1 Quality 1.5x, 2 Balanced 1.7x, 3 Performance 2x), jittered, and brought to the screen
-    // with the frames before (camera motion from the depth) before the HUD; TAA and SMAA are left out meanwhile
+    // temporal upscaler (Vulkan; every style but Retro; one view; gpu/upscale.h): 0 off, 1 AMD FSR 2, 2 NVIDIA DLSS
+    // (where built in and the GPU runs it, else FSR 2; an old 'xess' reads as off). The 3D scene drawn at the
+    // screen's size over the quality's ratio (0 Native AA / DLAA 1x, 1 Quality 1.5x, 2 Balanced 1.7x, 3 Performance
+    // 2x, 4 Ultra Performance 3x), jittered, and brought to the screen with the frames before (camera motion from the
+    // depth) before the HUD; TAA and SMAA are left out meanwhile
     int upscaler = 0;
     int upscale_quality = 0;
-    float upscale_sharpness = 0.3f;  // 0 to 1 (FSR's RCAS)
+    float upscale_sharpness = 0.3f;  // 0 to 1 (FSR's RCAS; DLSS has no sharpening of its own since 2.5.1)
     // ray tracing denoise (Vulkan): the traced bounced and volumetric light built up over frames (reprojected), less grain
     bool rt_denoise = true;  // movies shown 4:3 in the middle of a wide screen (black at the sides), not stretched
     // GPU particles (Vulkan; every style but Retro; one view): sparks, dust and chips where shots hit, fire, smoke,
@@ -238,8 +246,8 @@ void SetStyleRendererActive(bool on);
 void SetViewCount(int n);
 int ViewCount();
 bool RayTracingSupported();  // the Vulkan renderer's GPU has ray queries (set by it)
-bool UpscalerAvailable(int upscaler);  // built in and usable: off and FSR 2 (DLSS and XeSS are not built in)
-float UpscaleRatio(int quality);      // the screen's size over the scene's, each way: 1, 1.5, 1.7, 2
+bool UpscalerAvailable(int upscaler);  // built in and usable: off, FSR 2, DLSS where its runtime runs on the GPU
+float UpscaleRatio(int quality);      // the screen's size over the scene's, each way: 1, 1.5, 1.7, 2, 3
 void SetRayTracingSupported(bool on);
 // the player aims down the sights (the game's thread, each frame): depth of field's focus blurs more
 bool Aiming();
