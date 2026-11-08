@@ -294,4 +294,24 @@ void EmitParticles(uint32_t kind, const float pos[3], const float normal[3], flo
 uint32_t TakeParticles(ParticleEvent* out, uint32_t max);  // the renderer, once a frame: the queue emptied
 uint32_t FootprintEpoch();      // counts the clears
 
+// screenshots (frame_info.cpp): the next frame as shown (the overlays drawn over it included) written as a PNG at path
+// by the Vulkan renderer; any thread. The renderer takes the request at its next present and reports it written
+void RequestScreenshot(const std::wstring& path);
+bool ScreenshotPending();                                  // asked for, not yet written
+bool TakeScreenshotRequest(std::wstring& path);            // the renderer, at each present
+void ScreenshotWritten(const std::wstring& path, bool ok);  // the renderer, once it is on disk (or failed)
+// the last screenshot finished: its path and whether it was written; a count bumped by each (0 none yet)
+uint32_t ScreenshotResult(std::wstring& path, bool& ok);
+// the renderer's last frame, for a performance overlay: the GPU's time on it (ms, from its timestamps; 0 unknown), the
+// 3D scene's size as drawn (smaller than the output while an upscaler rebuilds it), the output's, the upscaler
+// running (kUpscalerOff when none), and a count of the frames
+struct FrameStats {
+    float gpu_ms = 0;
+    uint32_t scene_w = 0, scene_h = 0, out_w = 0, out_h = 0;
+    int upscaler = 0;
+    uint64_t frame = 0;
+};
+void SetFrameStats(const FrameStats& s);  // the renderer, at each present
+FrameStats LastFrameStats();              // any thread
+
 }  // namespace gpu

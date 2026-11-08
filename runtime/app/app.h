@@ -79,6 +79,9 @@ struct Settings {
     std::vector<WheelBind> wheel_gears;    // an H-pattern shifter's positions: R, 1 to 7 (kGears)
     uint32_t ffb_strength = 70;      // force feedback overall, percent, 0 off
     uint32_t ffb_road = 50;          // the game's rumble (kerbs, impacts) felt in the wheel, percent
+    // Discord Rich Presence (discord.cpp): on, and the application's id from Discord's developer portal (empty: off)
+    bool discord = true;
+    std::string discord_app_id;
 };
 // the wheel buttons of a Logitech G920/G923 (Xbox) for each input::Control, -1 none
 int8_t DefaultWheelButton(int c);
@@ -128,6 +131,15 @@ void* Monitor();                  // HMONITOR of the monitor setting (the primar
 std::vector<std::string> Monitors();  // the displays' names, in the monitor setting's order from 1
 bool Paused();                    // pause_unfocused and the window is not in front (Windows)
 void DrawHud(double fps);         // the frame counter, inside the ImGui frame (overlay.cpp)
+// the runtime's own drawing over the frame (the frame counter, hit markers, blood, unlock pop-ups) left out while
+// hidden: a title's photo mode (any thread)
+void HideOverlays(bool hide);
+bool OverlaysHidden();
+// Discord Rich Presence (discord.cpp): what the player is doing, on their Discord profile while Discord runs on this
+// PC (its local IPC, a background thread; nothing without Discord, Settings::discord off or no discord_app_id).
+// details the first line ("Playing The Exchange"), state the second (may be empty), start the Unix time the elapsed
+// time counts from (0 none). Any thread; sent when it changes
+void SetPresence(const std::string& details, const std::string& state, int64_t start);
 // hit feedback (hit_marker.cpp): a game's hook when a local player's shot hits a character, at that player's
 // crosshair (x, y the shown frame's fractions); kind 0 a hit, 1 the head, 2 a kill
 void HitMarker(float x, float y, int kind);

@@ -4075,6 +4075,8 @@ private:
     uint32_t pass_n_[24] = {};
     bool frame_stamp_due_ = true;
     double gpu_frame_ms_ = 0, gpu_post_ms_ = 0;
+    double gpu_last_ms_ = 0;     // the last frame read back's GPU time (a performance overlay's, LastFrameStats)
+    FrameStats frame_stats_;
     uint32_t gpu_frames_ = 0, gpu_posts_ = 0;
     void Stamp(uint32_t which);
     void ReadStamps(uint32_t slot);
@@ -8718,6 +8720,14 @@ void VulkanBackend::Present(const Surface& front) {
             std::filesystem::remove(req, ec);
         }
     }
+    // a title's screenshot (RequestScreenshot): the same picture, reported written
+    const bool shot_asked = shot_path.empty() && TakeScreenshotRequest(shot_path);
+    // the frame's sizes for a performance overlay (LastFrameStats): the 3D scene as drawn, the upscaler rebuilding it
+    {
+        const Target* sc = scene_rt_ ? scene_rt_ : t;
+        frame_stats_.scene_w = sc ? sc->w : 0, frame_stats_.scene_h = sc ? sc->h : 0;
+        frame_stats_.upscaler = scene_rt_ && scene_rt_->up_small ? Style().upscaler : kUpscalerOff;
+    }
     scene_rt_ = scene_ds_ = nullptr;
     post_done_ = false;
     scene_zwrites_ = 0;
@@ -8793,6 +8803,7 @@ void VulkanBackend::Present(const Surface& front) {
         if (shot && readback_.size < shot_bytes) {
             DropBuffer(readback_);
             shot = MakeBuffer(readback_, shot_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+            if (!shot && shot_asked) ScreenshotWritten(shot_path, false);
         }
         ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         ib.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
@@ -8834,7 +8845,9 @@ void VulkanBackend::Present(const Surface& front) {
                 for (uint32_t& p : px) p = (p & 0xFF00FF00u) | (p >> 16 & 0xFF) | (p & 0xFF) << 16;
             if (swap_hdr_) HdrToSdr(px, swap_fmt_ == VK_FORMAT_A2B10G10R10_UNORM_PACK32, HdrLevels().paper);
             for (uint32_t& p : px) p |= 0xFF000000u;
-            LOGR("vulkan: shot %ls %s", shot_path.c_str(), WritePngFile(shot_path, px, bb_w_, bb_h_) ? "written" : "failed");
+            const bool written = WritePngFile(shot_path, px, bb_w_, bb_h_);
+            LOGR("vulkan: shot %ls %s", shot_path.c_str(), written ? "written" : "failed");
+            if (shot_asked) ScreenshotWritten(shot_path, written);
         }
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.waitSemaphoreCount = 1;
@@ -8854,12 +8867,17 @@ void VulkanBackend::Present(const Surface& front) {
         frame_serial_[frame_slot_] = serial_;
         frame_slot_ = (frame_slot_ + 1) % kFramesInFlight;
     } else {
+        if (shot_asked) RequestScreenshot(shot_path);  // asked again for the next frame
         Submit();
         frame_serial_[frame_slot_] = serial_;  // the slot is not advanced: its stamps and the throttle are this frame's
     }
     // at most kFramesInFlight frames ahead of the GPU; the slot's timings read before it is used again
     Wait(frame_serial_[frame_slot_]);
     ReadStamps(frame_slot_);
+    frame_stats_.gpu_ms = float(gpu_last_ms_);
+    frame_stats_.out_w = bb_w_, frame_stats_.out_h = bb_h_;
+    frame_stats_.frame = presents_;
+    SetFrameStats(frame_stats_);
     frame_stamp_due_ = true;
     SaveStyleIfDue();
     Unbind();
@@ -10601,7 +10619,10 @@ void VulkanBackend::ReadStamps(uint32_t slot) {
     for (uint32_t i = 0; i < kStamps; i++)
         if (w >> i & 1) vkGetQueryPoolResults(dev_, stamps_, slot * kStamps + i, 1, 8, &t[i], 8, VK_QUERY_RESULT_64_BIT);
     double ns = props_.limits.timestampPeriod;
-    if ((w & 3) == 3 && t[1] > t[0]) gpu_frame_ms_ += double(t[1] - t[0]) * ns / 1e6, gpu_frames_++;
+    if ((w & 3) == 3 && t[1] > t[0]) {
+        gpu_last_ms_ = double(t[1] - t[0]) * ns / 1e6;
+        gpu_frame_ms_ += gpu_last_ms_, gpu_frames_++;
+    }
     if ((w & 12) == 12 && t[3] > t[2]) gpu_post_ms_ += double(t[3] - t[2]) * ns / 1e6, gpu_posts_++;
     // each pass: from the stamp just before it in time (the scene pass's start, 2, or another pass's end)
     if (w & 4)

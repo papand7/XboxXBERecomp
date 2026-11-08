@@ -494,7 +494,14 @@ void Achievements() {
     ImGui::EndTable();
 }
 
+namespace {
+std::atomic<bool> g_overlays_hidden{false};
+}
+void HideOverlays(bool hide) { g_overlays_hidden = hide; }
+bool OverlaysHidden() { return g_overlays_hidden; }
+
 void DrawHud(double fps) {
+    if (OverlaysHidden()) return;
     DrawUnlock();
     DrawBlood();
     DrawHitMarkers();

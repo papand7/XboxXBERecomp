@@ -230,6 +230,8 @@ void Load() {
     s.hdr_paper = std::min<uint32_t>(t["hdr_paper_white_nits"].value_or(s.hdr_paper), 600);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    s.discord = t["discord"].value_or(s.discord);
+    s.discord_app_id = t["discord_app_id"].value_or(s.discord_app_id);
     std::string aspect = t["aspect"].value_or(std::string(kAspects[s.aspect % kAspectCount]));
     for (uint32_t i = 0; i < kAspectCount; i++)
         if (aspect == kAspects[i]) s.aspect = i;
@@ -342,6 +344,8 @@ toml::table Table() {
                   {"hdr_paper_white_nits", int64_t(s.hdr_paper)},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"join_ip", s.join_ip},
+                  {"discord", s.discord},
+                  {"discord_app_id", s.discord_app_id},
                   {"aspect", kAspects[s.aspect % kAspectCount]},
                   {"keyboard", s.keyboard},
                   {"keyboard_alone", s.keyboard_alone},
