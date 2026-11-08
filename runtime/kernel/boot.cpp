@@ -248,8 +248,11 @@ void Relaunch(const char* exe) {
         closedir(d);
     }
     execl(path.c_str(), path.c_str(), nullptr);
+#ifdef XBE_HEADLESS
+    // the harness has no other image beside it: the run ends here (smoke.sh starts that image's own harness)
+    LOGI("relaunch: no %s beside the harness (%s): the run ends", exe, std::strerror(errno));
+#else
     LOGE("relaunch: cannot start %s (%s)", path.c_str(), std::strerror(errno));
-#ifndef XBE_HEADLESS
     std::string text = "The game could not start " + std::string(exe) + ": it is not beside this program (" + path +
                        "), or cannot be run. Restore it or build again.";
     app::MessageBox(std::wstring(text.begin(), text.end()).c_str(), true);
