@@ -102,4 +102,6 @@ void Pace(uint32_t vblanks) {
     std::this_thread::sleep_until(next);
 }
 
+void MixHitSound(float*, uint32_t) {}  // no hit marker ticks (app/hit_marker.cpp) headless
+
 }  // namespace app
