@@ -59,6 +59,9 @@ public:
     bool Launch(std::string& error);
     uint64_t BuildFilesBytes() const;  // source\out, removable once built
     bool RemoveBuildFiles(std::string& error);
+    // the downloaded source and its build removed (a download that broke, a build gone wrong): the next Install starts
+    // from a clean copy; the build tools, the game copy and the saves (play/) are kept
+    bool StartOver(std::string& error);
 
     // the game's Xbox custom soundtracks (GameConfig::music) from a folder of the player's music: each file converted
     // to WMA with ffmpeg (fetched the first time), ST.DB written, the folder remembered; summary: what was done

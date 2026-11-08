@@ -211,6 +211,11 @@ struct Service {
             else if (!copy.ok) e = copy.error.empty() ? "No game copy." : copy.error;
             if (e.empty() && builder->Launch(e)) Send({{"ev", "done"}, {"job", "play"}, {"ok", true}, {"message", ""}});
             else Send({{"ev", "done"}, {"job", "play"}, {"ok", false}, {"message", e}});
+        } else if (cmd == "start_over") {
+            Start("start_over", [this](std::string& e, std::string& m) {
+                m = "Cleaned up. Press Install to download and build again.";
+                return builder->StartOver(e);
+            });
         } else if (cmd == "remove_build") {
             Start("remove_build", [this](std::string& e, std::string& m) {
                 m = "Build files removed. An update builds everything again.";
