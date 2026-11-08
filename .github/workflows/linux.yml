@@ -37,7 +37,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cmake -S tests/linux -B "$RUNNER_TEMP/rt" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++             -DCMAKE_C_FLAGS=-march=x86-64-v2 -DCMAKE_CXX_FLAGS=-march=x86-64-v2
 
       - name: Build runtime check
         if: ${{ !cancelled() }}

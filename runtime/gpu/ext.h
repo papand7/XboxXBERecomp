@@ -1,5 +1,7 @@
 #pragma once
-// A game's additions to the D3D12 renderer: hooks at fixed points of the console path, none of which run without one
+// A game's additions to the D3D12 renderer: hooks at fixed points of the console path, none of which run without one.
+// Off Windows there is no D3D12 renderer: only the shader hooks' part is left, which the Vulkan renderer ignores too.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -9,6 +11,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <wrl/client.h>
+#endif
 
 #include <cstdint>
 #include <memory>
@@ -20,6 +23,7 @@
 
 namespace gpu {
 
+#ifdef _WIN32
 // a console surface the renderer draws into
 struct Target {
     Microsoft::WRL::ComPtr<ID3D12Resource> res;
@@ -96,6 +100,13 @@ public:
     // a target with range other than 1 is read, copied or presented
     virtual void Resolve(Context&, Target&) {}
 };
+#else
+class Extension {
+public:
+    virtual ~Extension() = default;
+    virtual const ShaderHooks* Shaders() const { return nullptr; }
+};
+#endif
 
 inline std::unique_ptr<Extension> g_extension;
 

@@ -179,6 +179,9 @@ bool CreateVulkanSurface(void* instance, void* surface);  // a VkInstance, a VkS
 void* VulkanGetInstanceProcAddr();  // the loader SDL opened for the window: a PFN_vkGetInstanceProcAddr
 void WindowPixels(uint32_t& width, uint32_t& height);  // the window's drawable size in pixels (GetClientRect's)
 std::vector<Mode> DisplayModes();  // the monitor setting's display's fullscreen sizes, widest first, each once
+std::string Utf8(const wchar_t* w);  // a wide string (kGame's, UTF-32 here) as UTF-8
+// a message box over the game window (SDL's); yes_no: Yes and No buttons, true for Yes, else OK and true
+bool MessageBox(const wchar_t* text, bool error, bool yes_no = false);
 #endif
 // leave the game as closing its window does (the settings window's Quit, a title's own quit item); from any thread
 void Quit();

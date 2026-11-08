@@ -1,5 +1,6 @@
 // the in-game settings window, F1: display, graphics, the game's own options and controls. Changes are saved to the
 // settings file at once; display mode, resolution and render scale apply at once, aspect at the next start.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -7,6 +8,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -31,8 +33,11 @@ std::atomic<bool> g_open{false};
 // a key binding waiting for its key: the input and the slot, -1 none
 std::atomic<int> g_bind_control{-1}, g_bind_slot{0};
 
-// the monitor's modes, widest first, each size once
+// the monitor's modes, widest first, each size once (off Windows SDL's, app/main_sdl.cpp)
 std::vector<Mode> Modes() {
+#ifndef _WIN32
+    return DisplayModes();
+#else
     std::vector<Mode> modes;
     HMONITOR mon = static_cast<HMONITOR>(Monitor());
     MONITORINFOEXW mi{};
@@ -50,6 +55,7 @@ std::vector<Mode> Modes() {
         return a.width != b.width ? a.width > b.width : a.height > b.height;
     });
     return modes;
+#endif
 }
 
 void Display(Settings& s) {
@@ -541,7 +547,7 @@ bool KeyCaptureBusy() {
     if (g_capture) return true;
     uint16_t held = g_capture_held;
     if (!held) return false;
-    if (GetAsyncKeyState(held) & 0x8000) return true;
+    if (input::KeyDown(held)) return true;
     g_capture_held = 0;
     return false;
 }

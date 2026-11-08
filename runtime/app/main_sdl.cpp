@@ -42,22 +42,6 @@
 
 namespace app {
 
-namespace {
-
-SDL_Window* g_window = nullptr;
-Uint32 g_event_base = 0;  // SDL_RegisterEvents: kApplyDisplay, kOpenWindow after it
-enum : Sint32 { kApplyDisplay, kOpenWindow };
-std::atomic<bool> g_active{true};  // the game window has the keyboard
-bool g_apply_posted = false;       // window thread: a display apply waits in the queue
-
-// OpenGameWindow's wait for the window thread
-struct OpenRequest {
-    bool apply = true;
-    std::mutex lock;
-    std::condition_variable cv;
-    bool done = false;
-};
-
 // kGame's wide strings (UTF-32 here) as UTF-8
 std::string Utf8(const wchar_t* w) {
     std::string s;
@@ -76,6 +60,42 @@ std::string Utf8(const wchar_t* w) {
     }
     return s;
 }
+
+bool MessageBox(const wchar_t* text, bool error, bool yes_no) {
+    std::string title = Utf8(kGame.short_title), body = Utf8(text);
+    if (!yes_no)
+        return SDL_ShowSimpleMessageBox(error ? SDL_MESSAGEBOX_ERROR : SDL_MESSAGEBOX_WARNING, title.c_str(), body.c_str(),
+                                        static_cast<SDL_Window*>(Window()));
+    const SDL_MessageBoxButtonData buttons[] = {
+        {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "No"},
+        {0, 1, "Yes"},
+    };
+    SDL_MessageBoxData box{};
+    box.flags = error ? SDL_MESSAGEBOX_ERROR : SDL_MESSAGEBOX_WARNING;
+    box.window = static_cast<SDL_Window*>(Window());
+    box.title = title.c_str();
+    box.message = body.c_str();
+    box.numbuttons = 2;
+    box.buttons = buttons;
+    int pressed = 0;
+    return SDL_ShowMessageBox(&box, &pressed) && pressed == 1;
+}
+
+namespace {
+
+SDL_Window* g_window = nullptr;
+Uint32 g_event_base = 0;  // SDL_RegisterEvents: kApplyDisplay, kOpenWindow after it
+enum : Sint32 { kApplyDisplay, kOpenWindow };
+std::atomic<bool> g_active{true};  // the game window has the keyboard
+bool g_apply_posted = false;       // window thread: a display apply waits in the queue
+
+// OpenGameWindow's wait for the window thread
+struct OpenRequest {
+    bool apply = true;
+    std::mutex lock;
+    std::condition_variable cv;
+    bool done = false;
+};
 
 // a crash: the faulting address, the guest thread's stack and a host backtrace in the log and on stderr
 void OnCrash(int sig, siginfo_t* info, void*) {

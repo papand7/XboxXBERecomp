@@ -93,6 +93,12 @@ target_include_directories(xbe_fsr2 PRIVATE ${vulkanheaders_SOURCE_DIR}/include 
 target_compile_definitions(xbe_fsr2 PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS
     _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS _SILENCE_ALL_CXX20_DEPRECATION_WARNINGS)
 target_compile_options(xbe_fsr2 PRIVATE -w)
+# off Windows: FSR 2's GCC branch (no __declspec) and the MSVC names its sources use (_countof, wcscpy_s)
+set(XBE_FSR2_POSIX ${XBE_SDK_DIR}/tools/fsr2_shaders/posix_compat.h)
+if(NOT WIN32)
+    target_compile_definitions(xbe_fsr2 PRIVATE FFX_GCC)
+    target_compile_options(xbe_fsr2 PRIVATE -include ${XBE_FSR2_POSIX})
+endif()
 
 # NVIDIA DLSS Super Resolution (gpu/upscale_dlss.cpp): NVIDIA's NGX SDK under the NVIDIA RTX SDKs licence (its
 # terms in sdk/THIRD_PARTY.txt; building with it accepts them). Its headers, static loader library and the
@@ -226,9 +232,15 @@ endif()
 foreach(f core/input.cpp app/main_sdl.cpp audio/sdl.cpp)
     set_source_files_properties(${XBE_SDK_DIR}/runtime/${f} PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
 endforeach()
-set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/upscale_fsr.cpp PROPERTIES
-    INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include;${XBE_FSR2_API};${XBE_FSR2_API}/vk"
-    COMPILE_DEFINITIONS "_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS")
+if(WIN32)
+    set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/upscale_fsr.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include;${XBE_FSR2_API};${XBE_FSR2_API}/vk"
+        COMPILE_DEFINITIONS "_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS")
+else()
+    set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/upscale_fsr.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include;${XBE_FSR2_API};${XBE_FSR2_API}/vk"
+        COMPILE_DEFINITIONS "_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS;FFX_GCC" COMPILE_OPTIONS "-include;${XBE_FSR2_POSIX}")
+endif()
 set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/smaa.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${smaa_SOURCE_DIR}/Textures;${CMAKE_BINARY_DIR}/smaa")
 

@@ -1,11 +1,15 @@
 // The title's Direct3D 8 calls drawn with Vulkan 1.3 (renderer = "vulkan" in the settings file). The console path of
 // d3d11.cpp on Vulkan, with what does not depend on the API shared through d3d_common (its D3D12 enums translated
-// here). The shaders are d3d_common's and shaders.cpp's HLSL, compiled to SPIR-V by DXC (dxcompiler.dll beside the
-// exe). Vulkan is loaded at run time (vulkan-1.dll): without it Init fails and the fallback renderer takes over.
+// here). The shaders are d3d_common's and shaders.cpp's HLSL, compiled to SPIR-V by DXC (gpu/dxc.cpp: dxcompiler.dll
+// or libdxcompiler.so beside the exe). Vulkan is loaded at run time (vulkan-1.dll; off Windows the loader SDL opened
+// for the window, else libvulkan.so.1): without it Init fails and the fallback renderer takes over. Off Windows the
+// window, its surface and its size come from app/main_sdl.cpp's hooks, and the D3D names d3d_common uses from
+// runtime/compat.
 //
 // Synchronisation is kept simple and correct before fast: every image lives in VK_IMAGE_LAYOUT_GENERAL, one dynamic
 // rendering instance is open at a time, and each end of one and each transfer is followed by a full memory barrier.
 // Not here yet: MSAA, F3 captures, renderer extensions and the perf report.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -20,7 +24,15 @@
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
-#include <dxcapi.h>
+#else
+#include <dlfcn.h>
+#include <windows.h>  // runtime/compat's
+#include <d3dcompiler.h>
+#include <wrl/client.h>
+
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -42,13 +54,18 @@
 
 #include <imgui.h>
 #include <backends/imgui_impl_vulkan.h>
+#ifdef _WIN32
 #include <backends/imgui_impl_win32.h>
+#else
+#include <backends/imgui_impl_sdl3.h>
+#endif
 
 #include "app/app.h"
 #include "core/diag.h"
 #include "core/log.h"
 #include "gpu/backend.h"
 #include "gpu/d3d_common.h"
+#include "gpu/dxc.h"
 #include "gpu/ext.h"
 #include "gpu/shaders.h"
 #include "gpu/smaa.h"
@@ -75,6 +92,11 @@ namespace {
     X(vkEnumerateInstanceLayerProperties)   \
     X(vkEnumerateInstanceVersion)
 
+#ifdef _WIN32
+#define VK_WIN32_SURFACE(X) X(vkCreateWin32SurfaceKHR)
+#else
+#define VK_WIN32_SURFACE(X)
+#endif
 #define VK_INSTANCE_FUNCS(X)                     \
     X(vkDestroyInstance)                         \
     X(vkEnumeratePhysicalDevices)                \
@@ -86,7 +108,7 @@ namespace {
     X(vkEnumerateDeviceExtensionProperties)      \
     X(vkCreateDevice)                            \
     X(vkGetDeviceProcAddr)                       \
-    X(vkCreateWin32SurfaceKHR)                   \
+    VK_WIN32_SURFACE(X)                          \
     X(vkDestroySurfaceKHR)                       \
     X(vkGetPhysicalDeviceSurfaceSupportKHR)      \
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
@@ -3506,33 +3528,6 @@ constexpr uint32_t kLightTilesX = 16, kLightTilesY = 9, kLights = 32;
 constexpr VkFormat kMaskFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr uint32_t kMaskRtFmt = 0x4D41534Bu;  // PsoKey::rtfmt of the mask's pipelines  // "maskmask": the mask's pixel shaders apart from the game's
 
-// ---- DXC, loaded from dxcompiler.dll beside the exe
-
-struct Dxc {
-    ComPtr<IDxcCompiler3> compiler;
-    ComPtr<IDxcUtils> utils;
-    bool tried = false;
-    bool Load() {
-        if (tried) return compiler != nullptr;
-        tried = true;
-        std::filesystem::path dll = app::ExeDir() / "dxcompiler.dll";
-        HMODULE m = LoadLibraryW(dll.wstring().c_str());
-        if (!m) m = LoadLibraryW(L"dxcompiler.dll");
-        if (!m) {
-            LOGE("vulkan: dxcompiler.dll not found beside the exe; the shaders cannot be compiled");
-            return false;
-        }
-        auto create = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(m, "DxcCreateInstance"));
-        if (!create || FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))) ||
-            FAILED(create(CLSID_DxcUtils, IID_PPV_ARGS(&utils)))) {
-            LOGE("vulkan: dxcompiler.dll has no compiler");
-            compiler = nullptr;
-            return false;
-        }
-        return true;
-    }
-};
-
 // ---- the backend
 
 class VulkanBackend final : public Backend {
@@ -3706,7 +3701,7 @@ private:
     void ForgetDrawState() { ds_ = {}; }
 
     // Vulkan objects
-    HMODULE lib_ = nullptr;
+    void* lib_ = nullptr;  // vulkan-1.dll / libvulkan.so.1 when this loaded it
     VkInstance instance_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
     VkPhysicalDevice pd_ = VK_NULL_HANDLE;
@@ -3766,7 +3761,6 @@ private:
     Image dummy_;  // 1x1 white, for stages without a texture where null descriptors are missing
     std::vector<Chunk> chunks_;  // stream chunks: [0] is being filled
     Buffer readback_;
-    Dxc dxc_;
     // caches
     std::unordered_map<uint64_t, std::vector<uint32_t>> spirv_;
     std::unordered_map<uint64_t, VkShaderModule> modules_;
@@ -4142,12 +4136,27 @@ bool DebugWanted() {
 // ---- instance, device, swap chain, fixed objects
 
 bool VulkanBackend::LoadVulkan() {
+#ifdef _WIN32
     lib_ = LoadLibraryW(L"vulkan-1.dll");
     if (!lib_) {
         LOGE("vulkan: vulkan-1.dll not found (no Vulkan driver)");
         return false;
     }
-    vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(lib_, "vkGetInstanceProcAddr"));
+    vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(lib_), "vkGetInstanceProcAddr")));
+#else
+    // the loader SDL opened for the window, else the system's
+    vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(app::VulkanGetInstanceProcAddr());
+    if (!vkGetInstanceProcAddr) {
+        lib_ = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (!lib_) lib_ = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+        if (!lib_) {
+            LOGE("vulkan: libvulkan.so.1 not found (no Vulkan loader)");
+            return false;
+        }
+        vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib_, "vkGetInstanceProcAddr"));
+    }
+#endif
     if (!vkGetInstanceProcAddr) return false;
 #define VK_LOAD(f) f = reinterpret_cast<PFN_##f>(vkGetInstanceProcAddr(nullptr, #f));
     VK_GLOBAL_FUNCS(VK_LOAD)
@@ -4163,7 +4172,12 @@ bool VulkanBackend::CreateInstance() {
              VK_API_VERSION_MINOR(version));
         return false;
     }
+#ifdef _WIN32
     std::vector<const char*> exts = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+#else
+    std::vector<const char*> exts = app::VulkanInstanceExtensions();  // the window's (SDL's)
+    if (exts.empty()) return false;
+#endif
     {
         // HDR: the swap chain's colour spaces past sRGB (HDR10's)
         uint32_t n = 0;
@@ -4226,6 +4240,7 @@ bool VulkanBackend::CreateInstance() {
         vkCreateDebugUtilsMessengerEXT(instance_, &mi, nullptr, &messenger_);
         LOGR("vulkan: validation %s", layers.empty() ? "unavailable" : "on");
     }
+#ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     si.hinstance = GetModuleHandleW(nullptr);
     si.hwnd = static_cast<HWND>(app::Window());
@@ -4233,6 +4248,9 @@ bool VulkanBackend::CreateInstance() {
         LOGE("vulkan: no surface for the window");
         return false;
     }
+#else
+    if (!app::CreateVulkanSurface(instance_, &surface_)) return false;
+#endif
     return true;
 }
 
@@ -4466,6 +4484,19 @@ bool VulkanBackend::CreateDevice() {
     return true;
 }
 
+// the window's drawable size in pixels
+static void WindowSize(uint32_t& w, uint32_t& h) {
+#ifdef _WIN32
+    RECT rc;
+    GetClientRect(static_cast<HWND>(app::Window()), &rc);
+    w = uint32_t(std::max<LONG>(rc.right - rc.left, 1)), h = uint32_t(std::max<LONG>(rc.bottom - rc.top, 1));
+#else
+    app::WindowPixels(w, h);
+    w = std::max(w, 1u), h = std::max(h, 1u);
+#endif
+}
+
+#ifdef _WIN32
 // the window's screen: its peak brightness (DXGI's) and the one Windows shows SDR white at in HDR (its "SDR content
 // brightness"), in nits; 0 where unknown
 static void DisplayLuminance(HWND wnd, float& peak, float& paper) {
@@ -4503,13 +4534,16 @@ static void DisplayLuminance(HWND wnd, float& peak, float& paper) {
         break;
     }
 }
+#else
+// off Windows not known: the settings' peak (or 1000 nits) and the default SDR white
+static void DisplayLuminance(void*, float& peak, float& paper) { peak = paper = 0; }
+#endif
 
 bool VulkanBackend::CreateSwapchain() {
-    RECT rc;
-    GetClientRect(static_cast<HWND>(app::Window()), &rc);
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd_, surface_, &caps);
-    uint32_t w = std::max<LONG>(rc.right - rc.left, 1), h = std::max<LONG>(rc.bottom - rc.top, 1);
+    uint32_t w = 1, h = 1;
+    WindowSize(w, h);
     if (caps.currentExtent.width != 0xFFFFFFFFu) w = caps.currentExtent.width, h = caps.currentExtent.height;
     if (!w || !h) return false;  // minimised
     uint32_t fn = 0;
@@ -4532,7 +4566,7 @@ bool VulkanBackend::CreateSwapchain() {
                 sf = f, swap_hdr_ = true;
                 break;
             }
-        DisplayLuminance(static_cast<HWND>(app::Window()), display_peak_, display_paper_);
+        DisplayLuminance(app::Window(), display_peak_, display_paper_);
         static bool told = false;
         if (!told || swap_hdr_) {
             told = true;
@@ -4555,6 +4589,7 @@ bool VulkanBackend::CreateSwapchain() {
                 break;
             }
     }
+#ifdef _WIN32
     {
         // the screen's refresh rate (smooth turning wants 100 Hz or more)
         MONITORINFOEXW mi{};
@@ -4566,6 +4601,7 @@ bool VulkanBackend::CreateSwapchain() {
             dm.dmDisplayFrequency > 1)
             refresh_hz_ = dm.dmDisplayFrequency;
     }
+#endif
     uint32_t images = std::max(caps.minImageCount, 2u);
     if (caps.maxImageCount) images = std::min(images, caps.maxImageCount);
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -4809,7 +4845,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     scale_ = app::RenderScale(guest_h_);
     if (!LoadVulkan() || !CreateInstance() || !PickDevice() || !CreateDevice() || !CreateFixed() || !CreateSwapchain())
         return false;
-    if (!dxc_.Load()) return false;
+    if (!dxc::Load()) return false;
     // the shaders the passes need, compiled once now: a DXC that cannot make SPIR-V fails here, not mid-game
     uint64_t h;
     if (!Compile(kBlitHlsl, "vs", "vs_5_0", h) || !Compile(kBlitHlsl, "psmain", "ps_5_0", h)) {
@@ -5575,35 +5611,23 @@ VkShaderModule VulkanBackend::Compile(const std::string& source, const char* ent
         code.resize(kept->GetBufferSize() / 4);
         std::memcpy(code.data(), kept->GetBufferPointer(), code.size() * 4);
     } else {
-        if (!dxc_.Load()) return modules_[hash] = VK_NULL_HANDLE;
-        std::wstring wentry(entry, entry + std::strlen(entry));
+        if (!dxc::Load()) return modules_[hash] = VK_NULL_HANDLE;
         // a 6.x profile (ray queries: 6.5) as it is, on Vulkan 1.2's SPIR-V; the D3D 5 ones at 6.0
         bool sm6 = profile[3] == '6';
-        std::wstring target = sm6 ? std::wstring(profile, profile + std::strlen(profile))
-                                  : std::wstring(1, wchar_t(profile[0])) + L"s_6_0";
-        std::vector<const wchar_t*> args = {L"-E", wentry.c_str(), L"-T", target.c_str(), L"-spirv", L"-HV", L"2018",
-                                            sm6 ? L"-fspv-target-env=vulkan1.2" : L"-fspv-target-env=vulkan1.1",
-                                            L"-fvk-use-dx-layout", L"-O1",
-                                            L"-fvk-b-shift", L"0", L"0", L"-fvk-t-shift", L"2", L"0",
-                                            L"-fvk-s-shift", L"6", L"0", L"-fvk-u-shift", L"10", L"0",
-                                            L"-fspv-entrypoint-name=main"};
-        if (profile[0] == 'p') args.push_back(L"-fvk-use-dx-position-w");
-        DxcBuffer buf{src.data(), src.size(), DXC_CP_UTF8};
-        ComPtr<IDxcResult> res;
-        HRESULT status = E_FAIL;
-        if (SUCCEEDED(dxc_.compiler->Compile(&buf, args.data(), UINT32(args.size()), nullptr, IID_PPV_ARGS(&res))))
-            res->GetStatus(&status);
-        ComPtr<IDxcBlob> obj;
-        if (SUCCEEDED(status)) res->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&obj), nullptr);
-        if (FAILED(status) || !obj || !obj->GetBufferSize()) {
-            ComPtr<IDxcBlobUtf8> err;
-            if (res) res->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&err), nullptr);
-            LOGE("vulkan: %s compile failed: %s", profile, err && err->GetStringLength() ? err->GetStringPointer() : "?");
+        std::string target = sm6 ? std::string(profile) : std::string(1, profile[0]) + "s_6_0";
+        std::vector<std::string> args = {"-E", entry, "-T", target, "-spirv", "-HV", "2018",
+                                         sm6 ? "-fspv-target-env=vulkan1.2" : "-fspv-target-env=vulkan1.1",
+                                         "-fvk-use-dx-layout", "-O1",
+                                         "-fvk-b-shift", "0", "0", "-fvk-t-shift", "2", "0",
+                                         "-fvk-s-shift", "6", "0", "-fvk-u-shift", "10", "0",
+                                         "-fspv-entrypoint-name=main"};
+        if (profile[0] == 'p') args.push_back("-fvk-use-dx-position-w");
+        std::string errors;
+        if (!dxc::Compile(src, args, code, errors)) {
+            LOGE("vulkan: %s compile failed: %s", profile, errors.c_str());
             LOGE("%s", src.c_str());
             return modules_[hash] = VK_NULL_HANDLE;
         }
-        code.resize(obj->GetBufferSize() / 4);
-        std::memcpy(code.data(), obj->GetBufferPointer(), code.size() * 4);
         g_shaders_compiled.fetch_add(1, std::memory_order_relaxed);
         ComPtr<ID3DBlob> keep;
         if (SUCCEEDED(D3DCreateBlob(code.size() * 4, &keep))) {
@@ -8640,7 +8664,11 @@ void VulkanBackend::RenderUi() {
     std::lock_guard lock(app::UiLock());
     app::FeedPad();
     ImGui_ImplVulkan_NewFrame();
+#ifdef _WIN32
     ImGui_ImplWin32_NewFrame();
+#else
+    ImGui_ImplSDL3_NewFrame();
+#endif
     ImGui::NewFrame();
     app::DrawHud(fps_);
     app::DrawOverlay();
@@ -8678,9 +8706,8 @@ void VulkanBackend::CountFps() {
 
 // the next swap chain image, the chain made again when the window changed size or the vsync setting changed
 bool VulkanBackend::Acquire(uint32_t& index) {
-    RECT rc;
-    GetClientRect(static_cast<HWND>(app::Window()), &rc);
-    uint32_t w = std::max<LONG>(rc.right - rc.left, 1), h = std::max<LONG>(rc.bottom - rc.top, 1);
+    uint32_t w = 1, h = 1;
+    WindowSize(w, h);
     if (!swap_ || w != bb_w_ || h != bb_h_ || swap_vsync_ != app::Get().vsync || swap_hdr_asked_ != app::Get().hdr) {
         if (!CreateSwapchain()) return false;
         if (ui_) ImGui_ImplVulkan_SetMinImageCount(2);
@@ -10766,5 +10793,11 @@ void VulkanBackend::RescaleTargets() {
 }  // namespace
 
 std::unique_ptr<Backend> CreateVulkanBackend() { return std::make_unique<VulkanBackend>(); }
+
+#ifndef _WIN32
+// off Windows Vulkan is the renderer (the Direct3D ones are d3d12.cpp's choice on Windows), with nothing to fall back to
+std::unique_ptr<Backend> CreateBackend() { return CreateVulkanBackend(); }
+std::unique_ptr<Backend> CreateFallbackBackend() { return nullptr; }
+#endif
 
 }  // namespace gpu

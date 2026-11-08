@@ -10,8 +10,14 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifdef _WIN32
 #include <windows.h>
 #include <iphlpapi.h>
+#else
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +31,7 @@
 
 #include "core/netplay.h"
 #include "app/app.h"
+#include "core/input.h"
 #include "core/log.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -228,6 +235,7 @@ void Pump(int wait_ms) {
 // gives up (the title then starts alone)
 constexpr wchar_t kWaitBox[] = L"Network play";
 std::atomic<bool> g_wait_box{false}, g_wait_over{false}, g_wait_cancel{false};
+#ifdef _WIN32
 void WaitOver() {
     g_wait_over = true;
     for (int i = 0; i < 20; i++) {
@@ -262,6 +270,27 @@ bool Waiting(const std::wstring& text, const std::wstring& more = L"") {
     }
     return true;
 }
+#else
+// off Windows no box: the log says it once, and Escape in the window gives up
+void WaitOver() { g_wait_over = true; }
+
+std::string Narrow(const std::wstring& w) {
+    std::string s;
+    for (wchar_t c : w) s += c < 0x80 ? char(c) : '?';
+    return s;
+}
+
+bool Waiting(const std::wstring& text, const std::wstring& more = L"") {
+    if (!g_wait_box.exchange(true))
+        LOGR("netplay: %s%s%s (Escape plays alone)", Narrow(text).c_str(), more.empty() ? "" : "; ", Narrow(more).c_str());
+    if (g_wait_cancel || input::KeyHeld(VK_ESCAPE)) {
+        LOGR("netplay: waiting given up; playing alone");
+        WaitOver();
+        return false;
+    }
+    return true;
+}
+#endif
 
 void StartWsa() {
     static const bool once = [] {
@@ -285,6 +314,20 @@ struct Adapter {
 };
 std::vector<Adapter> Adapters() {
     std::vector<Adapter> out;
+#ifndef _WIN32
+    ifaddrs* list = nullptr;
+    if (getifaddrs(&list) != 0) return out;
+    for (ifaddrs* a = list; a; a = a->ifa_next) {
+        if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET || !(a->ifa_flags & IFF_UP) || (a->ifa_flags & IFF_LOOPBACK))
+            continue;
+        in_addr ip = reinterpret_cast<sockaddr_in*>(a->ifa_addr)->sin_addr;
+        if ((ntohl(ip.s_addr) >> 16) == 0xA9FE) continue;  // 169.254: no address was given
+        uint32_t mask = a->ifa_netmask ? reinterpret_cast<sockaddr_in*>(a->ifa_netmask)->sin_addr.s_addr : 0;
+        // getifaddrs does not tell the default route's interface: a broadcast capable one stands in for "has a gateway"
+        out.push_back({ip, mask, (a->ifa_flags & IFF_BROADCAST) != 0});
+    }
+    freeifaddrs(list);
+#else
     std::vector<uint8_t> buf;
     ULONG size = 16 * 1024, r = ERROR_BUFFER_OVERFLOW;
     const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER |
@@ -306,6 +349,7 @@ std::vector<Adapter> Adapters() {
             out.push_back({ip, mask, a->FirstGatewayAddress != nullptr});
         }
     }
+#endif
     std::stable_sort(out.begin(), out.end(), [](const Adapter& x, const Adapter& y) { return x.gateway > y.gateway; });
     return out;
 }
@@ -322,15 +366,24 @@ std::wstring HostAddressText() {
 
 // a search's answer (kFind), while the host's lobby waits
 void AnswerFind(const sockaddr_in& to, int joined) {
+#ifdef _WIN32
     static const uint32_t session = GetTickCount() ^ (GetCurrentProcessId() << 16);
+#else
+    static const uint32_t session = uint32_t(std::chrono::steady_clock::now().time_since_epoch().count()) ^ (uint32_t(getpid()) << 16);
+#endif
     HerePacket hp{};
     hp.h = Head(kHere);
     hp.session = session;
     hp.port = ntohs(g_bound_port);
     hp.joined = uint8_t(joined);
+#ifdef _WIN32
     char name[MAX_COMPUTERNAME_LENGTH + 1] = {};
     DWORD n = sizeof name;
     if (!GetComputerNameA(name, &n)) std::strcpy(name, "Host");
+#else
+    char name[256] = {};
+    if (gethostname(name, sizeof name - 1) != 0 || !name[0]) std::strcpy(name, "Host");
+#endif
     std::strncpy(hp.name, name, sizeof hp.name - 1);
     SendTo(to, &hp, sizeof hp);
     static int said = 0;
@@ -457,8 +510,10 @@ bool Start() {
         g_now[p].connected = true;
     }
     g_active = true;
+#ifdef _WIN32
     if (HWND w = static_cast<HWND>(app::Window()))
         SetWindowTextW(w, (std::wstring(app::kGame.title) + L" - player " + std::to_wstring(g_me + 1)).c_str());
+#endif
     LOGR("netplay: started as player %d of %d, %d frames of input delay", g_me + 1, g_players, g_delay);
     return true;
 }
