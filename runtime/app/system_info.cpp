@@ -114,7 +114,11 @@ void LogSystem() {
     char date[32] = {};
     std::strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
     LOGR("%ls (%s), %s", kGame.title, IMAGE_XBE, date);
+#ifdef _WIN32
     LOGR("Path: %ls", ExeDir().c_str());
+#else
+    LOGR("Path: %s", ExeDir().c_str());
+#endif
     LOGR("OS: %s", OsVersion().c_str());
 #ifdef _WIN32
     SYSTEM_INFO si{};
