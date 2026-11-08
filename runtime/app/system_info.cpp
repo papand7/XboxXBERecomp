@@ -31,7 +31,9 @@ extern char** environ;
 #include "core/log.h"
 #include "image_symbols.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "advapi32.lib")
+#endif
 
 namespace app {
 

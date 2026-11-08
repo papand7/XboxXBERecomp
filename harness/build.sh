@@ -4,7 +4,8 @@
 #   -n exe name (default: the generated folder's name)
 #   -x regex of sources to leave out (repeatable)   -e extra source file (repeatable)
 #   -G folder for the generated objects (default <out>/gen), shared between builds of the same generated code
-# env: CXX (clang++), JOBS (nproc). Sources see XBE_HEADLESS defined (no window, settings file or ImGui).
+# env: CXX (clang++), JOBS (nproc), CXXFLAGS added to the host sources' flags (toml++'s include folder where it is not
+# installed). Sources see XBE_HEADLESS defined (no window, settings file or ImGui).
 # Leaves out the window, SDL input, XAudio2, SDL audio and D3D12 parts of the runtime and the sources of the repo's other images
 # (src/<name> for each other folder beside the generated one); the harness supplies their stand ins.
 set -e
@@ -22,7 +23,7 @@ EXE=${EXE:-$(basename "$GEN")}; GEN_OBJ=${GEN_OBJ:-$OUT/gen}; mkdir -p "$GEN_OBJ
 H=$(dirname "$(realpath "$0")"); RT=$REPO/sdk/runtime
 CXX=${CXX:-clang++}; JOBS=${JOBS:-$(nproc)}
 BASE="-std=c++20 -march=x86-64-v2 -fno-strict-aliasing"
-HOST="$BASE -O1 -g -I$REPO/src -I$RT -I$GEN -I$H -I$RT/compat -DXBE_HEADLESS=1 -DXBE_RAW_VERTICES=${RAW:-0} -DXBE_RENDER_THREAD=${RT_THREAD:-0}"
+HOST="$BASE -O1 -g -I$REPO/src -I$RT -I$GEN -I$H -I$RT/compat -DXBE_HEADLESS=1 -DXBE_RAW_VERTICES=${RAW:-0} -DXBE_RENDER_THREAD=${RT_THREAD:-0} ${CXXFLAGS:-}"
 
 # generated code, an object rebuilt only when its partition is newer
 export CXX BASE RT GEN GEN_OBJ GEN_OPT
@@ -31,7 +32,7 @@ ls "$GEN"/x86_recomp.*.cpp "$GEN"/x86_func_mapping.cpp | xargs -P "$JOBS" -I{} s
     $CXX $BASE ${GEN_OPT:--O1} -g0 -w -I"$RT" -I"$GEN" -c {} -o "$o.tmp" && mv "$o.tmp" "$o"'
 
 others=$(ls "$GEN/.." | grep -vx "$(basename "$GEN")" | paste -sd'|' -)
-SRC=$(ls "$RT"/*/*.cpp | grep -Ev "/runtime/app/|/core/input.cpp|/core/wheel.cpp|/gpu/d3d12.cpp|/gpu/d3d11.cpp|/gpu/d3d_common.cpp|/gpu/vulkan.cpp|/gpu/dxc.cpp|/gpu/style.cpp|/gpu/texture_pack.cpp|/audio/xaudio2.cpp|/audio/sdl.cpp")
+SRC=$(ls "$RT"/*/*.cpp | grep -Ev "/runtime/app/|/core/input.cpp|/core/wheel.cpp|/gpu/d3d12.cpp|/gpu/d3d11.cpp|/gpu/d3d_common.cpp|/gpu/vulkan.cpp|/gpu/dxc.cpp|/gpu/smaa.cpp|/gpu/style.cpp|/gpu/texture_pack.cpp|/audio/xaudio2.cpp|/audio/sdl.cpp")
 SRC="$SRC $(ls "$REPO"/src/*/*.cpp | grep -Ev "/src/(${others:-^$})/" || true)"
 SRC="$SRC $(ls "$H"/*.cpp) ${EXTRA[*]}"
 for x in "${EXCL[@]}"; do SRC=$(echo $SRC | tr ' ' '\n' | grep -Ev -- "$x"); done

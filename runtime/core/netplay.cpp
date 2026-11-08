@@ -35,8 +35,10 @@
 #include "core/log.h"
 #include "core/vk_codes.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#endif
 
 namespace netplay {
 namespace {
