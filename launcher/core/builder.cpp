@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -105,6 +106,68 @@ bool OnPath(const std::string& path, char sep, const std::string& program) {
     return false;
 }
 
+// a download's speed, from the bytes it had when it began (a resumed one) over the time since
+class Speed {
+public:
+    std::string Of(uint64_t done) {
+        auto now = std::chrono::steady_clock::now();
+        if (!started_) started_ = true, start_ = now, first_ = done;
+        double seconds = std::chrono::duration<double>(now - start_).count();
+        if (seconds < 1 || done <= first_) return {};
+        char s[32];
+        std::snprintf(s, sizeof(s), "%.1f MB/s", double(done - first_) / seconds / double(1 << 20));
+        return s;
+    }
+
+private:
+    bool started_ = false;
+    std::chrono::steady_clock::time_point start_;
+    uint64_t first_ = 0;
+};
+
+// "312 MB of 845 MB, 5.2 MB/s" ("312 MB, 5.2 MB/s" when the size is not known)
+std::string Amount(uint64_t done, uint64_t total, Speed& speed) {
+    std::string s = Megabytes(done) + (total ? " of " + Megabytes(total) : std::string()), rate = speed.Of(done);
+    return rate.empty() ? s : s + ", " + rate;
+}
+
+// a number with its unit as git prints it ("12.34 MiB", "512.00 KiB"), in bytes
+double GitBytes(const std::string& text, size_t at) {
+    double v = std::atof(text.c_str() + at);
+    size_t unit = text.find_first_of("KMG", at);
+    if (unit == std::string::npos || unit > at + 16) return v;
+    return v * (text[unit] == 'G' ? double(1 << 30) : text[unit] == 'M' ? double(1 << 20) : 1024.0);
+}
+
+// git's --progress lines: "Receiving objects:  45% (1234/2741), 12.34 MiB | 2.10 MiB/s", "Resolving deltas:  80%
+// (900/1125)", "Updating files: 100% (3000/3000), done." as a status detail and the phase's fraction; false for others
+bool GitProgress(const std::string& line, std::string& detail, double& fraction) {
+    size_t colon = line.find(':'), pct = line.find('%');
+    if (colon == std::string::npos || pct == std::string::npos || pct < colon) return false;
+    std::string phase = line.substr(0, colon);
+    if (phase.rfind("remote", 0) == 0) {  // "remote: Compressing objects:  50% (...)"
+        size_t second = line.find(':', colon + 1);
+        if (second == std::string::npos || second > pct) return false;
+        phase = "GitHub: " + line.substr(colon + 2, second - colon - 2);
+    }
+    fraction = std::atof(line.c_str() + line.find_last_of(' ', pct) + 1) / 100.0;
+    detail = phase;
+    size_t open = line.find('(', pct), slash = line.find('/', pct), close = line.find(')', pct);
+    if (open != std::string::npos && slash != std::string::npos && close != std::string::npos && open < slash && slash < close)
+        detail += " " + line.substr(open + 1, slash - open - 1) + " of " + line.substr(slash + 1, close - slash - 1);
+    size_t amount = close == std::string::npos ? std::string::npos : line.find(", ", close);
+    if (amount != std::string::npos && line.find("iB", amount) != std::string::npos) {
+        detail += ", " + Megabytes(uint64_t(GitBytes(line, amount + 2)));
+        size_t bar = line.find(" | ", amount);
+        if (bar != std::string::npos) {
+            char s[32];
+            std::snprintf(s, sizeof(s), "%.1f MB/s", GitBytes(line, bar + 3) / double(1 << 20));
+            detail += std::string(", ") + s;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 std::string Megabytes(uint64_t bytes) {
@@ -195,7 +258,12 @@ bool Builder::LoadToolchain(Plan& plan, std::string& error) {
     Say("Looking up the build tools");
     std::string text;
     fs::path saved = root_ / "toolchain.json";
-    if (FetchText(http_, game_.toolchain, text, error)) {
+    // NF_TOOLCHAIN: a toolchain.json on disk in place of the published one (to test a new one before it is published)
+    std::string local = platform_.GetEnv("NF_TOOLCHAIN");
+    if (!local.empty() && ReadAll(PathOf(local), text)) {
+        Log("toolchain.json from " + local);
+        std::ofstream(saved, std::ios::binary) << text;
+    } else if (FetchText(http_, game_.toolchain, text, error)) {
         std::ofstream(saved, std::ios::binary) << text;
     } else if (ReadAll(saved, text)) {
         Log("toolchain.json could not be fetched (" + error + "), the last one is used");
@@ -236,10 +304,11 @@ bool Builder::InstallTool(const Tool& tool, std::string& error) {
     fs::create_directories(downloads, ec);
     uint64_t total = tool.Bytes(), before = 0;
     std::string step = "Downloading " + tool.title;
+    Speed speed;
     auto fetch = [&](const FileRef& f) {
         Log("download " + f.url);
         bool ok = Download(http_, f.url, downloads / f.name, f.sha256, f.size, [&](uint64_t done, uint64_t) {
-                Say(step, Megabytes(before + done) + " of " + Megabytes(total), total ? double(before + done) / double(total) : -1);
+                Say(step, Amount(before + done, total, speed), total ? double(before + done) / double(total) : -1);
             }, &cancel, error);
         before += f.size;
         if (!ok) error = "Could not download " + f.name + ": " + error;
@@ -303,13 +372,9 @@ int Builder::Git(const std::vector<std::string>& args, std::string* out, std::st
     int code = platform_.Run(cmd, root_, BuildEnv(plan_), [&](const std::string& line) {
             if (out) *out += line + "\n";
             Log("git: " + line);
-            // "Receiving objects:  45% (...)"
-            size_t pct = line.find('%');
-            if (pct != std::string::npos && pct >= 2) {
-                size_t at = line.find_last_of(' ', pct);
-                double v = std::atof(line.c_str() + (at == std::string::npos ? 0 : at + 1));
-                Say("Downloading the game's source", line.substr(0, line.find(':')), v / 100.0);
-            }
+            std::string detail;
+            double fraction = -1;
+            if (GitProgress(line, detail, fraction)) Say(git_step_, detail, fraction);
         }, &cancel);
     if (code != 0) error = "git " + (args.empty() ? std::string() : args[0]) + " failed (" + std::to_string(code) + "), see launcher.log";
     return code;
@@ -410,13 +475,18 @@ bool Builder::CheckSystem(std::string& error) {
 }
 
 bool Builder::GetSource(std::string& error) {
-    Say("Downloading the game's source");
     std::error_code ec;
     fs::path src = root_ / "source";
     // a release launcher builds its own release (its tag), a dev launcher the branch's head
     bool release = IsReleaseVersion(game_.version);
     std::string ref = release ? game_.version : game_.branch;
+    // the step's name: what the source comes from (the launcher's own copy unpacks in moments)
+    auto step = [&](const std::string& s) {
+        git_step_ = s;
+        Say(s);
+    };
     if (fs::exists(src / ".git", ec)) {
+        step("Updating the game's source");
         if (release) {
             std::string tag = "refs/tags/" + ref;
             if (Git({"-C", U8(src), "fetch", "--progress", "--force", "origin", tag + ":" + tag}, nullptr, error) != 0)
@@ -436,17 +506,37 @@ bool Builder::GetSource(std::string& error) {
         fs::path shipped = ShippedBundle(RepoName());
         if (!shipped.empty()) {
             // the source the launcher carries: nothing to download
+            step("Unpacking the game's source");
             Log("the game's source from the launcher (" + U8(shipped) + ")");
             if (!CloneBundle(shipped, src, ref, error)) return false;
-        } else if (Git({"clone", "--progress", "--branch", ref, game_.repo, U8(src)}, nullptr, error) != 0 &&
-                   !SourceFromMirror(src, ref, error)) {
-            return false;
+        } else {
+            step("Downloading the game's source");
+            if (Git({"clone", "--progress", "--branch", ref, game_.repo, U8(src)}, nullptr, error) != 0 &&
+                !SourceFromMirror(src, ref, error))
+                return false;
         }
     }
     fs::path shipped_sdk = ShippedBundle("XboxXBERecomp");
-    if (!shipped_sdk.empty() && SubmoduleFromBundle(src, shipped_sdk, error)) return true;
+    if (!shipped_sdk.empty()) {
+        step("Unpacking the game's runtime");
+        if (SubmoduleFromBundle(src, shipped_sdk, error)) return true;
+    }
+    step("Downloading the game's runtime");
     if (Git({"-C", U8(src), "submodule", "update", "--init", "--recursive", "--progress"}, nullptr, error) == 0) return true;
     return SubmoduleFromMirror(src, error);
+}
+
+// a git bundle from the mirror into path, its progress shown under the current step
+bool Builder::MirrorBundle(const std::string& name, const fs::path& path, std::string& error) {
+    std::error_code ec;
+    fs::remove(path, ec);
+    Speed speed;
+    bool sized = false;  // the mirror may not say the size: total is then what came so far
+    return Download(http_, "https://mirror.dankelsoft.dk/source/" + name + ".bundle", path, "", 0,
+                    [&](uint64_t done, uint64_t total) {
+                        sized = sized || total > done;
+                        Say(git_step_, Amount(done, sized ? total : 0, speed), sized && total ? double(done) / double(total) : -1);
+                    }, &cancel, error);
 }
 
 // the repository's name (its URL's last part, without .git)
@@ -487,7 +577,7 @@ bool Builder::SubmoduleFromBundle(const fs::path& src, const fs::path& bundle, s
     fs::path sdk = src / "sdk";
     std::error_code ec;
     fs::remove_all(sdk, ec);
-    if (Git({"clone", "-q", U8(bundle), U8(sdk)}, nullptr, e) != 0 || Git({"-C", U8(sdk), "checkout", "-q", commit}, nullptr, e) != 0) {
+    if (Git({"clone", "--progress", U8(bundle), U8(sdk)}, nullptr, e) != 0 || Git({"-C", U8(sdk), "checkout", "-q", commit}, nullptr, e) != 0) {
         Log("the runtime's bundle (" + U8(bundle) + "): " + e);
         fs::remove_all(sdk, ec);
         return false;
@@ -505,11 +595,11 @@ bool Builder::SourceFromMirror(const fs::path& src, const std::string& ref, std:
     if (name.size() > 4 && name.compare(name.size() - 4, 4, ".git") == 0) name.resize(name.size() - 4);
     fs::path bundle = root_ / "downloads" / (name + ".bundle");
     std::error_code ec;
-    fs::remove(bundle, ec);
     Log("GitHub could not be reached (" + error + "): the game's source from the mirror");
-    Say("Downloading the game's source (mirror)");
+    git_step_ = "Downloading the game's source (mirror)";
+    Say(git_step_);
     std::string e;
-    if (!Download(http_, "https://mirror.dankelsoft.dk/source/" + name + ".bundle", bundle, "", 0, nullptr, &cancel, e)) {
+    if (!MirrorBundle(name, bundle, e)) {
         error += "; the mirror too: " + e;
         return false;
     }
@@ -535,15 +625,16 @@ bool Builder::SubmoduleFromMirror(const fs::path& src, std::string& error) {
     if (commit.size() != 40) return false;
     fs::path bundle = root_ / "downloads" / "XboxXBERecomp.bundle";
     std::error_code ec;
-    fs::remove(bundle, ec);
     Log("the runtime from the mirror (" + error + ")");
-    if (!Download(http_, "https://mirror.dankelsoft.dk/source/XboxXBERecomp.bundle", bundle, "", 0, nullptr, &cancel, e)) {
+    git_step_ = "Downloading the game's runtime (mirror)";
+    Say(git_step_);
+    if (!MirrorBundle("XboxXBERecomp", bundle, e)) {
         error += "; the mirror too: " + e;
         return false;
     }
     fs::path sdk = src / "sdk";
     fs::remove_all(sdk, ec);
-    if (Git({"clone", "-q", U8(bundle), U8(sdk)}, nullptr, e) != 0 || Git({"-C", U8(sdk), "checkout", "-q", commit}, nullptr, e) != 0) {
+    if (Git({"clone", "--progress", U8(bundle), U8(sdk)}, nullptr, e) != 0 || Git({"-C", U8(sdk), "checkout", "-q", commit}, nullptr, e) != 0) {
         error += "; the mirror's runtime: " + e;
         return false;
     }
@@ -740,6 +831,7 @@ bool Builder::UpdateAvailable(bool& available, std::string& error) {
     std::error_code ec;
     if (!fs::exists(src / ".git", ec)) return true;
     std::string head, remote;
+    git_step_ = "Checking for an update";
     if (Git({"-C", U8(src), "fetch", "origin", game_.branch}, nullptr, error) != 0) return false;
     if (Git({"-C", U8(src), "rev-parse", "HEAD"}, &head, error) != 0) return false;
     if (Git({"-C", U8(src), "rev-parse", "origin/" + game_.branch}, &remote, error) != 0) return false;

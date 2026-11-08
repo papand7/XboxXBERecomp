@@ -96,7 +96,9 @@ public:
 private:
     void Remember(const std::string& key, const std::string& value);  // an entry of launcher.json, the others kept
     void Say(const std::string& step, const std::string& detail = {}, double fraction = -1);
+    // git, its --progress lines shown as git_step_'s detail ("Receiving objects 120 of 2741, 12 MB, 2.1 MB/s")
     int Git(const std::vector<std::string>& args, std::string* out, std::string& error);
+    bool MirrorBundle(const std::string& name, const std::filesystem::path& path, std::string& error);
     std::filesystem::path ToolPath(const std::string& id) const { return root_ / "tools" / id; }
 
     GameConfig game_;
@@ -105,6 +107,7 @@ private:
     Platform& platform_;
     Plan plan_;
     std::map<std::string, std::string> system_tools_;  // a tool id: the system's version used in its place
+    std::string git_step_ = "Downloading the game's source";  // the status step git's progress goes under
     std::mutex log_lock_;
 };
 
