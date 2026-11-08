@@ -178,6 +178,11 @@ std::vector<const char*> VulkanInstanceExtensions();  // the instance extensions
 bool CreateVulkanSurface(void* instance, void* surface);  // a VkInstance, a VkSurfaceKHR* to fill; false logged
 void* VulkanGetInstanceProcAddr();  // the loader SDL opened for the window: a PFN_vkGetInstanceProcAddr
 void WindowPixels(uint32_t& width, uint32_t& height);  // the window's drawable size in pixels (GetClientRect's)
+// Android: the app is in the background, its window's surface gone (nothing is presented), and a count of the
+// surfaces the window has had (a new one after each return: the renderer makes its Vulkan surface again); elsewhere
+// false and 0
+bool Backgrounded();
+uint32_t SurfaceGeneration();
 std::vector<Mode> DisplayModes();  // the monitor setting's display's fullscreen sizes, widest first, each once
 std::string Utf8(const wchar_t* w);  // a wide string (kGame's, UTF-32 here) as UTF-8
 // a message box over the game window (SDL's); yes_no: Yes and No buttons, true for Yes, else OK and true

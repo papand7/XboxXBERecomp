@@ -17,6 +17,12 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#if defined(__ANDROID__) && __ANDROID_API__ < 30
+// bionic declares memfd_create from API 30; the kernel has had it far longer
+static int memfd_create(const char* name, unsigned flags) { return int(syscall(__NR_memfd_create, name, flags)); }
+#endif
 #endif
 
 namespace mem {

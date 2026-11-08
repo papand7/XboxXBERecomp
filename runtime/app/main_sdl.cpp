@@ -92,6 +92,19 @@ SDL_Window* g_window = nullptr;
 Uint32 g_event_base = 0;  // SDL_RegisterEvents: kApplyDisplay, kOpenWindow after it
 enum : Sint32 { kApplyDisplay, kOpenWindow };
 std::atomic<bool> g_active{true};  // the game window has the keyboard
+std::atomic<bool> g_background{false};      // Android: the app is in the background
+std::atomic<uint32_t> g_surface_generation{0};
+
+// Android's lifecycle, as SDL reports it (an event watch: at once, from SDL's Java thread, as the surface goes)
+bool LifecycleWatch(void*, SDL_Event* e) {
+    if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+        g_background = true;
+    } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+        g_surface_generation++;
+        g_background = false;
+    }
+    return true;
+}
 bool g_apply_posted = false;       // window thread: a display apply waits in the queue
 
 // OpenGameWindow's wait for the window thread
@@ -401,9 +414,13 @@ void OpenGameWindow(bool apply) {
 }
 
 bool Paused() {
+    if (g_background && !netplay::Active()) return true;
     return !netplay::Active() && Get().pause_unfocused && !g_active && g_window &&
            !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_HIDDEN);
 }
+
+bool Backgrounded() { return g_background; }
+uint32_t SurfaceGeneration() { return g_surface_generation; }
 
 static void (*g_mid_frame)() = nullptr;
 void SetMidFrame(void (*fn)()) { g_mid_frame = fn; }
@@ -570,7 +587,7 @@ void AndroidRelaunch(const char* exe) {
 extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** argv) {
     for (int i = 1; i < argc; i++)
         if (!std::strncmp(argv[i], "--env=", 6))
-            if (const char* eq = std::strchr(argv[i] + 6, '=')) setenv(std::string(argv[i] + 6, eq).c_str(), eq + 1, 1);
+            if (const char* eq = std::strchr(argv[i] + 6, '=')) setenv(std::string(argv[i] + 6, size_t(eq - (argv[i] + 6))).c_str(), eq + 1, 1);
     // landscape, the fingers not also the mouse (app/touch.cpp reads them), the back gesture the game's pause
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
@@ -605,6 +622,7 @@ int main(int argc, char** argv) {
         logx::Flush();
         return 1;
     }
+    SDL_AddEventWatch(app::LifecycleWatch, nullptr);
     app::Load();
     if (app::kGame.init) app::kGame.init();
     if (relaunched && !logx::kVerbose) LOGR("Relaunched: %s", IMAGE_XBE);

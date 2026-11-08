@@ -3710,6 +3710,7 @@ private:
     uint32_t family_ = 0;
     VkQueue queue_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    uint32_t surface_generation_ = 0;  // app::SurfaceGeneration's when surface_ was made
     VkSwapchainKHR swap_ = VK_NULL_HANDLE;
     VkFormat swap_fmt_ = kBgra;
     // HDR (Settings::hdr): an HDR10 swap chain (PQ, BT.2020) where the screen offers one (Windows' HDR on); the frame
@@ -4546,6 +4547,10 @@ bool VulkanBackend::CreateSwapchain() {
     uint32_t w = 1, h = 1;
     WindowSize(w, h);
     if (caps.currentExtent.width != 0xFFFFFFFFu) w = caps.currentExtent.width, h = caps.currentExtent.height;
+    // a phone held across reports a 90 degree transform with the extent as the window is (landscape): the chain is
+    // made so with no transform, and the compositor turns it (a pre-rotated chain would save that pass)
+    VkSurfaceTransformFlagBitsKHR transform = caps.currentTransform;
+    if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     if (!w || !h) return false;  // minimised
     uint32_t fn = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(pd_, surface_, &fn, nullptr);
@@ -4615,8 +4620,15 @@ bool VulkanBackend::CreateSwapchain() {
     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ci.preTransform = caps.currentTransform;
+    ci.preTransform = transform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR))
+        for (VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR, VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+                                               VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
+            if (caps.supportedCompositeAlpha & a) {
+                ci.compositeAlpha = a;
+                break;
+            }
     ci.presentMode = present_mode_;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = swap_;
@@ -8710,6 +8722,18 @@ void VulkanBackend::CountFps() {
 
 // the next swap chain image, the chain made again when the window changed size or the vsync setting changed
 bool VulkanBackend::Acquire(uint32_t& index) {
+#ifndef _WIN32
+    // Android: nothing to show on in the background; back, the window has a new surface to make the chain on
+    if (app::Backgrounded()) return false;
+    if (uint32_t g = app::SurfaceGeneration(); g != surface_generation_) {
+        surface_generation_ = g;
+        if (swap_) DestroySwapchain();
+        if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
+        surface_ = VK_NULL_HANDLE;
+        if (!app::CreateVulkanSurface(instance_, &surface_)) return false;
+        LOGR("vulkan: the window's surface made again");
+    }
+#endif
     uint32_t w = 1, h = 1;
     WindowSize(w, h);
     if (!swap_ || w != bb_w_ || h != bb_h_ || swap_vsync_ != app::Get().vsync || swap_hdr_asked_ != app::Get().hdr) {
@@ -8721,6 +8745,7 @@ bool VulkanBackend::Acquire(uint32_t& index) {
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) return true;
         if (r != VK_ERROR_OUT_OF_DATE_KHR) {
             LOG_FIRST(8, "vulkan: vkAcquireNextImageKHR failed: %s", VkResultName(r));
+            if (r == VK_ERROR_SURFACE_LOST_KHR) surface_generation_--;  // made again at the next frame
             return false;
         }
         if (!CreateSwapchain()) return false;
