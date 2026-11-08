@@ -18,7 +18,11 @@
 #endif
 #include <windows.h>
 #else
+#include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
+
+#include <cerrno>
 #endif
 #include "xbe/xbe.h"
 
@@ -233,7 +237,23 @@ void Relaunch(const char* exe) {
     std::string path = std::string(self, n > 0 ? size_t(n) : 0);
     path = path.substr(0, path.find_last_of('/') + 1) + exe;
     setenv("XBE_RELAUNCHED", "1", 1);  // no boot splash again (app/main_sdl.cpp); --instance stays as XBE_INSTANCE
+    // the new image binds the same ports, and nothing of this one (the window's display connection, sound, the GPU)
+    // may stay open in it: every descriptor but the standard ones closes on exec
+    xnet::CloseSockets();
+    if (DIR* d = opendir("/proc/self/fd")) {
+        while (dirent* e = readdir(d)) {
+            int fd = std::atoi(e->d_name);
+            if (fd > 2 && fd != dirfd(d)) fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+        }
+        closedir(d);
+    }
     execl(path.c_str(), path.c_str(), nullptr);
+    LOGE("relaunch: cannot start %s (%s)", path.c_str(), std::strerror(errno));
+#ifndef XBE_HEADLESS
+    std::string text = "The game could not start " + std::string(exe) + ": it is not beside this program (" + path +
+                       "), or cannot be run. Restore it or build again.";
+    app::MessageBox(std::wstring(text.begin(), text.end()).c_str(), true);
+#endif
     std::_Exit(0);
 #endif
 }
