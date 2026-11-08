@@ -13,7 +13,7 @@ set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(zydis GIT_REPOSITORY https://github.com/zyantific/zydis.git GIT_TAG v4.1.1 GIT_SHALLOW TRUE)
 FetchContent_Declare(tomlplusplus GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git GIT_TAG v3.4.0 GIT_SHALLOW TRUE)
 FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.91.0 GIT_SHALLOW TRUE)
-# SDL3 for controllers, static so it links into the exe
+# SDL3 for controllers (on Linux also the window and sound), static so it links into the exe
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
@@ -22,13 +22,31 @@ set(SDL_GPU OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3)
-# the Vulkan renderer: Khronos' headers (vulkan-1.dll is loaded at run time, nothing is linked) and DXC, which compiles
-# the HLSL shaders to SPIR-V (its dxcompiler.dll goes beside each exe)
+# the Vulkan renderer: Khronos' headers (vulkan-1.dll / libvulkan.so.1 is loaded at run time, nothing is linked) and
+# DXC, which compiles the HLSL shaders to SPIR-V (its dxcompiler.dll / libdxcompiler.so goes beside each exe, loaded at
+# run time too)
 FetchContent_Declare(VulkanHeaders URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.296.tar.gz
     URL_HASH SHA256=e204e0b3c19f622d197df945737f5db913d6621830999b8578d34e80a7c90585)
-FetchContent_Declare(dxc URL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2407/dxc_2024_07_31.zip
-    URL_HASH SHA256=e2627f004f0f9424d8c71ea1314d04f38c5a5096884ae9217f1f18bd320267b5)
+if(WIN32)
+    FetchContent_Declare(dxc URL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2407/dxc_2024_07_31.zip
+        URL_HASH SHA256=e2627f004f0f9424d8c71ea1314d04f38c5a5096884ae9217f1f18bd320267b5)
+else()
+    FetchContent_Declare(dxc URL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2407/linux_dxc_2024_07_31.x86_64.tar.gz
+        URL_HASH SHA256=b58725ac191df0686994fb9d54d27ee8dd3f180b023d562733112a499ea1195c)
+endif()
 FetchContent_MakeAvailable(VulkanHeaders dxc)
+if(WIN32)
+    set(XBE_DXC_INCLUDE ${dxc_SOURCE_DIR}/inc)
+    set(XBE_DXC_LIBS ${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll)
+else()
+    set(XBE_DXC_INCLUDE ${dxc_SOURCE_DIR}/include/dxc)
+    set(XBE_DXC_LIBS ${dxc_SOURCE_DIR}/lib/libdxcompiler.so ${dxc_SOURCE_DIR}/lib/libdxil.so)
+    # stb_image / stb_image_write (public domain or MIT): pictures off Windows (app/image.cpp), WIC's work on Windows
+    FetchContent_Declare(stb URL https://github.com/nothings/stb/archive/4e9b368bfc071e97206ea5c6adba68dd0cbf8897.tar.gz
+        URL_HASH SHA256=e60706ab084e0cae35ee7282deb4a7f283e4a28be1896d097437205da01a0683)
+    FetchContent_MakeAvailable(stb)
+    set_source_files_properties(${XBE_SDK_DIR}/runtime/app/image.cpp PROPERTIES INCLUDE_DIRECTORIES "${stb_SOURCE_DIR}")
+endif()
 # SMAA (MIT, Jimenez et al.): the Vulkan renderer's scene antialiasing; its shader source as a string, its lookup
 # textures' bytes from its headers (gpu/smaa.cpp)
 FetchContent_Declare(smaa URL https://github.com/iryoku/smaa/archive/71c806a838bdd7d517df19192a20f0c61b3ca29d.tar.gz
@@ -176,24 +194,38 @@ set(XBE_IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+if(WIN32)
+    list(APPEND XBE_IMGUI_SOURCES ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp)
+else()
+    # off Windows the window is SDL's (app/main_sdl.cpp); imgui 1.91.0's backend still names SDL_TRUE / SDL_FALSE
+    list(APPEND XBE_IMGUI_SOURCES ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp)
+    set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp PROPERTIES
+        COMPILE_DEFINITIONS SDL_ENABLE_OLD_NAMES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
+endif()
 
 # Vulkan's entry points are loaded at run time (gpu/vulkan.cpp hands ImGui its loader)
 set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp PROPERTIES
     COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_NO_PROTOTYPES INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include")
 set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/vulkan.cpp PROPERTIES
-    INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include;${dxc_SOURCE_DIR}/inc")
+    INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include")
+set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/dxc.cpp PROPERTIES INCLUDE_DIRECTORIES "${XBE_DXC_INCLUDE}")
 
 # the settings window reads controllers from the runtime's SDL input (app::FeedPad), not XInput
 set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp PROPERTIES
     COMPILE_DEFINITIONS IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
 
 file(GLOB XBE_RUNTIME_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/runtime/*/*.cpp)
-# SDL's headers go to the input code alone (it is linked LINK_ONLY), so the generated sources' compile line stays the same
-set_source_files_properties(${XBE_SDK_DIR}/runtime/core/input.cpp PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
+if(NOT WIN32)
+    # Windows only: the Direct3D renderers, XAudio2, the DirectInput wheel (input.cpp stubs it) and the Win32 window
+    list(FILTER XBE_RUNTIME_SOURCES EXCLUDE REGEX "/runtime/(gpu/d3d12|gpu/d3d11|audio/xaudio2|core/wheel|app/main)\\.cpp$")
+endif()
+# SDL's headers go to the files that use SDL alone (it is linked LINK_ONLY), so the generated sources' compile line stays
+# the same
+foreach(f core/input.cpp app/main_sdl.cpp audio/sdl.cpp)
+    set_source_files_properties(${XBE_SDK_DIR}/runtime/${f} PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
+endforeach()
 set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/upscale_fsr.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include;${XBE_FSR2_API};${XBE_FSR2_API}/vk"
     COMPILE_DEFINITIONS "_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS")
@@ -230,16 +262,31 @@ function(add_xbe_image target xbe config partitions game_dir)
     file(SHA1 ${xbe_file} xbe_sha1)
     set(XBE_HASH ${CMAKE_CURRENT_BINARY_DIR}/${target}_xbe.cpp)
     file(CONFIGURE OUTPUT ${XBE_HASH} CONTENT "extern const char kImageSha1[] = \"${xbe_sha1}\";\n")
-    add_executable(${target} WIN32 ${XBE_RUNTIME_SOURCES} ${XBE_HOST_SOURCES} ${GAME_SOURCES} ${GEN_SOURCES} ${XBE_IMGUI_SOURCES} ${XBE_HASH})
+    add_executable(${target} WIN32 ${GAME_SOURCES} ${GEN_SOURCES} ${XBE_HASH})
     add_dependencies(${target} recompile_${target})
-    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${XBE_SDK_DIR}/runtime ${GEN})
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${GEN})
+    xbe_runtime_target(${target})
+endfunction()
+
+# The runtime, ImGui and XBE_HOST_SOURCES added to a game executable (add_xbe_image's, or the Linux CI's around a stub
+# image in tests/linux), with what it links and the files that go beside it
+function(xbe_runtime_target target)
+    target_sources(${target} PRIVATE ${XBE_RUNTIME_SOURCES} ${XBE_HOST_SOURCES} ${XBE_IMGUI_SOURCES})
+    target_include_directories(${target} PRIVATE ${XBE_SDK_DIR}/runtime)
     target_include_directories(${target} SYSTEM PRIVATE ${imgui_SOURCE_DIR})
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> xbe_fsr2 d3d12 d3d11 dinput8 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
+    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> xbe_fsr2)
+    if(WIN32)
+        target_link_libraries(${target} PRIVATE d3d12 d3d11 dinput8 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
+    else()
+        # the few Win32 and Winsock names portable sources use, and the D3D ones the shared renderer code names
+        target_include_directories(${target} PRIVATE ${XBE_SDK_DIR}/runtime/compat)
+        target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS} pthread)
+    endif()
     # the Vulkan renderer's shader compiler, beside the exe
     add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll $<TARGET_FILE_DIR:${target}>)
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_DXC_LIBS} $<TARGET_FILE_DIR:${target}>)
     # DLSS: NGX's loader linked in, NVIDIA's runtime beside the exe (the launcher copies the build's dlls to play\)
     if(XBE_DLSS_FOUND)
         target_link_libraries(${target} PRIVATE ${XBE_DLSS_LIB})
@@ -247,7 +294,7 @@ function(add_xbe_image target xbe config partitions game_dir)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_DLSS_DLL} $<TARGET_FILE_DIR:${target}>)
     endif()
     # the texture pack tool and its upscaler, in tools\ beside the exe
-    if(WIN32)
+    if(WIN32 AND TARGET hd_pack)
         add_dependencies(${target} hd_pack)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models

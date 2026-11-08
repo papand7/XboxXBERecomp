@@ -1,6 +1,6 @@
 #pragma once
-// picture files for the host (app/image.cpp): the boot splash, texture packs and their dumps. WIC on Windows;
-// elsewhere stb_image once the Linux CMake branch fetches it (phase 2 of the Linux port), until then nothing reads
+// picture files for the host (app/image.cpp): the boot splash, texture packs and their dumps. WIC on Windows,
+// stb_image and stb_image_write elsewhere
 #include <cstdint>
 #include <filesystem>
 #include <vector>
