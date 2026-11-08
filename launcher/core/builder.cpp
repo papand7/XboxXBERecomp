@@ -486,15 +486,17 @@ bool Builder::GetSource(std::string& error) {
         Say(s);
     };
     if (fs::exists(src / ".git", ec)) {
+        // (the runtime, the submodule sdk, is brought to the game's commit below: a fetch here that also fetched it
+        // would fail, and with it the update, when GitHub is out of reach or does not have it yet)
         step("Updating the game's source");
         if (release) {
             std::string tag = "refs/tags/" + ref;
-            if (Git({"-C", U8(src), "fetch", "--progress", "--force", "origin", tag + ":" + tag}, nullptr, error) != 0)
+            if (Git({"-C", U8(src), "fetch", "--progress", "--no-recurse-submodules", "--force", "origin", tag + ":" + tag}, nullptr, error) != 0)
                 return false;
-        } else if (Git({"-C", U8(src), "fetch", "--progress", "origin", ref}, nullptr, error) != 0) {
+        } else if (Git({"-C", U8(src), "fetch", "--progress", "--no-recurse-submodules", "origin", ref}, nullptr, error) != 0) {
             fs::path shipped = ShippedBundle(RepoName());
             std::string e;
-            if (shipped.empty() || Git({"-C", U8(src), "fetch", U8(shipped), "HEAD:refs/remotes/origin/" + ref}, nullptr, e) != 0)
+            if (shipped.empty() || Git({"-C", U8(src), "fetch", "--no-recurse-submodules", U8(shipped), "HEAD:refs/remotes/origin/" + ref}, nullptr, e) != 0)
                 return false;
             Log("GitHub could not be reached (" + error + "): the launcher's own source is used");
             error.clear();
@@ -680,7 +682,9 @@ bool Builder::PutXbe(std::string& error) {
         std::error_code ec;
         fs::create_directories(to.parent_path(), ec);
         std::string have;
-        if (ReadAll(to, have) && have.size() == xbe.size() && std::equal(xbe.begin(), xbe.end(), have.begin())) continue;
+        // (compared as bytes: uint8_t against char never matched past 0x7F, so it was written, and the code made from
+        // it again, on every update)
+        if (ReadAll(to, have) && have.size() == xbe.size() && std::memcmp(have.data(), xbe.data(), xbe.size()) == 0) continue;
         std::ofstream(to, std::ios::binary).write(reinterpret_cast<const char*>(xbe.data()), std::streamsize(xbe.size()));
         Log("xbe written to " + U8(to));
     }
@@ -737,11 +741,20 @@ bool Builder::Compile(std::string& error) {
     last.erase(std::remove(last.begin(), last.end(), '\r'), last.end());  // written in text mode before 1.5.4
     // clang links with lld (no Microsoft linker in the kit)
     std::vector<std::string> configure = {cmake, "--preset", "release", "-DCMAKE_LINKER_TYPE=LLD"};
-    // (a build folder from before this record counts as another toolchain). --fresh: the cache made again, its
-    // compiler and header checks with the new tools; the compiled objects stay, so only what changed is built again
+    // (a build folder from before this record counts as another toolchain). The cache goes, and CMake's records of
+    // the compilers (CMakeFiles/<its version>/ and the files directly in CMakeFiles), so its compiler and header checks
+    // are made again with the new tools; the targets' folders (CMakeFiles/<target>.dir), the compiled objects, stay, so
+    // only what changed is built again. (cmake --fresh would remove all of CMakeFiles, the objects too)
     if (fs::exists(build / "CMakeCache.txt", ec) && last != tools) {
         Log("the build tools changed: CMake's cache is made again");
-        configure.push_back("--fresh");
+        fs::remove(build / "CMakeCache.txt", ec);
+        std::vector<fs::path> records;
+        for (const auto& e : fs::directory_iterator(build / "CMakeFiles", ec)) {
+            std::string name = U8(e.path().filename());
+            if (!e.is_directory(ec) || (!name.empty() && std::isdigit(static_cast<unsigned char>(name[0]))))
+                records.push_back(e.path());
+        }
+        for (const fs::path& p : records) fs::remove_all(p, ec);  // CMake's own files in our build folder
     }
     Say("Preparing the build", fs::exists(build / "CMakeCache.txt", ec) ? std::string()
                                                                         : "the first time also downloads the libraries it uses");
@@ -854,7 +867,7 @@ bool Builder::UpdateAvailable(bool& available, std::string& error) {
     if (!fs::exists(src / ".git", ec)) return true;
     std::string head, remote;
     git_step_ = "Checking for an update";
-    if (Git({"-C", U8(src), "fetch", "origin", game_.branch}, nullptr, error) != 0) return false;
+    if (Git({"-C", U8(src), "fetch", "--no-recurse-submodules", "origin", game_.branch}, nullptr, error) != 0) return false;
     if (Git({"-C", U8(src), "rev-parse", "HEAD"}, &head, error) != 0) return false;
     if (Git({"-C", U8(src), "rev-parse", "origin/" + game_.branch}, &remote, error) != 0) return false;
     available = head != remote;
