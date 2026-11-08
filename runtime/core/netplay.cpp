@@ -10,8 +10,8 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>  // off Windows runtime/compat's
 #ifdef _WIN32
-#include <windows.h>
 #include <iphlpapi.h>
 #else
 #include <ifaddrs.h>
@@ -33,6 +33,7 @@
 #include "app/app.h"
 #include "core/input.h"
 #include "core/log.h"
+#include "core/vk_codes.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")

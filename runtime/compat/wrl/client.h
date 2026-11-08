@@ -32,6 +32,10 @@ public:
     T* operator->() const { return p_; }
     explicit operator bool() const { return p_ != nullptr; }
     T** GetAddressOf() { return &p_; }
+    T** operator&() {  // as WRL's: whatever was held is released for the callee to fill
+        Reset();
+        return &p_;
+    }
     T* const* GetAddressOf() const { return &p_; }
     T** ReleaseAndGetAddressOf() {
         Reset();

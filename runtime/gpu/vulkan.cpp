@@ -4499,7 +4499,8 @@ static void WindowSize(uint32_t& w, uint32_t& h) {
 #ifdef _WIN32
 // the window's screen: its peak brightness (DXGI's) and the one Windows shows SDR white at in HDR (its "SDR content
 // brightness"), in nits; 0 where unknown
-static void DisplayLuminance(HWND wnd, float& peak, float& paper) {
+static void DisplayLuminance(void* window, float& peak, float& paper) {
+    HWND wnd = static_cast<HWND>(window);
     peak = paper = 0;
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
@@ -8938,7 +8939,11 @@ void VulkanBackend::MidFrame() {
                                         std::chrono::duration<double>(present_interval_ * 0.5));
     if (clock::now() > at + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(present_interval_ * 0.25)))
         return;
+#ifdef _WIN32
     while (clock::now() + std::chrono::milliseconds(2) < at) Sleep(1);
+#else
+    while (clock::now() + std::chrono::milliseconds(2) < at) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+#endif
     while (clock::now() < at) std::this_thread::yield();
     float yaw = 0, pitch = 0, ty = 0.5774f;
     // XBE_WARP_TEST=<degrees>: every in-between frame turned that far right, one of them written to warp_test.png

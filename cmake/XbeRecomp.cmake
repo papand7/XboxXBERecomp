@@ -217,6 +217,10 @@ set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp P
 set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/vulkan.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include")
 set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/dxc.cpp PROPERTIES INCLUDE_DIRECTORIES "${XBE_DXC_INCLUDE}")
+if(NOT WIN32)
+    # DXC's WinAdapter.h gives its interfaces their ids with __declspec(uuid) under clang
+    set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/dxc.cpp PROPERTIES COMPILE_OPTIONS "-fms-extensions")
+endif()
 
 # the settings window reads controllers from the runtime's SDL input (app::FeedPad), not XInput
 set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp PROPERTIES

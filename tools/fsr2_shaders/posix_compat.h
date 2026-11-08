@@ -10,6 +10,8 @@
 #endif
 
 #ifdef __cplusplus
+#include <locale>  // std::wstring_convert, which MSVC's <codecvt> brings along
+
 template <size_t N>
 inline int wcscpy_s(wchar_t (&dst)[N], const wchar_t* src) {
     wcsncpy(dst, src, N - 1);

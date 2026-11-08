@@ -23,6 +23,7 @@
 #include "app/app.h"
 #include "core/input.h"
 #include "core/log.h"
+#include "core/vk_codes.h"
 #include "gpu/style.h"
 
 namespace app {
