@@ -816,6 +816,17 @@ bool Builder::ImportMusic(const fs::path& folder, std::string& summary, std::str
     return true;
 }
 
+bool Builder::StartOver(std::string& error) {
+    std::error_code ec;
+    fs::remove_all(root_ / "source", ec);
+    if (ec) {
+        error = "Could not remove the downloaded source (" + ec.message() + "): close the game and try again.";
+        return false;
+    }
+    Log("start over: the source and its build removed");
+    return true;
+}
+
 bool Builder::RemoveBuildFiles(std::string& error) {
     std::error_code ec;
     fs::remove_all(root_ / "source" / "out", ec);  // the build's own output folder
