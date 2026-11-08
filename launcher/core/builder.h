@@ -62,6 +62,8 @@ public:
     // the downloaded source and its build removed (a download that broke, a build gone wrong): the next Install starts
     // from a clean copy; the build tools, the game copy and the saves (play/) are kept
     bool StartOver(std::string& error);
+    bool SourceFromMirror(const std::filesystem::path& src, const std::string& ref, std::string& error);
+    bool SubmoduleFromMirror(const std::filesystem::path& src, std::string& error);
 
     // the game's Xbox custom soundtracks (GameConfig::music) from a folder of the player's music: each file converted
     // to WMA with ffmpeg (fetched the first time), ST.DB written, the folder remembered; summary: what was done

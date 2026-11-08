@@ -428,9 +428,65 @@ bool Builder::GetSource(std::string& error) {
         if (Git({"-C", U8(src), "reset", "--hard", release ? ref : "origin/" + ref}, nullptr, error) != 0) return false;
     } else {
         fs::remove_all(src, ec);  // a clone that did not finish
-        if (Git({"clone", "--progress", "--branch", ref, game_.repo, U8(src)}, nullptr, error) != 0) return false;
+        if (Git({"clone", "--progress", "--branch", ref, game_.repo, U8(src)}, nullptr, error) != 0 &&
+            !SourceFromMirror(src, ref, error))
+            return false;
     }
-    return Git({"-C", U8(src), "submodule", "update", "--init", "--recursive", "--progress"}, nullptr, error) == 0;
+    if (Git({"-C", U8(src), "submodule", "update", "--init", "--recursive", "--progress"}, nullptr, error) == 0) return true;
+    return SubmoduleFromMirror(src, error);
+}
+
+// GitHub out of reach: the game's source from the mirror's git bundle (source/<repo name>.bundle), its origin set back
+// to GitHub so later updates come from there
+bool Builder::SourceFromMirror(const fs::path& src, const std::string& ref, std::string& error) {
+    std::string name = game_.repo.substr(game_.repo.find_last_of('/') + 1);
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".git") == 0) name.resize(name.size() - 4);
+    fs::path bundle = root_ / "downloads" / (name + ".bundle");
+    std::error_code ec;
+    fs::remove(bundle, ec);
+    Log("GitHub could not be reached (" + error + "): the game's source from the mirror");
+    Say("Downloading the game's source (mirror)");
+    std::string e;
+    if (!Download(http_, "https://mirror.dankelsoft.dk/source/" + name + ".bundle", bundle, "", 0, nullptr, &cancel, e)) {
+        error += "; the mirror too: " + e;
+        return false;
+    }
+    fs::remove_all(src, ec);
+    if (Git({"clone", "--progress", U8(bundle), U8(src)}, nullptr, e) != 0) {
+        error += "; the mirror's copy: " + e;
+        return false;
+    }
+    Git({"-C", U8(src), "remote", "set-url", "origin", game_.repo}, nullptr, e);
+    if (!ref.empty() && Git({"-C", U8(src), "checkout", "-q", ref}, nullptr, e) != 0)
+        Log("the mirror's copy has no " + ref + ": its main is built");
+    error.clear();
+    return true;
+}
+
+// the runtime (submodule sdk) from the mirror's bundle at the commit the game names
+bool Builder::SubmoduleFromMirror(const fs::path& src, std::string& error) {
+    std::string out, e;
+    if (Git({"-C", U8(src), "ls-tree", "HEAD", "sdk"}, &out, e) != 0) return false;
+    std::string commit;
+    size_t at = out.find("commit ");
+    if (at != std::string::npos) commit = out.substr(at + 7, 40);
+    if (commit.size() != 40) return false;
+    fs::path bundle = root_ / "downloads" / "XboxXBERecomp.bundle";
+    std::error_code ec;
+    fs::remove(bundle, ec);
+    Log("the runtime from the mirror (" + error + ")");
+    if (!Download(http_, "https://mirror.dankelsoft.dk/source/XboxXBERecomp.bundle", bundle, "", 0, nullptr, &cancel, e)) {
+        error += "; the mirror too: " + e;
+        return false;
+    }
+    fs::path sdk = src / "sdk";
+    fs::remove_all(sdk, ec);
+    if (Git({"clone", "-q", U8(bundle), U8(sdk)}, nullptr, e) != 0 || Git({"-C", U8(sdk), "checkout", "-q", commit}, nullptr, e) != 0) {
+        error += "; the mirror's runtime: " + e;
+        return false;
+    }
+    error.clear();
+    return true;
 }
 
 bool Builder::PutXbe(std::string& error) {
