@@ -231,6 +231,9 @@ void Relaunch(const char* exe) {
         MessageBoxW(nullptr, text.c_str(), app::kGame.short_title, MB_OK | MB_ICONERROR);
     }
     std::_Exit(0);
+#elif defined(__ANDROID__) && !defined(XBE_HEADLESS)
+    xnet::CloseSockets();
+    app::AndroidRelaunch(exe);  // a new process of the app with that image's library (app/main_sdl.cpp)
 #else
     char self[4096] = {};
     ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);

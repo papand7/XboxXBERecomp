@@ -9,7 +9,9 @@
 #include <windows.h>
 #include <intrin.h>
 #else
+#if defined(__x86_64__)
 #include <cpuid.h>
+#endif
 #include <sys/utsname.h>
 #include <unistd.h>
 
@@ -93,13 +95,19 @@ std::string CpuName() {
         __cpuid(r, int(0x80000002 + i));
         std::memcpy(brand + i * 16, r, 16);
     }
-#else
+#elif defined(__x86_64__)
     unsigned r[4] = {};
     if (__get_cpuid_max(0x80000000, nullptr) < 0x80000004) return "unknown";
     for (unsigned i = 0; i < 3; i++) {
         __get_cpuid(0x80000002 + i, &r[0], &r[1], &r[2], &r[3]);
         std::memcpy(brand + i * 16, r, 16);
     }
+#else
+    // Arm: /proc/cpuinfo's Hardware line where the kernel gives one, else the architecture
+    std::ifstream info("/proc/cpuinfo");
+    for (std::string line; std::getline(info, line);)
+        if (line.rfind("Hardware", 0) == 0 && line.find(':') != std::string::npos) return line.substr(line.find(':') + 2);
+    return "arm64";
 #endif
     std::string s = brand;
     s.erase(0, s.find_first_not_of(' '));

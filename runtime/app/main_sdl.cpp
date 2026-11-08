@@ -9,8 +9,13 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
-#include <execinfo.h>
+#include <dlfcn.h>
 #include <unistd.h>
+#ifdef __ANDROID__
+#include <jni.h>  // the relaunch through the app's Java side (AndroidRelaunch)
+#else
+#include <execinfo.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -107,8 +112,10 @@ void OnCrash(int sig, siginfo_t* info, void*) {
         kernel::LogGuestStack(*t->ctx, 256);
     }
     logx::Flush();
+#ifndef __ANDROID__  // Android's own crash report (logcat, the tombstone) has the host stack
     void* frames[32];
     backtrace_symbols_fd(frames, backtrace(frames, 32), 2);
+#endif
     std::signal(sig, SIG_DFL);
     std::raise(sig);
 }
@@ -218,6 +225,7 @@ uint16_t MouseVk(Uint8 button) {
 
 // one event, window thread; false: leave the loop
 bool HandleEvent(const SDL_Event& e) {
+    if (TouchEvent(&e)) return true;
     if (input::HandleSdlEvent(&e)) return true;
     if (e.type == g_event_base) {
         if (e.user.code == kApplyDisplay) {
@@ -314,6 +322,14 @@ void PushUser(Sint32 code, void* data = nullptr) {
 
 std::filesystem::path ExeDir() {
     static const std::filesystem::path dir = [] {
+#ifdef __ANDROID__
+        // the process is the app's (app_process): the folder this library was loaded from, where the app put the game
+        // package (its files, logs, saves and caches go beside it as an exe's do)
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(&ExeDir), &info) && info.dli_fname)
+            return std::filesystem::path(info.dli_fname).parent_path();
+        return std::filesystem::current_path();
+#endif
         std::error_code ec;
         std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ec);
         return ec ? std::filesystem::current_path() : self.parent_path();
@@ -502,9 +518,67 @@ void WindowPixels(uint32_t& width, uint32_t& height) {
     width = uint32_t(std::max(w, 0)), height = uint32_t(std::max(h, 0));
 }
 
+#ifdef __ANDROID__
+// kernel::Relaunch on Android: the app's GameActivity.relaunch(library, environment) starts the image's library in a
+// new process of the app (an exec has no Android form; one process cannot load a second copy of the runtime), with
+// this process's XBE_ and NF_ environment and XBE_RELAUNCHED=1 handed over as the exec keeps them on Linux. The launch
+// data and the hdd are files beside the library, as on the desktop.
+void AndroidRelaunch(const char* exe) {
+    setenv("XBE_RELAUNCHED", "1", 1);
+    std::vector<std::string> env;
+    for (char** e = environ; e && *e; e++)
+        if (!std::strncmp(*e, "XBE_", 4) || !std::strncmp(*e, "NF_", 3)) env.push_back(*e);
+    auto* jni = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    bool asked = false;
+    if (jni && activity) {
+        jclass cls = jni->GetObjectClass(activity);
+        jmethodID relaunch = jni->GetMethodID(cls, "relaunch", "(Ljava/lang/String;[Ljava/lang/String;)V");
+        if (relaunch) {
+            jclass string_class = jni->FindClass("java/lang/String");
+            jobjectArray list = jni->NewObjectArray(jsize(env.size()), string_class, nullptr);
+            for (size_t i = 0; i < env.size(); i++) {
+                jstring s = jni->NewStringUTF(env[i].c_str());
+                jni->SetObjectArrayElement(list, jsize(i), s);
+                jni->DeleteLocalRef(s);
+            }
+            std::string lib = "lib" + std::string(exe) + ".so";
+            jstring name = jni->NewStringUTF(lib.c_str());
+            jni->CallVoidMethod(activity, relaunch, name, list);
+            asked = !jni->ExceptionCheck();
+            if (!asked) jni->ExceptionClear();
+        }
+        jni->DeleteLocalRef(activity);
+    }
+    if (!asked) {
+        LOGE("relaunch: the app could not start %s", exe);
+        std::string text = "The game could not start " + std::string(exe) + " (lib" + exe + ".so): import the game package again.";
+        MessageBox(std::wstring(text.begin(), text.end()).c_str(), true);
+    } else {
+        LOGR("relaunch: lib%s.so in a new process", exe);
+    }
+    logx::Flush();
+    std::_Exit(0);
+}
+#endif
+
 }  // namespace app
 
+#ifdef __ANDROID__
+// SDL's Java side (SDLActivity.nativeRunMain) calls this in the library the app loaded; its arguments may carry the
+// environment a relaunch handed over (--env=NAME=VALUE)
+extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** argv) {
+    for (int i = 1; i < argc; i++)
+        if (!std::strncmp(argv[i], "--env=", 6))
+            if (const char* eq = std::strchr(argv[i] + 6, '=')) setenv(std::string(argv[i] + 6, eq).c_str(), eq + 1, 1);
+    // landscape, the fingers not also the mouse (app/touch.cpp reads them), the back gesture the game's pause
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+#else
 int main(int argc, char** argv) {
+    if (const char* t = std::getenv("XBE_TOUCH"); t && *t == '1') SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "1");
+#endif
     struct sigaction sa{};
     sa.sa_sigaction = app::OnCrash;
     sa.sa_flags = SA_SIGINFO;

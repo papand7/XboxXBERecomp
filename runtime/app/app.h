@@ -182,6 +182,15 @@ std::vector<Mode> DisplayModes();  // the monitor setting's display's fullscreen
 std::string Utf8(const wchar_t* w);  // a wide string (kGame's, UTF-32 here) as UTF-8
 // a message box over the game window (SDL's); yes_no: Yes and No buttons, true for Yes, else OK and true
 bool MessageBox(const wchar_t* text, bool error, bool yes_no = false);
+// on-screen touch controls (app/touch.cpp): Android's, elsewhere with XBE_TOUCH=1
+bool TouchEvent(const void* sdl_event);         // window thread, each event first; true: taken (fingers, Android's back)
+bool TouchRead(float* out);  // input::kControls entries: controller 1's inputs from the screen, 0 to 1 each; false while hidden
+bool TouchControlsShown();
+void DrawTouch();                               // inside the ImGui frame, UiLock held
+#ifdef __ANDROID__
+// Android: the other image's library started in a new process of the app (kernel::Relaunch's exec), this one ends
+[[noreturn]] void AndroidRelaunch(const char* exe);
+#endif
 #endif
 // leave the game as closing its window does (the settings window's Quit, a title's own quit item); from any thread
 void Quit();
@@ -197,6 +206,16 @@ void FinishHandover();  // any thread but the window thread's: opens the game wi
 
 // held around ImGui: the window thread's messages and the renderer's frame
 std::recursive_mutex& UiLock();
+
+// an on-screen touch button (app/touch.cpp): the console control it holds, its label (another in the title's menus,
+// GameInfo::menu_up), its centre in screen heights from the right edge (from the left edge when negative) and from the
+// bottom, and its radius
+struct TouchButton {
+    int control;  // input::Control
+    const char* label;
+    const char* menu_label;
+    float x, y, r;
+};
 
 // what the game repo defines once
 struct Option {  // a setting in the settings file, flag or value
@@ -299,6 +318,8 @@ struct GameInfo {
     // radians (yaw right, pitch up), and the tangent of half its vertical field of view; false when it does not
     // (menus, cutscenes, a controller)
     bool (*view_turn)(float& yaw, float& pitch, float& tan_half_fov) = nullptr;
+    // the on-screen touch buttons (Android); none, the console's face buttons, triggers, Start and Back
+    std::vector<TouchButton> touch_buttons = {};
 };
 extern const GameInfo kGame;
 

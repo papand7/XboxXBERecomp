@@ -38,6 +38,20 @@ FetchContent_MakeAvailable(VulkanHeaders dxc)
 if(WIN32)
     set(XBE_DXC_INCLUDE ${dxc_SOURCE_DIR}/inc)
     set(XBE_DXC_LIBS ${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll)
+elseif(ANDROID)
+    # Android: DXC has no Android release; the Linux archive's headers are the same, the library is DXC built for the
+    # ABI by sdk/scripts/android/build_dxc.sh (XBE_ANDROID_DXC its folder), copied beside the game library (dxc.cpp
+    # also finds one in the app's own native library folder)
+    set(XBE_DXC_INCLUDE ${dxc_SOURCE_DIR}/include/dxc)
+    set(XBE_ANDROID_DXC "" CACHE PATH "a folder with libdxcompiler.so built for this Android ABI (copied beside the game library)")
+    set(XBE_DXC_LIBS "")
+    if(XBE_ANDROID_DXC AND EXISTS ${XBE_ANDROID_DXC}/libdxcompiler.so)
+        set(XBE_DXC_LIBS ${XBE_ANDROID_DXC}/libdxcompiler.so)
+    endif()
+    FetchContent_Declare(stb URL https://github.com/nothings/stb/archive/4e9b368bfc071e97206ea5c6adba68dd0cbf8897.tar.gz
+        URL_HASH SHA256=e60706ab084e0cae35ee7282deb4a7f283e4a28be1896d097437205da01a0683)
+    FetchContent_MakeAvailable(stb)
+    set_source_files_properties(${XBE_SDK_DIR}/runtime/app/image.cpp PROPERTIES INCLUDE_DIRECTORIES "${stb_SOURCE_DIR}")
 else()
     set(XBE_DXC_INCLUDE ${dxc_SOURCE_DIR}/include/dxc)
     set(XBE_DXC_LIBS ${dxc_SOURCE_DIR}/lib/libdxcompiler.so ${dxc_SOURCE_DIR}/lib/libdxil.so)
@@ -74,12 +88,25 @@ FetchContent_Declare(glslang URL https://github.com/KhronosGroup/glslang/archive
     URL_HASH SHA256=b16c78e7604b9be9f546ee35ad8b6db6f39bbbbfb19e8d038b6fe2ea5bba4ff4 EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(fsr2 glslang)
 set(XBE_FSR2_API ${fsr2_SOURCE_DIR}/src/ffx-fsr2-api)
-add_executable(fsr2_shaders EXCLUDE_FROM_ALL ${XBE_SDK_DIR}/tools/fsr2_shaders/main.cpp)
-target_link_libraries(fsr2_shaders PRIVATE glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
+# a cross build (Android) runs the build-time tools (fsr2_shaders, xbe_recomp) of a host build of the same project:
+# XBE_HOST_TOOLS is that build's folder (sdk/scripts/android/build_game.sh makes it)
+if(CMAKE_CROSSCOMPILING)
+    set(XBE_HOST_TOOLS "" CACHE PATH "a host build folder of this project with xbe_recomp and fsr2_shaders (cross builds)")
+    if(NOT EXISTS ${XBE_HOST_TOOLS}/xbe_recomp OR NOT EXISTS ${XBE_HOST_TOOLS}/fsr2_shaders)
+        message(FATAL_ERROR "a cross build needs XBE_HOST_TOOLS: a host build of this project with xbe_recomp and fsr2_shaders built")
+    endif()
+    set(XBE_FSR2_SHADERS_CMD ${XBE_HOST_TOOLS}/fsr2_shaders)
+    set(XBE_RECOMP_CMD ${XBE_HOST_TOOLS}/xbe_recomp)
+else()
+    add_executable(fsr2_shaders EXCLUDE_FROM_ALL ${XBE_SDK_DIR}/tools/fsr2_shaders/main.cpp)
+    target_link_libraries(fsr2_shaders PRIVATE glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
+    set(XBE_FSR2_SHADERS_CMD fsr2_shaders)
+    set(XBE_RECOMP_CMD xbe_recomp)
+endif()
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/fsr2/fsr2_blobs.inc
-    COMMAND fsr2_shaders ${XBE_FSR2_API}/shaders ${CMAKE_BINARY_DIR}/fsr2/fsr2_blobs.inc
-    DEPENDS fsr2_shaders
+    COMMAND ${XBE_FSR2_SHADERS_CMD} ${XBE_FSR2_API}/shaders ${CMAKE_BINARY_DIR}/fsr2/fsr2_blobs.inc
+    DEPENDS ${XBE_FSR2_SHADERS_CMD}
     COMMENT "FSR 2's Vulkan shaders to SPIR-V"
     VERBATIM)
 add_library(xbe_fsr2 STATIC EXCLUDE_FROM_ALL
@@ -182,6 +209,7 @@ if(WIN32)
     target_link_libraries(hd_pack PRIVATE windowscodecs ole32)
 endif()
 
+if(NOT CMAKE_CROSSCOMPILING)
 # x86 to C++ recompiler
 file(GLOB XBE_RECOMP_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/tools/recomp/*.cpp)
 add_executable(xbe_recomp ${XBE_RECOMP_SOURCES})
@@ -194,6 +222,7 @@ add_executable(xbe_symbols ${XBE_SDK_DIR}/tools/symbols/main.cpp)
 target_include_directories(xbe_symbols PRIVATE ${XBE_SDK_DIR}/runtime)
 target_compile_definitions(xbe_symbols PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(xbe_symbols PRIVATE Zydis tomlplusplus::tomlplusplus)
+endif()
 
 set(XBE_IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -233,7 +262,7 @@ if(NOT WIN32)
 endif()
 # SDL's headers go to the files that use SDL alone (it is linked LINK_ONLY), so the generated sources' compile line stays
 # the same
-foreach(f core/input.cpp app/main_sdl.cpp audio/sdl.cpp)
+foreach(f core/input.cpp app/main_sdl.cpp app/touch.cpp audio/sdl.cpp)
     set_source_files_properties(${XBE_SDK_DIR}/runtime/${f} PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
 endforeach()
 if(WIN32)
@@ -262,9 +291,9 @@ function(add_xbe_image target xbe config partitions game_dir)
     add_custom_command(
         OUTPUT ${GEN}/codegen.stamp
         BYPRODUCTS ${GEN_SOURCES} ${GEN}/x86_recomp_shared.h ${GEN}/image_symbols.h
-        COMMAND xbe_recomp config/${config} --xdk ${XBE_SDK_DIR}/xdk
+        COMMAND ${XBE_RECOMP_CMD} config/${config} --xdk ${XBE_SDK_DIR}/xdk
         COMMAND ${CMAKE_COMMAND} -E touch ${GEN}/codegen.stamp
-        DEPENDS xbe_recomp ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe}
+        DEPENDS ${XBE_RECOMP_CMD} ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         COMMENT "Recompiling ${xbe}"
         VERBATIM)
@@ -278,7 +307,12 @@ function(add_xbe_image target xbe config partitions game_dir)
     file(SHA1 ${xbe_file} xbe_sha1)
     set(XBE_HASH ${CMAKE_CURRENT_BINARY_DIR}/${target}_xbe.cpp)
     file(CONFIGURE OUTPUT ${XBE_HASH} CONTENT "extern const char kImageSha1[] = \"${xbe_sha1}\";\n")
-    add_executable(${target} WIN32 ${GAME_SOURCES} ${GEN_SOURCES} ${XBE_HASH})
+    if(ANDROID)
+        # a library the Android app loads from its private storage (lib<target>.so): SDL's Java glue calls its SDL_main
+        add_library(${target} SHARED ${GAME_SOURCES} ${GEN_SOURCES} ${XBE_HASH})
+    else()
+        add_executable(${target} WIN32 ${GAME_SOURCES} ${GEN_SOURCES} ${XBE_HASH})
+    endif()
     add_dependencies(${target} recompile_${target})
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${GEN})
     xbe_runtime_target(${target})
@@ -298,11 +332,18 @@ function(xbe_runtime_target target)
     else()
         # the few Win32 and Winsock names portable sources use, and the D3D ones the shared renderer code names
         target_include_directories(${target} PRIVATE ${XBE_SDK_DIR}/runtime/compat)
-        target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS} pthread)
+        if(ANDROID)
+            # pthreads are bionic's own; SDL's interface brings android and log
+            target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS} android log)
+        else()
+            target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS} pthread)
+        endif()
     endif()
     # the Vulkan renderer's shader compiler, beside the exe
-    add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_DXC_LIBS} $<TARGET_FILE_DIR:${target}>)
+    if(XBE_DXC_LIBS)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_DXC_LIBS} $<TARGET_FILE_DIR:${target}>)
+    endif()
     # DLSS: NGX's loader linked in, NVIDIA's runtime beside the exe (the launcher copies the build's dlls to play\)
     if(XBE_DLSS_FOUND)
         target_link_libraries(${target} PRIVATE ${XBE_DLSS_LIB})

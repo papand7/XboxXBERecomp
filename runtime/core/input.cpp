@@ -544,6 +544,13 @@ Pad Poll(int port) {
         if (app::kGame.wheel) app::kGame.wheel(feel);
         WheelFeedback(feel, g_rumble[0], g_rumble[1]);
     }
+#ifndef _WIN32
+    // the on-screen touch controls play as controller 1 too (app/touch.cpp)
+    if (float touch[kControls] = {}; port == 0 && app::TouchRead(touch)) {
+        p.connected = true;
+        for (int c = 0; c < kControls; c++) out[c] = std::max(out[c], touch[c]);
+    }
+#endif
     // the keyboard is controller 1, plugged in while keyboard play is on (alt-tabbing away must not unplug it), its
     // keys read while the game window has the focus
     if (port == 0) {
