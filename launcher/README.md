@@ -65,6 +65,23 @@ reads it and its own WMA decoder plays them (core/music.h has the format). `laun
 what each file became: *Update my music* converts only what changed. A MUSIC folder with an ST.DB not made here (an
 Xbox's, copied over) is left alone.
 
+## On Linux
+
+`<short>LauncherService` (service.cpp, the same builder driven by JSON lines on stdin/stdout, which a game's Electron
+launcher draws) builds on Linux too: `cmake -S sdk/launcher -B out/launcher-svc -G Ninja -DCMAKE_BUILD_TYPE=Release
+-DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang -DLAUNCHER_GAME=<the folder>` (the C++ library linked in, so an
+AppImage can carry it). There it:
+- reads toolchain.json's `linux` section (`{"linux": {"tools": [...]}}`; the top level stays Windows', which older
+  launchers read): LLVM, CMake and Ninja's Linux releases, each pinned by SHA-256 (`kind` `tar.xz`, `tar.gz` or
+  `zip`; unpacked files keep their execute bits). A tool's `system` programs, all on the PATH with the first one's
+  `--version` at least `system_min`, stand in for its download (the system's clang, CMake, Ninja); a published list
+  without a `linux` section falls back to the launcher's own;
+- checks what it cannot fetch (`CheckSystem`): git, a test program built with clang++ and lld (the C and C++
+  libraries), the X11 or Wayland and the ALSA, PulseAudio or PipeWire development headers SDL builds the window and
+  sound with; what is missing is named with the distribution's install command (apt, dnf, pacman, zypper);
+- fetches nothing of Microsoft's (no license: `agreed` is true, `os` is `linux` in its state), has no path length
+  limit, installs the exes (no suffix) and `.so` files into `play/`, and starts the game detached.
+
 ## Testing on Linux
 
 `launcher_cli` (built on Linux from the same CMakeLists) runs the steps from a terminal: `plan` (resolves the tools

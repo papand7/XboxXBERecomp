@@ -1,5 +1,5 @@
-# Linux compile check: the headless harness and the whole runtime (SDL3 window and sound, Vulkan renderer, ImGui)
-# around a stub image (tests/linux), no game code or files needed
+# Linux checks: the headless harness and the whole runtime (SDL3 window and sound, Vulkan renderer, ImGui) around a
+# stub image (tests/linux), no game code or files needed; the launcher service and its Linux tools (sdk/launcher)
 name: linux
 
 on:
@@ -45,3 +45,40 @@ jobs:
 
       - name: Result
         run: ls -la "$RUNNER_TEMP/rt"
+
+  # the launcher service and launcher_cli on Linux (sdk/launcher), around the game template's launcher folder: they
+  # build, the service answers, and launcher_cli fetches and unpacks the small Linux tools of toolchain.json (Ninja's
+  # zip, CMake's tar.gz) runnable
+  launcher:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld cmake ninja-build
+
+      - name: Build
+        run: |
+          cmake -S launcher -B "$RUNNER_TEMP/launcher" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ -DLAUNCHER_GAME="$PWD/templates/game/launcher"
+          cmake --build "$RUNNER_TEMP/launcher"
+
+      - name: Service answers
+        run: |
+          mkdir -p "$RUNNER_TEMP/games"
+          printf '{"cmd":"state"}\n{"cmd":"quit"}\n' | "$RUNNER_TEMP/launcher/GameLauncherService" \
+            --games "$RUNNER_TEMP/games" --root "$RUNNER_TEMP/games/Game" | tee "$RUNNER_TEMP/state.txt"
+          grep -q '"os":"linux"' "$RUNNER_TEMP/state.txt"
+          grep -q '"agreed":true' "$RUNNER_TEMP/state.txt"
+
+      - name: Linux tools fetched and unpacked
+        run: |
+          cli="$RUNNER_TEMP/launcher/launcher_cli"
+          game=templates/game/launcher/game.json
+          "$cli" "$game" "$RUNNER_TEMP/lt" plan
+          "$cli" "$game" "$RUNNER_TEMP/lt" tool ninja
+          "$cli" "$game" "$RUNNER_TEMP/lt" tool cmake
+          "$RUNNER_TEMP/lt/tools/ninja/ninja" --version
+          "$RUNNER_TEMP/lt/tools/cmake/bin/cmake" --version
