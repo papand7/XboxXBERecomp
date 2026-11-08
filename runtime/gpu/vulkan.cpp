@@ -4265,6 +4265,7 @@ bool HasExtension(const std::vector<VkExtensionProperties>& list, const char* na
 bool VulkanBackend::PickDevice() {
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(instance_, &n, nullptr);
+    if (!n) LOGR("vulkan: the driver lists no GPU");
     std::vector<VkPhysicalDevice> list(n);
     vkEnumeratePhysicalDevices(instance_, &n, list.data());
     int best = -1;
@@ -4272,13 +4273,23 @@ bool VulkanBackend::PickDevice() {
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(list[i], &p);
-        if (p.apiVersion < VK_API_VERSION_1_3) continue;
+        // why a GPU is passed over, once each (phones: an older driver's Vulkan 1.1, no push descriptors)
+        auto skip = [&](const char* why) {
+            LOGR("vulkan: %s (Vulkan %u.%u.%u) passed over: %s", p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion),
+                 VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion), why);
+        };
+        if (p.apiVersion < VK_API_VERSION_1_3) {
+            skip("Vulkan 1.3 wanted");
+            continue;
+        }
         uint32_t en = 0;
         vkEnumerateDeviceExtensionProperties(list[i], nullptr, &en, nullptr);
         std::vector<VkExtensionProperties> ext(en);
         vkEnumerateDeviceExtensionProperties(list[i], nullptr, &en, ext.data());
-        if (!HasExtension(ext, VK_KHR_SWAPCHAIN_EXTENSION_NAME) || !HasExtension(ext, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
+        if (!HasExtension(ext, VK_KHR_SWAPCHAIN_EXTENSION_NAME) || !HasExtension(ext, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
+            skip(HasExtension(ext, VK_KHR_SWAPCHAIN_EXTENSION_NAME) ? "no VK_KHR_push_descriptor" : "no swap chains");
             continue;
+        }
         uint32_t qn = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(list[i], &qn, nullptr);
         std::vector<VkQueueFamilyProperties> qf(qn);
@@ -4289,7 +4300,10 @@ bool VulkanBackend::PickDevice() {
             vkGetPhysicalDeviceSurfaceSupportKHR(list[i], q, surface_, &present);
             if ((qf[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) family = int(q);
         }
-        if (family < 0) continue;
+        if (family < 0) {
+            skip("no queue that draws and presents to the window");
+            continue;
+        }
         bool discrete = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
         if (best < 0 || discrete) {
             best = int(i);
