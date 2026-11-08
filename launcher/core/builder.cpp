@@ -422,18 +422,80 @@ bool Builder::GetSource(std::string& error) {
             if (Git({"-C", U8(src), "fetch", "--progress", "--force", "origin", tag + ":" + tag}, nullptr, error) != 0)
                 return false;
         } else if (Git({"-C", U8(src), "fetch", "--progress", "origin", ref}, nullptr, error) != 0) {
-            return false;
+            fs::path shipped = ShippedBundle(RepoName());
+            std::string e;
+            if (shipped.empty() || Git({"-C", U8(src), "fetch", U8(shipped), "HEAD:refs/remotes/origin/" + ref}, nullptr, e) != 0)
+                return false;
+            Log("GitHub could not be reached (" + error + "): the launcher's own source is used");
+            error.clear();
         }
         // the launcher's own checkout: whatever it holds becomes the release, or the branch's head
         if (Git({"-C", U8(src), "reset", "--hard", release ? ref : "origin/" + ref}, nullptr, error) != 0) return false;
     } else {
         fs::remove_all(src, ec);  // a clone that did not finish
-        if (Git({"clone", "--progress", "--branch", ref, game_.repo, U8(src)}, nullptr, error) != 0 &&
-            !SourceFromMirror(src, ref, error))
+        fs::path shipped = ShippedBundle(RepoName());
+        if (!shipped.empty()) {
+            // the source the launcher carries: nothing to download
+            Log("the game's source from the launcher (" + U8(shipped) + ")");
+            if (!CloneBundle(shipped, src, ref, error)) return false;
+        } else if (Git({"clone", "--progress", "--branch", ref, game_.repo, U8(src)}, nullptr, error) != 0 &&
+                   !SourceFromMirror(src, ref, error)) {
             return false;
+        }
     }
+    fs::path shipped_sdk = ShippedBundle("XboxXBERecomp");
+    if (!shipped_sdk.empty() && SubmoduleFromBundle(src, shipped_sdk, error)) return true;
     if (Git({"-C", U8(src), "submodule", "update", "--init", "--recursive", "--progress"}, nullptr, error) == 0) return true;
     return SubmoduleFromMirror(src, error);
+}
+
+// the repository's name (its URL's last part, without .git)
+std::string Builder::RepoName() const {
+    std::string name = game_.repo.substr(game_.repo.find_last_of('/') + 1);
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".git") == 0) name.resize(name.size() - 4);
+    return name;
+}
+
+// a git bundle the launcher ships beside itself (NF_SOURCE_BUNDLES: its resources' source folder), empty if none
+fs::path Builder::ShippedBundle(const std::string& name) const {
+    std::string dir = platform_.GetEnv("NF_SOURCE_BUNDLES");
+    if (dir.empty()) return {};
+    std::error_code ec;
+    fs::path p = fs::u8path(dir) / (name + ".bundle");
+    return fs::exists(p, ec) ? p : fs::path();
+}
+
+// src cloned from a bundle, its origin GitHub's (later updates come from there), ref checked out when the bundle has it
+bool Builder::CloneBundle(const fs::path& bundle, const fs::path& src, const std::string& ref, std::string& error) {
+    std::error_code ec;
+    fs::remove_all(src, ec);
+    if (Git({"clone", "--progress", U8(bundle), U8(src)}, nullptr, error) != 0) return false;
+    std::string e;
+    Git({"-C", U8(src), "remote", "set-url", "origin", game_.repo}, nullptr, e);
+    if (!ref.empty() && Git({"-C", U8(src), "checkout", "-q", "-B", ref}, nullptr, e) != 0) Log("checkout " + ref + ": " + e);
+    error.clear();
+    return true;
+}
+
+// the runtime (submodule sdk) from a bundle at the commit the game names
+bool Builder::SubmoduleFromBundle(const fs::path& src, const fs::path& bundle, std::string& error) {
+    std::string out, e;
+    if (Git({"-C", U8(src), "ls-tree", "HEAD", "sdk"}, &out, e) != 0) return false;
+    size_t at = out.find("commit ");
+    std::string commit = at == std::string::npos ? std::string() : out.substr(at + 7, 40);
+    if (commit.size() != 40) return false;
+    fs::path sdk = src / "sdk";
+    std::error_code ec;
+    fs::remove_all(sdk, ec);
+    if (Git({"clone", "-q", U8(bundle), U8(sdk)}, nullptr, e) != 0 || Git({"-C", U8(sdk), "checkout", "-q", commit}, nullptr, e) != 0) {
+        Log("the runtime's bundle (" + U8(bundle) + "): " + e);
+        fs::remove_all(sdk, ec);
+        return false;
+    }
+    Git({"-C", U8(sdk), "remote", "set-url", "origin", "https://github.com/papand7/XboxXBERecomp.git"}, nullptr, e);
+    Log("the runtime from " + U8(bundle));
+    error.clear();
+    return true;
 }
 
 // GitHub out of reach: the game's source from the mirror's git bundle (source/<repo name>.bundle), its origin set back

@@ -63,6 +63,11 @@ public:
     // from a clean copy; the build tools, the game copy and the saves (play/) are kept
     bool StartOver(std::string& error);
     bool SourceFromMirror(const std::filesystem::path& src, const std::string& ref, std::string& error);
+    std::string RepoName() const;
+    std::filesystem::path ShippedBundle(const std::string& name) const;
+    bool CloneBundle(const std::filesystem::path& bundle, const std::filesystem::path& src, const std::string& ref,
+                     std::string& error);
+    bool SubmoduleFromBundle(const std::filesystem::path& src, const std::filesystem::path& bundle, std::string& error);
     bool SubmoduleFromMirror(const std::filesystem::path& src, std::string& error);
 
     // the game's Xbox custom soundtracks (GameConfig::music) from a folder of the player's music: each file converted
