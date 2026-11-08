@@ -518,7 +518,7 @@ bool Builder::GetSource(std::string& error) {
     }
     fs::path shipped_sdk = ShippedBundle("XboxXBERecomp");
     if (!shipped_sdk.empty()) {
-        step("Unpacking the game's runtime");
+        step(fs::exists(src / "sdk" / ".git", ec) ? "Updating the game's runtime" : "Unpacking the game's runtime");
         if (SubmoduleFromBundle(src, shipped_sdk, error)) return true;
     }
     step("Downloading the game's runtime");
@@ -576,6 +576,25 @@ bool Builder::SubmoduleFromBundle(const fs::path& src, const fs::path& bundle, s
     if (commit.size() != 40) return false;
     fs::path sdk = src / "sdk";
     std::error_code ec;
+    if (fs::exists(sdk / ".git", ec)) {
+        // already there (an update): the commit checked out in place, so only the files that changed are written and
+        // the build stays incremental (a new clone would date every file now and rebuild the whole game). The bundle
+        // may not have it (the game on GitHub is newer than this launcher): git's submodule update fetches it then
+        std::string head;
+        bool there = Git({"-C", U8(sdk), "rev-parse", "HEAD"}, &head, e) == 0 && head.rfind(commit, 0) == 0;
+        if (!there && (Git({"-C", U8(sdk), "cat-file", "-e", commit + "^{commit}"}, nullptr, e) == 0 ||
+             Git({"-C", U8(sdk), "fetch", "--progress", U8(bundle), "HEAD"}, nullptr, e) == 0) &&
+            Git({"-C", U8(sdk), "checkout", "-q", "--force", commit}, nullptr, e) == 0) {
+            Log("the runtime moved to " + commit + " (" + U8(bundle) + ")");
+            there = true;
+        }
+        if (!there) {
+            Log("the runtime's bundle has no " + commit + ": " + e);
+            return false;
+        }
+        error.clear();
+        return true;
+    }
     fs::remove_all(sdk, ec);
     if (Git({"clone", "--progress", U8(bundle), U8(sdk)}, nullptr, e) != 0 || Git({"-C", U8(sdk), "checkout", "-q", commit}, nullptr, e) != 0) {
         Log("the runtime's bundle (" + U8(bundle) + "): " + e);
@@ -714,22 +733,25 @@ bool Builder::Compile(std::string& error) {
         if (!t.optional) tools += t.id + " " + (system_tools_.count(t.id) ? "system " + system_tools_.at(t.id) : t.stamp) + "\n";
     fs::path build = src / "out" / "build" / "release", seen = build / ".launcher-tools";
     std::string last;
-    // (a build folder from before this record counts as another toolchain)
-    if (fs::exists(build / "CMakeCache.txt", ec) && (!ReadAll(seen, last) || last != tools)) {
-        Log("the build tools changed: CMake's cache is made again");
-        fs::remove(build / "CMakeCache.txt", ec);
-        fs::remove_all(build / "CMakeFiles", ec);  // CMake's own folder in our build folder
-    }
-    Say("Preparing the build", "the first time also downloads the libraries it uses");
+    ReadAll(seen, last);
+    last.erase(std::remove(last.begin(), last.end(), '\r'), last.end());  // written in text mode before 1.5.4
     // clang links with lld (no Microsoft linker in the kit)
-    int code = platform_.Run({cmake, "--preset", "release", "-DCMAKE_LINKER_TYPE=LLD"}, src, env,
-                             [&](const std::string& line) { Log("cmake: " + line); }, &cancel);
+    std::vector<std::string> configure = {cmake, "--preset", "release", "-DCMAKE_LINKER_TYPE=LLD"};
+    // (a build folder from before this record counts as another toolchain). --fresh: the cache made again, its
+    // compiler and header checks with the new tools; the compiled objects stay, so only what changed is built again
+    if (fs::exists(build / "CMakeCache.txt", ec) && last != tools) {
+        Log("the build tools changed: CMake's cache is made again");
+        configure.push_back("--fresh");
+    }
+    Say("Preparing the build", fs::exists(build / "CMakeCache.txt", ec) ? std::string()
+                                                                        : "the first time also downloads the libraries it uses");
+    int code = platform_.Run(configure, src, env, [&](const std::string& line) { Log("cmake: " + line); }, &cancel);
     if (code != 0) {
         error = "Preparing the build failed, see launcher.log";
         return false;
     }
     fs::create_directories(build, ec);
-    std::ofstream(seen) << tools;
+    std::ofstream(seen, std::ios::binary) << tools;
     Say("Building " + game_.title, "the first build takes 30 to 90 minutes", 0);
     code = platform_.Run({cmake, "--build", "out/build/release"}, src, env, [&](const std::string& line) {
             Log(line);
