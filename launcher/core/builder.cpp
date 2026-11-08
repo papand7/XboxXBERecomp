@@ -45,6 +45,66 @@ fs::path FirstDir(const fs::path& dir) {
     return dirs.empty() ? fs::path() : dirs.back();
 }
 
+// the first "1.2.3" in a program's --version output
+std::string VersionIn(const std::string& text) {
+    for (size_t i = 0; i < text.size(); i++) {
+        if (!std::isdigit(static_cast<unsigned char>(text[i])) || (i && std::isalnum(static_cast<unsigned char>(text[i - 1]))))
+            continue;
+        size_t j = i;
+        while (j < text.size() && (std::isdigit(static_cast<unsigned char>(text[j])) || text[j] == '.')) j++;
+        std::string v = text.substr(i, j - i);
+        if (v.find('.') != std::string::npos) return v;
+        i = j;
+    }
+    return {};
+}
+
+// a >= b, part by part ("18.1.3" >= "14")
+bool VersionAtLeast(const std::string& a, const std::string& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() || j < b.size()) {
+        long x = i < a.size() ? std::atol(a.c_str() + i) : 0, y = j < b.size() ? std::atol(b.c_str() + j) : 0;
+        if (x != y) return x > y;
+        i = a.find('.', i);
+        i = i == std::string::npos ? a.size() : i + 1;
+        j = b.find('.', j);
+        j = j == std::string::npos ? b.size() : j + 1;
+    }
+    return true;
+}
+
+// the distribution's id and what it is like (os-release): " ubuntu debian "
+std::string DistroIds() {
+    std::string text, ids;
+    if (!ReadAll("/etc/os-release", text) && !ReadAll("/usr/lib/os-release", text)) return {};
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(at, end - at);
+        at = end + 1;
+        for (const char* key : {"ID=", "ID_LIKE="})
+            if (line.rfind(key, 0) == 0) {
+                std::string v = line.substr(std::strlen(key));
+                v.erase(std::remove(v.begin(), v.end(), '"'), v.end());
+                ids += " " + Lower(v);
+            }
+    }
+    return ids + " ";
+}
+
+// a program in one of PATH's folders
+bool OnPath(const std::string& path, char sep, const std::string& program) {
+    for (size_t at = 0; at <= path.size();) {
+        size_t end = path.find(sep, at);
+        if (end == std::string::npos) end = path.size();
+        std::error_code ec;
+        if (end > at && fs::exists(fs::path(path.substr(at, end - at)) / program, ec)) return true;
+        at = end + 1;
+    }
+    return false;
+}
+
 }  // namespace
 
 std::string Megabytes(uint64_t bytes) {
@@ -147,8 +207,18 @@ bool Builder::LoadToolchain(Plan& plan, std::string& error) {
         return false;
     }
     plan = {};
-    if (!LoadPlan(text, plan, error)) return false;
-    if (!ResolveMicrosoft(http_, text, plan, error)) return false;
+    const bool windows = platform_.Os() == "windows";
+    if (!LoadPlan(text, plan, error, platform_.Os())) {
+        // a published list from before this system had tools of its own: the launcher's own list
+        Plan own;
+        std::string e;
+        if (fallback_toolchain.empty() || !LoadPlan(fallback_toolchain, own, e, platform_.Os())) return false;
+        Log("toolchain.json: " + error + ", the launcher's own list is used");
+        text = fallback_toolchain;
+        plan = own;
+        error.clear();
+    }
+    if (windows && !ResolveMicrosoft(http_, text, plan, error)) return false;
     uint64_t bytes = 0;
     for (const Tool& t : plan.tools)
         if (!t.optional) bytes += t.Bytes();
@@ -213,8 +283,9 @@ bool Builder::InstallTool(const Tool& tool, std::string& error) {
     } else {
         for (const FileRef& f : tool.files) {
             Log("unpack " + f.name);
-            bool ok = tool.kind == "tar.xz" ? UntarXz(downloads / f.name, dir, select, progress, &cancel, error)
-                                            : Unzip(downloads / f.name, dir, select, progress, &cancel, error);
+            bool ok = tool.kind == "tar.xz"   ? UntarXz(downloads / f.name, dir, select, progress, &cancel, error)
+                      : tool.kind == "tar.gz" ? UntarGz(downloads / f.name, dir, select, progress, &cancel, error)
+                                              : Unzip(downloads / f.name, dir, select, progress, &cancel, error);
             if (!ok) return false;
         }
     }
@@ -242,6 +313,100 @@ int Builder::Git(const std::vector<std::string>& args, std::string* out, std::st
         }, &cancel);
     if (code != 0) error = "git " + (args.empty() ? std::string() : args[0]) + " failed (" + std::to_string(code) + "), see launcher.log";
     return code;
+}
+
+bool Builder::SystemTool(const Tool& tool, std::string& found) {
+    if (platform_.Os() == "windows" || tool.system.empty()) return false;
+    std::string have;
+    if (ReadAll(ToolPath(tool.id) / ".launcher-stamp", have) && have == tool.stamp) return false;  // fetched before: kept
+    for (const std::string& program : tool.system) {
+        if (!OnPath(platform_.GetEnv("PATH"), platform_.PathSeparator(), program)) {
+            Log(tool.title + ": the system has no " + program + ", downloading it");
+            return false;
+        }
+    }
+    std::string out;
+    platform_.Run({tool.system[0], "--version"}, root_, {}, [&](const std::string& l) { out += l + "\n"; }, &cancel);
+    std::string version = VersionIn(out);
+    if (!tool.system_min.empty() && (version.empty() || !VersionAtLeast(version, tool.system_min))) {
+        Log(tool.title + ": the system's " + tool.system[0] + " is " + (version.empty() ? "of no known version" : version) +
+            ", older than " + tool.system_min + ": downloading " + tool.title);
+        return false;
+    }
+    found = tool.system[0] + " " + version;
+    Log(tool.title + ": the system's " + found + " is used");
+    return true;
+}
+
+bool Builder::CheckSystem(std::string& error) {
+    if (platform_.Os() == "windows") return true;
+    Say("Checking this system's build packages");
+    std::map<std::string, std::string> env = BuildEnv(plan_);
+    const std::string path = env.count("PATH") ? env["PATH"] : platform_.GetEnv("PATH");
+    std::vector<std::string> missing;
+    auto runs = [&](const std::vector<std::string>& args, const fs::path& cwd) {
+        std::string out;
+        int code = platform_.Run(args, cwd, env, [&](const std::string& l) { out += l + "\n"; }, &cancel);
+        if (code != 0) Log("system check: " + args[0] + " failed (" + std::to_string(code) + "): " + out);
+        return code == 0;
+    };
+    auto header = [](const char* name) {
+        std::error_code ec;
+        for (const char* dir : {"/usr/include", "/usr/local/include", "/usr/include/x86_64-linux-gnu"})
+            if (fs::exists(fs::path(dir) / name, ec)) return true;
+        return false;
+    };
+    auto on_path = [&](const char* program) { return OnPath(path, platform_.PathSeparator(), program); };
+    if (!on_path("git") || !runs({"git", "--version"}, root_)) missing.push_back("git");
+    // a program compiled and linked as the game is: clang++, lld, the C++ library and the C library's files
+    fs::path dir = root_ / "check";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    std::ofstream(dir / "check.cpp") << "#include <cstdio>\n#include <string>\n#include <thread>\n"
+                                        "int main() { std::string s = \"ok\"; std::thread([&] { std::puts(s.c_str()); }).join(); }\n";
+    if (!runs({"clang++", "-std=c++20", "-fuse-ld=lld", "check.cpp", "-o", "check", "-lpthread"}, dir))
+        missing.push_back("a C++ compiler and its library (clang, lld, the C and C++ library headers)");
+    const bool x11 = header("X11/Xlib.h") && header("X11/extensions/Xext.h");
+    const bool wayland = header("wayland-client.h") && header("xkbcommon/xkbcommon.h") && header("EGL/egl.h") &&
+                         on_path("wayland-scanner") && (on_path("pkg-config") || on_path("pkgconf"));
+    const bool sound = header("alsa/asoundlib.h") || header("pulse/pulseaudio.h") || header("pipewire-0.3/pipewire/pipewire.h");
+    Log(std::string("system: X11 headers ") + (x11 ? "yes" : "no") + ", Wayland " + (wayland ? "yes" : "no") +
+        ", sound " + (sound ? "yes" : "no"));
+    if (!x11 && !wayland) missing.push_back("the X11 or Wayland development files (the game's window)");
+    if (!sound) missing.push_back("the ALSA, PulseAudio or PipeWire development files (the game's sound)");
+    bool vulkan = false;
+    for (const char* lib : {"/usr/lib/x86_64-linux-gnu/libvulkan.so.1", "/usr/lib64/libvulkan.so.1", "/usr/lib/libvulkan.so.1"})
+        vulkan = vulkan || fs::exists(lib, ec);
+    if (!vulkan) Log("system: no Vulkan loader (libvulkan.so.1) found: the game needs it and the GPU's Vulkan driver to run");
+    if (missing.empty()) return true;
+    std::string ids = DistroIds(), command;
+    auto like = [&](const char* id) { return ids.find(std::string(" ") + id + " ") != std::string::npos; };
+    if (like("debian") || like("ubuntu"))
+        command = "sudo apt install git curl clang lld cmake ninja-build pkg-config libx11-dev libxext-dev libxrandr-dev "
+                  "libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev libwayland-dev "
+                  "wayland-protocols libegl1-mesa-dev libdecor-0-dev libasound2-dev libpulse-dev libpipewire-0.3-dev "
+                  "libudev-dev libdbus-1-dev libvulkan1";
+    else if (like("fedora") || like("rhel"))
+        command = "sudo dnf install git curl clang lld cmake ninja-build pkgconf-pkg-config libX11-devel libXext-devel "
+                  "libXrandr-devel libXcursor-devel libXfixes-devel libXi-devel libXScrnSaver-devel libXtst-devel "
+                  "libxkbcommon-devel wayland-devel wayland-protocols-devel mesa-libEGL-devel libdecor-devel "
+                  "alsa-lib-devel pulseaudio-libs-devel pipewire-devel systemd-devel dbus-devel vulkan-loader";
+    else if (like("arch"))
+        command = "sudo pacman -S --needed git curl base-devel clang lld cmake ninja pkgconf libx11 libxext libxrandr "
+                  "libxcursor libxfixes libxi libxss libxtst libxkbcommon wayland wayland-protocols libdecor alsa-lib "
+                  "libpulse pipewire systemd-libs dbus vulkan-icd-loader";
+    else if (like("suse"))
+        command = "sudo zypper install git curl clang lld cmake ninja pkg-config libX11-devel libXext-devel "
+                  "libXrandr-devel libXcursor-devel libXfixes-devel libXi-devel libXss-devel libXtst-devel "
+                  "libxkbcommon-devel wayland-devel wayland-protocols-devel Mesa-libEGL-devel libdecor-devel "
+                  "alsa-devel libpulse-devel pipewire-devel systemd-devel dbus-1-devel libvulkan1";
+    error = "This system lacks what the build needs: ";
+    for (size_t i = 0; i < missing.size(); i++) error += (i ? "; " : "") + missing[i];
+    error += command.empty() ? ". Install them with your distribution's package manager (git, curl, clang, lld, CMake, "
+                               "Ninja, pkg-config and the development packages of X11, Wayland, xkbcommon, EGL, ALSA, "
+                               "PulseAudio or PipeWire), then press Install again."
+                             : ". Install them (in a terminal): " + command + " - then press Install again.";
+    return false;
 }
 
 bool Builder::GetSource(std::string& error) {
@@ -337,7 +502,7 @@ bool Builder::Compile(std::string& error) {
     // a toolchain other than the last build's: CMake's cache (its compiler and header checks) is made again
     std::string tools;
     for (const Tool& t : plan_.tools)
-        if (!t.optional) tools += t.id + " " + t.stamp + "\n";
+        if (!t.optional) tools += t.id + " " + (system_tools_.count(t.id) ? "system " + system_tools_.at(t.id) : t.stamp) + "\n";
     fs::path build = src / "out" / "build" / "release", seen = build / ".launcher-tools";
     std::string last;
     // (a build folder from before this record counts as another toolchain)
@@ -382,11 +547,13 @@ bool Builder::Install(std::string& error) {
     bool any = false;
     for (const auto& e : fs::directory_iterator(out, ec)) {
         std::string ext = Lower(U8(e.path().extension()));
-        if (!e.is_regular_file(ec) || (ext != ".exe" && ext != ".dll")) continue;
+        // the exes (".exe", none on Linux) and the libraries beside them (dxcompiler, DLSS; libdxcompiler.so)
+        const bool exe = ext == Lower(platform_.ExeSuffix()), lib = ext == ".dll" || ext == ".so";
+        if (!e.is_regular_file(ec) || (!exe && !lib)) continue;
         std::string name = Lower(U8(e.path().stem()));
         // the game's exes (GameConfig::exes); the build's own tools (xbe_recomp) stay
-        if (ext == ".exe" && std::none_of(game_.exes.begin(), game_.exes.end(),
-                                          [&](const std::string& x) { return Lower(x) == name; }))
+        if (exe && std::none_of(game_.exes.begin(), game_.exes.end(),
+                                [&](const std::string& x) { return Lower(x) == name; }))
             continue;
         fs::copy_file(e.path(), PlayDir() / e.path().filename(), fs::copy_options::overwrite_existing, ec);
         if (ec) {
@@ -409,6 +576,7 @@ bool Builder::Install(std::string& error) {
 }
 
 bool Builder::PathTooLong(std::string& message) const {
+    if (platform_.Os() != "windows") return false;  // msiexec's limit
     size_t length = root_.wstring().size();
     if (length <= kMaxRootLength) return false;
     message = "This folder's path is too long for Microsoft's Windows SDK installer (" + std::to_string(length) +
@@ -422,9 +590,17 @@ bool Builder::BuildAll(std::string& error) {
     cancel = false;
     auto steps = [&] {
         if ((!Built() && PathTooLong(error)) || !LoadToolchain(plan_, error)) return false;
-        for (const Tool& t : plan_.tools)
-            if (!t.optional && !InstallTool(t, error)) return false;
-        return GetSource(error) && PutXbe(error) && Compile(error) && Install(error);
+        system_tools_.clear();
+        for (const Tool& t : plan_.tools) {
+            std::string found;
+            if (t.optional) continue;
+            if (SystemTool(t, found)) {
+                system_tools_[t.id] = found;
+                continue;
+            }
+            if (!InstallTool(t, error)) return false;
+        }
+        return CheckSystem(error) && GetSource(error) && PutXbe(error) && Compile(error) && Install(error);
     };
     if (!steps()) {
         if (error != "cancelled") Log("build stopped: " + error);

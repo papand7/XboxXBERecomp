@@ -1,6 +1,8 @@
 #pragma once
 // The launcher's work, step by step, under one folder (root):
-//   tools\    clang, CMake, Ninja, MinGit, the C++ libraries, the Windows SDK (portable, nothing installed)
+//   tools\    clang, CMake, Ninja, MinGit, the C++ libraries, the Windows SDK (portable, nothing installed); on Linux
+//             clang, CMake and Ninja when the system has none new enough (its git, C++ library and the window's and
+//             sound's headers are the system's: CheckSystem says what to install)
 //   source\   the game's repository (git), its xbe in source\assets for the build
 //   play\     the built exe, its settings, saves and logs; play\assets is the player's game (a junction to their
 //             folder, or their disc image linked or copied)
@@ -67,6 +69,11 @@ public:
     // steps, for the test tool
     bool LoadToolchain(Plan& plan, std::string& error);
     bool InstallTool(const Tool& tool, std::string& error);
+    // off Windows: the system's own programs stand in for the tool (Tool::system), found is what was found
+    bool SystemTool(const Tool& tool, std::string& found);
+    // off Windows: what the build needs of the system and cannot fetch (git, the C++ library, the window's and sound's
+    // development headers); false with what to install, as the distribution's package manager names it
+    bool CheckSystem(std::string& error);
     bool GetSource(std::string& error);
     bool PutXbe(std::string& error);
     bool Compile(std::string& error);
@@ -87,6 +94,7 @@ private:
     Http& http_;
     Platform& platform_;
     Plan plan_;
+    std::map<std::string, std::string> system_tools_;  // a tool id: the system's version used in its place
     std::mutex log_lock_;
 };
 

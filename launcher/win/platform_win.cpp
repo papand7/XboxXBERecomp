@@ -235,6 +235,7 @@ public:
 
     std::string ExeSuffix() const override { return ".exe"; }
     char PathSeparator() const override { return ';'; }
+    std::string Os() const override { return "windows"; }
     std::string GetEnv(const std::string& name) const override {
         std::wstring n = Wide(name);
         DWORD len = GetEnvironmentVariableW(n.c_str(), nullptr, 0);

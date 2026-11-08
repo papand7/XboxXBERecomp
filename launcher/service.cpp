@@ -4,7 +4,9 @@
 // {"cmd": "build"}, {"cmd": "cancel"}, {"cmd": "play"}, {"cmd": "remove_build"}, {"cmd": "music", "path": ...},
 // {"cmd": "check_update"}. Out: {"ev": "state", ...}, {"ev": "status", "step", "detail", "fraction"},
 // {"ev": "log", "line"}, {"ev": "done", "job", "ok", "message"}, {"ev": "error", "message"}.
-//   <short>LauncherService.exe --root <work folder> --games <folder whose .iso files are the player's game>
+//   <short>LauncherService(.exe) --root <work folder> --games <folder whose .iso files are the player's game>
+// Windows and Linux alike (the Linux one: posix/platform_posix.cpp, the system's own compilers where they do)
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -13,6 +15,9 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -37,7 +42,13 @@ using namespace launcher;
 
 namespace {
 
-constexpr const char* kLicenseUrl = "https://go.microsoft.com/fwlink/?LinkId=2179911";  // Visual Studio Build Tools
+// Visual Studio Build Tools: the C++ libraries and the Windows SDK the Windows build fetches (a Linux build fetches
+// nothing of Microsoft's: no license to accept)
+#ifdef _WIN32
+constexpr const char* kLicenseUrl = "https://go.microsoft.com/fwlink/?LinkId=2179911";
+#else
+constexpr const char* kLicenseUrl = "";
+#endif
 
 std::mutex g_out;
 void Send(const json& j) {
@@ -49,12 +60,17 @@ void Send(const json& j) {
 }
 
 uint64_t FreeBytes(const fs::path& dir) {
-    ULARGE_INTEGER avail{};
     fs::path d = dir;
     std::error_code ec;
     while (!d.empty() && !fs::exists(d, ec)) d = d.parent_path();
+#ifdef _WIN32
+    ULARGE_INTEGER avail{};
     GetDiskFreeSpaceExW(d.c_str(), &avail, nullptr, nullptr);
     return avail.QuadPart;
+#else
+    fs::space_info s = fs::space(d, ec);
+    return ec ? 0 : uint64_t(s.available);
+#endif
 }
 
 std::string Lower(std::string s) {
@@ -91,7 +107,8 @@ struct Service {
                   {"busy", bool(busy)},
                   {"job", job_name},
                   {"update", bool(update)},
-                  {"agreed", fs::exists(root / "agreed.txt", ec)},
+                  {"agreed", !*kLicenseUrl || fs::exists(root / "agreed.txt", ec)},
+                  {"os", platform->Os()},
                   {"license_url", kLicenseUrl},
                   {"free_bytes", FreeBytes(root)},
                   {"build_bytes", builder->BuildFilesBytes()},
@@ -233,16 +250,39 @@ struct Service {
     }
 };
 
-fs::path Arg(int argc, wchar_t** argv, const wchar_t* name) {
+#ifdef _WIN32
+using Char = wchar_t;
+#define ARG(s) L##s
+#else
+using Char = char;
+#define ARG(s) s
+#endif
+fs::path Arg(int argc, Char** argv, const Char* name) {
     for (int i = 1; i + 1 < argc; i++)
-        if (std::wstring(argv[i]) == name) return argv[i + 1];
+        if (std::basic_string<Char>(argv[i]) == name) return fs::path(argv[i + 1]);
     return {};
+}
+
+// this program's own file
+fs::path Self() {
+#ifdef _WIN32
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    return self;
+#else
+    std::error_code ec;
+    return fs::read_symlink("/proc/self/exe", ec);
+#endif
 }
 
 }  // namespace
 
+#ifdef _WIN32
 int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
+#else
+int main(int argc, char** argv) {
+#endif
     std::setvbuf(stdout, nullptr, _IOFBF, 1 << 16);
     Service s;
     std::string e;
@@ -251,11 +291,9 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
     s.game.version = kLauncherVersion;
-    wchar_t self[MAX_PATH];
-    GetModuleFileNameW(nullptr, self, MAX_PATH);
-    s.games = Arg(argc, argv, L"--games");
-    if (s.games.empty()) s.games = fs::path(self).parent_path();
-    s.root = Arg(argc, argv, L"--root");
+    s.games = Arg(argc, argv, ARG("--games"));
+    if (s.games.empty()) s.games = Self().parent_path();
+    s.root = Arg(argc, argv, ARG("--root"));
     if (s.root.empty()) s.root = s.games / s.game.short_name;
     std::error_code ec;
     fs::create_directories(s.root, ec);

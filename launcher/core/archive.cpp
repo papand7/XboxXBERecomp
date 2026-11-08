@@ -37,6 +37,19 @@ fs::path Under(const fs::path& dest, const std::string& rel) { return dest / Pat
 
 bool Cancelled(const std::atomic<bool>* cancel) { return cancel && cancel->load(); }
 
+// off Windows: an unpacked program stays one (the archive's mode, its execute bits)
+void KeepMode(const fs::path& file, uint32_t mode) {
+#ifndef _WIN32
+    if (mode & 0111) {
+        std::error_code ec;
+        fs::permissions(file, fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+                        fs::perm_options::add, ec);
+    }
+#else
+    (void)file, (void)mode;
+#endif
+}
+
 }  // namespace
 
 std::string StripComponents(const std::string& name, int n) {
@@ -88,6 +101,7 @@ bool Unzip(const fs::path& zip, const fs::path& dest, const EntryFilter& filter,
             error = "cannot write " + opath + " from " + zpath;
             return false;
         }
+        if ((st.m_version_made_by >> 8) == 3) KeepMode(out, st.m_external_attr >> 16);  // made on Unix: its mode
         done += st.m_uncomp_size;
         if (progress) progress(done, total);
     }
@@ -187,6 +201,8 @@ private:
                     error = "cannot write " + U8(out);
                     return false;
                 }
+                out_path_ = out;
+                out_mode_ = uint32_t(Number(header_ + 100, 8));
                 keep_ = true;
                 written_[name] = rel_;
             }
@@ -206,6 +222,7 @@ private:
                     fs::create_directories(out.parent_path(), ec);
                     fs::copy_file(Under(dest_, it->second), out, fs::copy_options::overwrite_existing, ec);
                     if (!ec) written_[name] = rel;
+                    if (!ec) KeepMode(out, uint32_t(Number(header_ + 100, 8)));
                 }
             }
         }
@@ -218,7 +235,10 @@ private:
     }
 
     bool EndEntry(std::string& /*error*/) {
-        if (out_.is_open()) out_.close();
+        if (out_.is_open()) {
+            out_.close();
+            KeepMode(out_path_, out_mode_);
+        }
         if (meta_) {
             if (meta_type_ == 'L') long_name_ = meta_buf_.c_str();
             else if (meta_type_ == 'K') long_link_ = meta_buf_.c_str();
@@ -266,6 +286,8 @@ private:
     char meta_type_ = 0;
     uint64_t remaining_ = 0, pad_ = 0, skip_ = 0;
     std::ofstream out_;
+    fs::path out_path_;
+    uint32_t out_mode_ = 0;
     std::string rel_, meta_buf_, long_name_, long_link_, pax_path_;
     std::map<std::string, std::string> written_;  // archive name -> where it was written
 };
@@ -319,6 +341,75 @@ bool UntarXz(const fs::path& file, const fs::path& dest, const EntryFilter& filt
         }
         if (b.in_size == 0 && b.in_pos == 0 && !in) {
             error = "the xz file ends early: " + U8(file);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool UntarGz(const fs::path& file, const fs::path& dest, const EntryFilter& filter, const Progress& progress,
+             const std::atomic<bool>* cancel, std::string& error) {
+    std::ifstream in(file, std::ios::binary);
+    if (!in) {
+        error = "cannot open " + U8(file);
+        return false;
+    }
+    std::error_code ec;
+    uint64_t total = fs::file_size(file, ec), done = 0;
+    std::vector<uint8_t> inbuf(1 << 20), outbuf(4 << 20);
+    // the gzip header (RFC 1952): its fixed 10 bytes, then the optional fields its flags name
+    in.read(reinterpret_cast<char*>(inbuf.data()), std::streamsize(inbuf.size()));
+    size_t have = size_t(in.gcount()), at = 10;
+    done += have;
+    if (have < 18 || inbuf[0] != 0x1F || inbuf[1] != 0x8B || inbuf[2] != 8) {
+        error = "not a gzip file: " + U8(file);
+        return false;
+    }
+    uint8_t flags = inbuf[3];
+    if (flags & 4) at += 2 + size_t(inbuf[10] | inbuf[11] << 8);  // FEXTRA
+    for (uint8_t f : {uint8_t(8), uint8_t(16)})                    // FNAME, FCOMMENT: zero ended
+        if (flags & f) {
+            while (at < have && inbuf[at]) at++;
+            at++;
+        }
+    if (flags & 2) at += 2;  // FHCRC
+    if (at >= have) {
+        error = "the gzip header is damaged: " + U8(file);
+        return false;
+    }
+    mz_stream z{};
+    if (mz_inflateInit2(&z, -MZ_DEFAULT_WINDOW_BITS) != MZ_OK) {  // raw deflate: the header was read here
+        error = "out of memory for the gzip decoder";
+        return false;
+    }
+    std::unique_ptr<mz_stream, int (*)(mz_stream*)> closer(&z, mz_inflateEnd);
+    TarReader tar(dest, filter);
+    z.next_in = inbuf.data() + at;
+    z.avail_in = unsigned(have - at);
+    for (;;) {
+        if (Cancelled(cancel)) {
+            error = "cancelled";
+            return false;
+        }
+        if (z.avail_in == 0) {
+            in.read(reinterpret_cast<char*>(inbuf.data()), std::streamsize(inbuf.size()));
+            z.next_in = inbuf.data();
+            z.avail_in = unsigned(in.gcount());
+            done += z.avail_in;
+            if (progress) progress(done, total);
+        }
+        z.next_out = outbuf.data();
+        z.avail_out = unsigned(outbuf.size());
+        int r = mz_inflate(&z, MZ_NO_FLUSH);
+        size_t out = outbuf.size() - z.avail_out;
+        if (out && !tar.Feed(outbuf.data(), out, error)) return false;
+        if (r == MZ_STREAM_END || tar.Ended()) break;
+        if (r != MZ_OK && r != MZ_BUF_ERROR) {
+            error = "the gzip data is damaged (" + std::to_string(r) + ") in " + U8(file);
+            return false;
+        }
+        if (z.avail_in == 0 && !in && out == 0) {
+            error = "the gzip file ends early: " + U8(file);
             return false;
         }
     }
