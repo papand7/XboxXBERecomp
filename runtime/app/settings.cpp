@@ -238,6 +238,7 @@ void Load() {
     s.keyboard = t["keyboard"].value_or(s.keyboard);
     s.keyboard_alone = t["keyboard_alone"].value_or(s.keyboard_alone);
     s.mouse_look = t["mouse_look"].value_or(s.mouse_look);
+    s.touch_controls = t["touch_controls"].value_or(s.touch_controls);
     s.mouse_sensitivity = std::clamp<uint32_t>(t["mouse_sensitivity"].value_or(s.mouse_sensitivity), 10, 1000);
     s.mouse_invert_y = t["mouse_invert_y"].value_or(s.mouse_invert_y);
     s.monitor = t["monitor"].value_or(s.monitor);
@@ -390,6 +391,7 @@ toml::table Table() {
         t.insert("mouse_sensitivity", int64_t(s.mouse_sensitivity));
         t.insert("mouse_invert_y", s.mouse_invert_y);
     }
+    t.insert("touch_controls", s.touch_controls);
     if (!pad.empty()) t.insert("gamepad", pad);
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);

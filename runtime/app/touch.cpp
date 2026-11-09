@@ -4,9 +4,13 @@
 // fire button drags to look too). Drawn over the frame in the ImGui frame; hidden while a controller is connected or
 // the settings window is open (whose fingers are then ImGui's pointer). The buttons are GameInfo::touch_buttons, else
 // the console's face buttons, triggers, Start and Back.
-#ifndef _WIN32
-
 #include <SDL3/SDL.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -59,16 +63,28 @@ constexpr float kStickRadius = 0.12f;  // screen heights for a full push
 constexpr float kLookFull = 0.9f;      // screen heights a second for a full right stick
 constexpr float kSettingsW = 0.16f, kSettingsH = 0.07f;
 
+// Android always; elsewhere the setting (Settings::touch_controls, read live) or XBE_TOUCH=1
 bool Enabled() {
-    static const bool on = [] {
 #ifdef __ANDROID__
-        return true;
+    return true;
 #else
+    static const bool env = [] {
         const char* e = std::getenv("XBE_TOUCH");
         return e && *e == '1';
-#endif
     }();
-    return on;
+    return env || Get().touch_controls;
+#endif
+}
+
+// the window's size in pixels (the SDL window, or the Windows client area)
+void WindowSize(int& w, int& h) {
+#ifdef _WIN32
+    RECT r{};
+    if (HWND hwnd = static_cast<HWND>(Window())) GetClientRect(hwnd, &r);
+    w = r.right - r.left, h = r.bottom - r.top;
+#else
+    if (SDL_Window* sw = static_cast<SDL_Window*>(Window())) SDL_GetWindowSize(sw, &w, &h);
+#endif
 }
 
 // a button's centre in screen heights from the top left: its x from the right edge (from the left when negative), its
@@ -114,7 +130,7 @@ bool TouchEvent(const void* event) {
         e.type != SDL_EVENT_FINGER_CANCELED)
         return false;
     int iw = 0, ih = 0;
-    if (SDL_Window* w = static_cast<SDL_Window*>(Window())) SDL_GetWindowSize(w, &iw, &ih);
+    WindowSize(iw, ih);
     if (iw <= 0 || ih <= 0) return true;
     // the settings window: the finger is its pointer
     if (OverlayOpen()) {
@@ -222,6 +238,20 @@ bool TouchRead(float* out) {
     return true;
 }
 
+void TouchPoint(uint32_t id, int kind, float x, float y) {
+    int iw = 0, ih = 0;
+    WindowSize(iw, ih);
+    if (iw <= 0 || ih <= 0) return;
+    SDL_Event e{};
+    e.type = kind == 0   ? SDL_EVENT_FINGER_DOWN
+             : kind == 1 ? SDL_EVENT_FINGER_MOTION
+             : kind == 2 ? SDL_EVENT_FINGER_UP
+                         : SDL_EVENT_FINGER_CANCELED;
+    e.tfinger.fingerID = id;
+    e.tfinger.x = x / float(iw), e.tfinger.y = y / float(ih);  // 0 to 1 of the window, as SDL gives them
+    TouchEvent(&e);
+}
+
 bool TouchControlsShown() {
     std::lock_guard lock(g_lock);
     return Shown();
@@ -278,5 +308,3 @@ void DrawTouch() {
 }
 
 }  // namespace app
-
-#endif  // !_WIN32

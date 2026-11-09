@@ -165,6 +165,9 @@ void Graphics(Settings& s) {
     }
     ImGui::TextDisabled("MSAA smooths the edges of the 3D scene at once; render scale above 100%% also smooths edges.");
     if (ImGui::Checkbox("Show frames a second", &s.show_fps)) Save();
+#ifndef __ANDROID__  // Android always has the touch buttons
+    if (ImGui::Checkbox("On-screen touch controls (for a touch screen)", &s.touch_controls)) Save();
+#endif
     if (kGame.hit_feedback) {
         int hit = int(s.hit_feedback % 3);
         const char* hits[] = {"Off", "Marker", "Marker and sound"};

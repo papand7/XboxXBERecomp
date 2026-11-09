@@ -2878,6 +2878,7 @@ void D3D12Backend::RenderUi() {
     app::DrawHud(fps_);
     app::DrawOverlay();
     if (app::kGame.ui) app::kGame.ui(fps_);
+    app::DrawTouch();
     ImGui::Render();
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
     cl_->SetDescriptorHeaps(1, uh);

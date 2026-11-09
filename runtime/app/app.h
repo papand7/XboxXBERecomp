@@ -45,6 +45,9 @@ struct Settings {
     // the mouse moves controller 1's right stick, for a title that offers it (GameInfo::mouse_look): the cursor is
     // held in the window while the game has it
     bool mouse_look = true;
+    // the on-screen touch controls on a touch screen (Windows; Android always has them): a finger on the screen plays
+    // controller 1, see app/touch.cpp
+    bool touch_controls = false;
     uint32_t mouse_sensitivity = 100;  // percent
     bool mouse_invert_y = false;
     uint32_t monitor = 0;            // 0 the primary display, n the nth display Windows lists
@@ -172,6 +175,13 @@ struct GameFiles {
 bool FindGame(GameFiles& game);
 int Instance();  // --instance N on the command line, 0 without: a second copy on this PC for system link tests
 void* Window();  // HWND (off Windows the SDL_Window*)
+// on-screen touch controls (app/touch.cpp): Android's, Windows' with the touch_controls setting, else XBE_TOUCH=1
+bool TouchEvent(const void* sdl_event);         // window thread, each event first; true: taken (fingers, Android's back)
+// a Windows touch point (WM_POINTER*): kind 0 down, 1 moved, 2 up, 3 cancelled; x, y in client pixels
+void TouchPoint(uint32_t id, int kind, float x, float y);
+bool TouchRead(float* out);  // input::kControls entries: controller 1's inputs from the screen, 0 to 1 each; false while hidden
+bool TouchControlsShown();
+void DrawTouch();                               // inside the ImGui frame, UiLock held
 #ifndef _WIN32
 // off Windows (app/main_sdl.cpp, SDL3): the Vulkan renderer's way into the window, and the displays
 std::vector<const char*> VulkanInstanceExtensions();  // the instance extensions the window's surface needs
@@ -187,11 +197,6 @@ std::vector<Mode> DisplayModes();  // the monitor setting's display's fullscreen
 std::string Utf8(const wchar_t* w);  // a wide string (kGame's, UTF-32 here) as UTF-8
 // a message box over the game window (SDL's); yes_no: Yes and No buttons, true for Yes, else OK and true
 bool MessageBox(const wchar_t* text, bool error, bool yes_no = false);
-// on-screen touch controls (app/touch.cpp): Android's, elsewhere with XBE_TOUCH=1
-bool TouchEvent(const void* sdl_event);         // window thread, each event first; true: taken (fingers, Android's back)
-bool TouchRead(float* out);  // input::kControls entries: controller 1's inputs from the screen, 0 to 1 each; false while hidden
-bool TouchControlsShown();
-void DrawTouch();                               // inside the ImGui frame, UiLock held
 #ifdef __ANDROID__
 // Android: the other image's library started in a new process of the app (kernel::Relaunch's exec), this one ends
 [[noreturn]] void AndroidRelaunch(const char* exe);

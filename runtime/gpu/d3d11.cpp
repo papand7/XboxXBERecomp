@@ -1962,6 +1962,7 @@ void D3D11Backend::RenderUi() {
     app::DrawHud(fps_);
     app::DrawOverlay();
     if (app::kGame.ui) app::kGame.ui(fps_);
+    app::DrawTouch();
     ImGui::Render();
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     ForgetDrawState();

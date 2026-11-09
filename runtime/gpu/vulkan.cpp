@@ -8747,9 +8747,7 @@ void VulkanBackend::RenderUi() {
     app::DrawHud(fps_);
     app::DrawOverlay();
     if (app::kGame.ui) app::kGame.ui(fps_);
-#ifndef _WIN32
     app::DrawTouch();
-#endif
     ImGui::Render();
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd_);
     ForgetDrawState();

@@ -5,6 +5,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef WINVER
+#define WINVER 0x0A00  // the touch screen's WM_POINTER messages (Windows 8.1 and up)
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #include <windows.h>
 #include <dbghelp.h>
 #include <timeapi.h>
@@ -248,6 +254,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (HCURSOR c = kGame.menu_up && kGame.menu_up() && !OverlayOpen() ? MenuCursor(hwnd) : nullptr) {
             SetCursor(c);
             return TRUE;
+        }
+    }
+    // a touch screen's fingers (WM_POINTER), for the on-screen touch controls when they are on (app/touch.cpp)
+    if (msg == WM_POINTERDOWN || msg == WM_POINTERUPDATE || msg == WM_POINTERUP) {
+        POINTER_INFO pi{};
+        const uint32_t id = GET_POINTERID_WPARAM(wp);
+        if (app::Get().touch_controls && GetPointerInfo(id, &pi) && pi.pointerType == PT_TOUCH) {
+            POINT pt = pi.ptPixelLocation;
+            ScreenToClient(hwnd, &pt);
+            app::TouchPoint(id, msg == WM_POINTERDOWN ? 0 : msg == WM_POINTERUPDATE ? 1 : 2, float(pt.x), float(pt.y));
         }
     }
     // a key binding the settings window waits for takes the next mouse button too
