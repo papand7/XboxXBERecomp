@@ -17,6 +17,9 @@
 #include <shellapi.h>
 #else
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 #include <algorithm>
@@ -274,6 +277,12 @@ fs::path Self() {
     wchar_t self[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     return self;
+#elif defined(__APPLE__)
+    char self[4096];
+    uint32_t size = sizeof self;
+    std::error_code ec;
+    if (_NSGetExecutablePath(self, &size) != 0) return {};
+    return fs::canonical(self, ec);
 #else
     std::error_code ec;
     return fs::read_symlink("/proc/self/exe", ec);
