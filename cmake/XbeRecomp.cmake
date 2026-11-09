@@ -385,6 +385,11 @@ function(xbe_runtime_target target)
                     ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.param ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.bin
                     ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.param $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models)
     endif()
-    # lld keeps the recompiled weak functions overridable by the host ones
-    target_link_options(${target} PRIVATE -fuse-ld=lld -g)
+    # lld keeps the recompiled weak functions overridable by the host ones (macOS: Apple's linker, which does the same
+    # with weak definitions; its clang has no lld)
+    if(APPLE)
+        target_link_options(${target} PRIVATE -g)
+    else()
+        target_link_options(${target} PRIVATE -fuse-ld=lld -g)
+    endif()
 endfunction()
