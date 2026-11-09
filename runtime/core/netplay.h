@@ -35,6 +35,9 @@ bool Configured();  // XBE_NETPLAY set
 bool Start();
 // before relaunching into another image: the socket closed (the next process holds the lobby again)
 void Stop();
+// Title rules selected before Start; the host's snapshot is carried in the handshake.
+void SetSessionRules(uint32_t rules);
+uint32_t SessionRules();
 bool Active();
 int Players();
 int Me();  // this copy's player, 0 the host

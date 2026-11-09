@@ -154,9 +154,8 @@ struct GraphicsStyle {
     // sparks and debris from explosions (EmitParticles), simulated on the GPU in the world (gravity, drag, wind, smoke
     // and fire rising, sparks and chips bouncing off the scene's depth), drawn over the scene before its tone mapping
     bool particles = true;
-    // blood (every style and renderer, drawn over the picture: app/blood.cpp): a spray where a player's shot hits a
-    // character, and red at the edges of a player's view as they are hit, fading
-    bool blood = false;
+    // Blood: world-space character-hit particles (game hooks) and fading red view edges when hurt (app/blood.cpp).
+    bool blood = true;
     // depth of field (Vulkan; every style but Retro): the scene blurred by its distance from the focus, the gun and
     // hands kept sharp; Distance: the far scenery alone, Focus: what is in the middle of the view sharp, nearer and
     // farther blurred, more while aiming down the sights (SetAiming)

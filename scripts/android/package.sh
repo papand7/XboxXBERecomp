@@ -5,7 +5,7 @@
 # imports it in the app. The package holds the player's game: it is made on the player's machine, for the player
 # alone; never commit it or upload it anywhere.
 #
-#   package.sh -r REPO [-a ABI] [-n NDK] [-d DXC_DIR] [-p PACK_DIR] [-o ZIP] [-j JOBS]
+#   package.sh -r REPO [-a ABI] [-n NDK] [-d DXC_DIR] [-p PACK_DIR] [-o ZIP] [-j JOBS] [-s ASSETS]
 #     REPO     the game repository, the player's disc in its assets/ (as for the desktop build)
 #     ABI      arm64-v8a (phones, the default) or x86_64 (the emulator)
 #     NDK      the Android NDK (default $ANDROID_NDK_HOME, else the newest under $ANDROID_HOME/ndk)
@@ -22,10 +22,12 @@ ABI=arm64-v8a
 NDK=${ANDROID_NDK_HOME:-}
 DXC=
 PACK=
+ASSETS=
 ZIP=
 JOBS=$(nproc)
-while getopts "r:a:n:d:p:o:j:" o; do
+while getopts "r:a:n:d:p:o:j:s:" o; do
     case $o in
+        s) ASSETS=$OPTARG ;;
         r) REPO=$OPTARG ;;
         a) ABI=$OPTARG ;;
         n) NDK=$OPTARG ;;
@@ -50,6 +52,10 @@ EXES=$(read_json exes)
 [ -n "$EXES" ] || EXES=$(read_json exe)
 ZIP=${ZIP:-$REPO/out/${SHORT// /}-android-package.zip}
 [ -d "$REPO/assets" ] || { echo "package: no assets/ in $REPO (the disc's files or its .iso)" >&2; exit 1; }
+
+ASSETS=${ASSETS:-$REPO/assets}
+[ -d "$ASSETS" ] || { echo "package: no disc assets in $ASSETS" >&2; exit 1; }
+ASSETS=$(cd "$ASSETS" && pwd)
 
 # DXC for the ABI
 if [ -z "$DXC" ]; then
@@ -84,7 +90,7 @@ for e in $EXES; do
     LIBS+=("\"lib$e.so\"")
 done
 cp "$DXC/libdxcompiler.so" "$STAGE/"
-ln -s "$REPO/assets" "$STAGE/assets"
+ln -s "$ASSETS" "$STAGE/assets"
 [ -n "$PACK" ] && [ -d "$PACK" ] && ln -s "$(cd "$PACK" && pwd)" "$STAGE/texture_pack"
 SDL_TAG=$(grep -o 'GIT_TAG release-[0-9.]*' "$HERE/../../cmake/XbeRecomp.cmake" | head -1 | sed 's/GIT_TAG release-//')
 SDK_REV=$(git -C "$HERE/../.." rev-parse --short HEAD 2>/dev/null || echo unknown)

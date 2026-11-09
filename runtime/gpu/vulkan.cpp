@@ -516,6 +516,7 @@ struct Target {
     Image glow, light_a, light_b, light_list;
     Image light_pa, light_pb, light_rank;  // the tiles' 8 x 8 parts' sums, the tiles' ranks
     Image atmo[5];  // light shafts and fog: a quarter of the scene's size, then each half the one before
+    Image atmo_shafts;  // quarter-resolution scattering, alpha is scene depth for bilateral upsampling
     Image atmo_pick;  // their lights: each quarter's bright centre, the sky's colour
     Image bounce;     // bounced light: the gathered light, a quarter of the scene's size
     Image rt_ao;      // ray traced ambient occlusion: what is open (r) and the distance (g), the scene's size
@@ -1150,11 +1151,10 @@ float4 ps(O i) : SV_Target {
 
 // light shafts and fog (VulkanBackend::AtmospherePass, RGBA16F images): src makes a quarter-size picture of what
 // lights the air (the sky, by its brightness, and the brightest surfaces: lamps, windows) as colour times weight, a
-// the weight; down halves it, four times, to a field whose slope points to the light; comp marches each pixel up that
-// slope through the quarter picture (the shafts: what lies between it and the light, fading) and fogs it by its
-// distance in the colour of the sky about it. b1 p: [0] 1/width, 1/height, shafts, fog; [1] W-buffer, seconds,
+// the weight; down halves it four times to find local light sources. shafts integrates at quarter resolution;
+// comp upsamples it with depth rejection and adds distance fog in the sky's colour. b1 p: [0] 1/width, 1/height, shafts, fog; [1] W-buffer, seconds,
 // 1/field width, 1/field height; [2] fog's density, the source's sky threshold, the light's reach, aspect.
-// t0 the scene (src, comp) or the level below (down), t1 depth, t2 the quarter picture, t3 the field; s0 linear, s1 point
+// t0 the scene (src, comp) or level below (down), t1 depth, t2 sources (shafts) or scattering (comp), t3 lights; s0 linear, s1 point
 const char* kAtmoHlsl = R"(
 cbuffer P : register(b1) { float4 p[4]; };
 Texture2D t0 : register(t0);
@@ -1182,7 +1182,15 @@ float4 src(O i) : SV_Target {
         float2 uv = i.uv + (float2(k & 1, k >> 1) - 0.5) * 2 * px;
         float3 c = t0.SampleLevel(ls, uv, 0).rgb;
         float d = depthtex.SampleLevel(pt, uv, 0), l = luma(c);
-        float w = d >= 0.99999 ? smoothstep(p[2].y * 0.5, p[2].y + 0.3, l) : 0.8 * smoothstep(0.75, 0.95, l);
+        // Broad pale walls must not emit shafts. Surface sources need a bright, local contrast;
+        // the sky uses its own threshold, so a dark night sky contributes very little.
+        float surround = 0;
+        [unroll] for (int n = 0; n < 4; n++) {
+            float2 offset = n == 0 ? float2(12, 0) : n == 1 ? float2(-12, 0) : n == 2 ? float2(0, 12) : float2(0, -12);
+            surround += luma(t0.SampleLevel(ls, uv + offset * px, 0).rgb);
+        }
+        float local = smoothstep(0.08, 0.3, l - surround * 0.25);
+        float w = d >= 0.99999 ? smoothstep(p[2].y + 0.1, p[2].y + 0.6, l) : 0.5 * smoothstep(0.85, 1.05, l) * local;
         acc += float4(c * w, w);
     }
     return acc / 4;
@@ -1199,6 +1207,7 @@ float4 down(O i) : SV_Target {
 // its texel), at those places the depth (t1) and the scene (t2)
 float4 pick(O i) : SV_Target {
     int k = int(i.pos.x);
+    if (k != 4 && p[0].z <= 0) return 0;
     uint fw = uint(1 / p[1].z + 0.5), fh = uint(1 / p[1].w + 0.5);
     float4 acc = 0, skyacc = 0, all = 0;
     float2 best = 0.5;
@@ -1218,7 +1227,44 @@ float4 pick(O i) : SV_Target {
             if (s.a > most) most = s.a, best = uv;
         }
     if (k == 4) return float4(skyacc.a > all.a * 0.02 ? skyacc.rgb / skyacc.a : all.rgb / max(all.a, 1), skyacc.a / max(all.a, 1));
-    return float4(best, most, 0);  // the quarter's brightest spot: its light (a lamp, an opening, the sun's sky)
+    // Centroid of the strongest local cluster: no snapping between adjacent coarse texels as the view moves.
+    float2 centre = 0;
+    float weight = 0;
+    for (uint y = 0; y < fh; y++)
+        for (uint x = 0; x < fw; x++) {
+            float2 uv = (float2(x, y) + 0.5) * p[1].zw;
+            float2 delta = (uv - best) * float2(p[2].w, 1);
+            float w = pow(saturate(t0.Load(int3(x, y, 0)).a / max(most, 1e-4)), 4) *
+                      saturate(1 - dot(delta, delta) / 0.0225);
+            centre += uv * w;
+            weight += w;
+        }
+    return float4(weight > 0 ? centre / weight : best, most, 0);
+}
+// Expensive integration runs at quarter resolution (one sixteenth the pixels), never at display size.
+float4 shafts(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 sh = 0;
+    float j = noise(floor(i.pos.xy)) * 0.5;  // fixed spatial jitter: no animated grain
+    [unroll] for (int k = 0; k < 4; k++) {
+        float4 L = field.Load(int3(k, 0, 0));
+        if (L.z < 0.025) continue;
+        float2 distance = (uv - L.xy) * float2(p[2].w, 1);
+        float reach = saturate(1 - length(distance) / p[2].z);
+        if (reach <= 0) continue;
+        float2 delta = (uv - L.xy) * (0.85 / 24);
+        float2 q = uv - delta * j;
+        float3 acc = 0;
+        float decay = 1, weight = 0;
+        [loop] for (int n = 0; n < 24; n++) {
+            q -= delta;
+            acc += src4.SampleLevel(ls, q, 0).rgb * decay;
+            weight += decay;
+            decay *= 0.94;
+        }
+        sh += acc / max(weight, 1e-4) * smoothstep(0.025, 0.15, L.z) * reach * reach;
+    }
+    return float4(sh * p[0].z * 0.8, depthtex.SampleLevel(pt, uv, 0));
 }
 float4 comp(O i) : SV_Target {
     float2 uv = i.uv;
@@ -1226,26 +1272,25 @@ float4 comp(O i) : SV_Target {
     float d = depthtex.SampleLevel(pt, uv, 0);
     bool sky = d >= 0.99999;
     float3 skyc = field.Load(int3(4, 0, 0)).rgb;
-    // the shafts: from each quarter's light toward this pixel through the quarter picture, what lies between cutting
-    // them into rays (GPU Gems 3, 13)
     float3 sh = 0;
     if (p[0].z > 0) {
-        float j = noise(uv * 613.0 + p[1].y);
-        [unroll] for (int k = 0; k < 4; k++) {
-            float4 L = field.Load(int3(k, 0, 0));
-            if (L.z < 0.02) continue;
-            float2 delta = (uv - L.xy) * (0.85 / 32);
-            float2 q = uv - delta * j;
-            float3 acc = 0;
-            float decay = 1;
-            [loop] for (int s = 0; s < 32; s++) {
-                q -= delta;
-                acc += src4.SampleLevel(ls, q, 0).rgb * decay;
-                decay *= 0.965;
-            }
-            sh += acc / 32 * saturate(L.z * 4);
+        // Bilateral reconstruction preserves silhouettes, avoiding shafts bleeding across walls and the weapon.
+        float2 size = p[3].zw;
+        float2 pixel = uv * size - 0.5;
+        int2 base = int2(floor(pixel));
+        float2 f = frac(pixel);
+        float weights = 0;
+        [unroll] for (int y = 0; y < 2; y++) [unroll] for (int x = 0; x < 2; x++) {
+            int2 at = clamp(base + int2(x, y), int2(0, 0), int2(size) - 1);
+            float4 v = src4.Load(int3(at, 0));
+            bool sampleSky = v.a >= 0.99999;
+            float w = (x ? f.x : 1 - f.x) * (y ? f.y : 1 - f.y);
+            w *= sampleSky == sky ? exp(-abs(viewz(v.a) - viewz(d)) / max(viewz(d) * 0.1, 0.05)) : 0;
+            sh += v.rgb * w;
+            weights += w;
         }
-        sh *= p[0].z * 1.6;
+        sh = weights > 1e-4 ? sh / weights : 0;
+        if (!sky && p[1].x != 0) sh *= smoothstep(1, 8, viewz(d));
     }
     // the fog: by distance, the sky's colour, not over the sky itself; only over a W-buffer, whose depth is the
     // distance (a Z-buffer's, Driving.xbe's, is not metres without the projection: every pixel came out far, fogged
@@ -4040,6 +4085,8 @@ private:
         DropImage(t.water_background), DropImage(t.post_depth);
         DropImage(t.glow), DropImage(t.light_a), DropImage(t.light_b), DropImage(t.light_list);
         DropImage(t.light_pa), DropImage(t.light_pb), DropImage(t.light_rank);
+        for (Image& im : t.atmo) DropImage(im);
+        DropImage(t.atmo_pick), DropImage(t.atmo_shafts);
         DropImage(t.rt_ao), DropImage(t.rt_depth), DropImage(t.rt_gi), DropImage(t.rt_vol), DropImage(t.gtao);
         DropImage(t.dof_focus[0]), DropImage(t.dof_focus[1]);
         DropImage(t.hdr_scene);
@@ -10539,14 +10586,15 @@ void VulkanBackend::MotionBlurPass(Target& rt, Target* ds) {
 }
 
 // light shafts and fog over the scene: what lights the air at a quarter size, halved four times to a field that
-// points to the light, then the scene marched toward it and fogged (kAtmoHlsl)
+// locates the lights. Scattering is integrated at quarter resolution, then upsampled with depth rejection (kAtmoHlsl).
 void VulkanBackend::AtmospherePass(Target& rt, Target* ds) {
     const GraphicsStyle& st = Style();
     if (!ds || ds->w != rt.w || ds->h != rt.h) return;
-    uint64_t vh, sh, dh, ch, kh;
+    uint64_t vh, sh, dh, ch, kh, rh;
     if (!Compile(kAtmoHlsl, "vs", "vs_5_0", vh) || !Compile(kAtmoHlsl, "src", "ps_5_0", sh) ||
         !Compile(kAtmoHlsl, "down", "ps_5_0", dh) || !Compile(kAtmoHlsl, "comp", "ps_5_0", ch) ||
-        !Compile(kAtmoHlsl, "pick", "ps_5_0", kh)) {
+        !Compile(kAtmoHlsl, "pick", "ps_5_0", kh) ||
+        !Compile(kAtmoHlsl, "shafts", "ps_5_0", rh)) {
         LOG_FIRST(1, "vulkan: the light shafts' passes did not compile; no shafts or fog");
         return;
     }
@@ -10555,7 +10603,8 @@ void VulkanBackend::AtmospherePass(Target& rt, Target* ds) {
     VkPipeline pd = PassPipeline({vh, dh, kAtmoFormat, VK_FORMAT_UNDEFINED, 0, 0});
     VkPipeline pc = PassPipeline({vh, ch, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0});
     VkPipeline pk = PassPipeline({vh, kh, VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
-    if (!ps || !pd || !pc || !pk) return;
+    VkPipeline pr = PassPipeline({vh, rh, kAtmoFormat, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!ps || !pd || !pc || !pk || !pr) return;
     if (!rt.atmo_pick.img && !MakeImage(rt.atmo_pick, VK_IMAGE_TYPE_2D, VK_FORMAT_R32G32B32A32_SFLOAT, 5, 1, 1, 1, 1,
                                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
         return;
@@ -10578,13 +10627,16 @@ void VulkanBackend::AtmospherePass(Target& rt, Target* ds) {
     dirty_ = true;
     Barrier();
     const Image& field = rt.atmo[4];
+    if (rt.atmo_shafts.img && (rt.atmo_shafts.w != rt.atmo[0].w || rt.atmo_shafts.h != rt.atmo[0].h)) DropImage(rt.atmo_shafts);
+    if (st.shaft_strength > 0 && !rt.atmo_shafts.img &&
+        !MakeImage(rt.atmo_shafts, VK_IMAGE_TYPE_2D, kAtmoFormat, rt.atmo[0].w, rt.atmo[0].h, 1, 1, 1, u)) return;
     static const int test = [] {
         const char* e = std::getenv("XBE_ATMO_TEST");
         return e && *e >= '1' && *e <= '3' ? *e - '0' : 0;
     }();
     float c[16] = {1.0f / rt.w, 1.0f / rt.h, st.shaft_strength, st.fog_strength,
                    scene_wbuf_ ? 1.0f : 0.0f, float(presents_ % 3600) / 60.0f, 1.0f / field.w, 1.0f / field.h,
-                   0.006f, 0.35f, 0.55f, float(rt.w) / float(rt.h), float(test), 0, 0, 0};
+                   0.006f, 0.35f, 0.55f, float(rt.w) / float(rt.h), float(test), 0, float(rt.atmo[0].w), float(rt.atmo[0].h)};
     auto pass = [&](VkPipeline p, const Image& dst, const VkImageView* views, uint32_t n, float pxw, float pxh) {
         float cc[16];
         std::memcpy(cc, c, sizeof cc);
@@ -10596,13 +10648,17 @@ void VulkanBackend::AtmospherePass(Target& rt, Target* ds) {
         Barrier();
     };
     VkImageView sv[2] = {rt.fb.view, ds->res.view};
-    pass(ps, rt.atmo[0], sv, 2, 1.0f / rt.w, 1.0f / rt.h);
-    for (int k = 1; k < 5; k++) pass(pd, rt.atmo[k], &rt.atmo[k - 1].view, 1, 1.0f / rt.atmo[k - 1].w, 1.0f / rt.atmo[k - 1].h);
+    if (st.shaft_strength > 0) {
+        pass(ps, rt.atmo[0], sv, 2, 1.0f / rt.w, 1.0f / rt.h);
+        for (int k = 1; k < 5; k++) pass(pd, rt.atmo[k], &rt.atmo[k - 1].view, 1, 1.0f / rt.atmo[k - 1].w, 1.0f / rt.atmo[k - 1].h);
+    }
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
     VkImageView pv[3] = {field.view, ds->res.view, rt.fb.view};
     pass(pk, rt.atmo_pick, pv, 3, 1.0f / field.w, 1.0f / field.h);
     VkImageView views[4] = {rt.fb.view, ds->res.view, rt.atmo[0].view, rt.atmo_pick.view};
+    if (st.shaft_strength > 0) pass(pr, rt.atmo_shafts, views, 4, 1.0f / rt.w, 1.0f / rt.h);
+    views[2] = st.shaft_strength > 0 ? rt.atmo_shafts.view : dummy_.view;
     FullScreen(pc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4);
     End();
     static bool said = false;

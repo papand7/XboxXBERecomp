@@ -58,6 +58,10 @@ struct Header {
     uint32_t magic;
     uint8_t type, from, players, delay;
 };
+struct RulesPacket {
+    Header h;
+    uint32_t rules;  // optional tail on welcome/start; legacy hosts mean original rules (zero)
+};
 struct InputHeader {
     Header h;
     uint32_t acks[kMaxPlayers];  // the sender has every player's frames below these
@@ -82,6 +86,7 @@ struct HerePacket {
 SOCKET g_sock = INVALID_SOCKET;
 uint16_t g_bound_port = 0;  // the host's port (network order), shown while waiting
 bool g_configured = false, g_host = false;
+uint32_t g_session_rules = 0;
 std::atomic<bool> g_active{false};
 int g_players = 1, g_me = 0, g_delay = 2;
 sockaddr_in g_host_addr{};
@@ -226,8 +231,8 @@ void Pump(int wait_ms) {
         } else if (h.type == kHello && g_host) {  // a client that missed its start
             for (int p = 1; p < g_players; p++)
                 if (g_joined[p] && std::memcmp(&g_peer[p], &from, sizeof from) == 0) {
-                    Header s = Head(kStart);
-                    s.from = uint8_t(p);
+                    RulesPacket s{Head(kStart), g_session_rules};
+                    s.h.from = uint8_t(p);
                     SendTo(from, &s, sizeof s);
                 }
         }
@@ -421,15 +426,15 @@ bool Lobby() {
                 LOGR("netplay: player %d joined from %s:%u (%d of %d)", id + 1, ip, ntohs(from.sin_port), joined,
                      g_players);
             }
-            Header w = Head(kWelcome);
-            w.from = uint8_t(id);
+            RulesPacket w{Head(kWelcome), g_session_rules};
+            w.h.from = uint8_t(id);
             SendTo(from, &w, sizeof w);
         }
         // everyone is told twice, and a late hello is answered while playing
         for (int i = 0; i < 2; i++)
             for (int p = 1; p < g_players; p++) {
-                Header s = Head(kStart);
-                s.from = uint8_t(p);
+                RulesPacket s{Head(kStart), g_session_rules};
+                s.h.from = uint8_t(p);
                 SendTo(g_peer[p], &s, sizeof s);
             }
         return true;
@@ -443,9 +448,13 @@ bool Lobby() {
             SendTo(g_host_addr, &h, sizeof h);
             said = now;
         }
-        if (Recv(buf, sizeof buf, from, 20) < int(sizeof(Header))) continue;
+        const int bytes = Recv(buf, sizeof buf, from, 20);
+        if (bytes < int(sizeof(Header))) continue;
         const Header& h = *reinterpret_cast<Header*>(buf);
         if (h.type == kWelcome || h.type == kStart) {
+            if (from.sin_addr.s_addr != g_host_addr.sin_addr.s_addr || from.sin_port != g_host_addr.sin_port) continue;
+            g_session_rules = 0;
+            if (bytes >= int(sizeof(RulesPacket))) std::memcpy(&g_session_rules, buf + sizeof(Header), 4);
             g_me = h.from, g_players = h.players, g_delay = h.delay;
             if (h.type == kStart) return true;
         }
@@ -517,7 +526,8 @@ bool Start() {
     if (HWND w = static_cast<HWND>(app::Window()))
         SetWindowTextW(w, (std::wstring(app::kGame.title) + L" - player " + std::to_wstring(g_me + 1)).c_str());
 #endif
-    LOGR("netplay: started as player %d of %d, %d frames of input delay", g_me + 1, g_players, g_delay);
+    LOGR("netplay: started as player %d of %d, %d frames of input delay, host rules %08X",
+         g_me + 1, g_players, g_delay, g_session_rules);
     return true;
 }
 
@@ -538,6 +548,9 @@ input::Pad Pad(int port) {
     std::lock_guard lock(g_lock);
     return g_now[port];
 }
+
+void SetSessionRules(uint32_t rules) { if (!Active()) g_session_rules = rules; }
+uint32_t SessionRules() { return g_session_rules; }
 
 void SetStateHash(uint64_t (*hash)()) { g_hash = hash; }
 
