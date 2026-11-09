@@ -1,6 +1,8 @@
 #include "core/archive.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <fstream>
@@ -48,6 +50,17 @@ void KeepMode(const fs::path& file, uint32_t mode) {
 #else
     (void)file, (void)mode;
 #endif
+}
+
+// a file's time as the archive gives it (Unix seconds): a tool unpacked again keeps its headers' times, so a build
+// whose objects are newer is not made again
+void KeepTime(const fs::path& file, int64_t unix_seconds) {
+    if (unix_seconds <= 0) return;
+    using namespace std::chrono;
+    auto sys = system_clock::time_point(seconds(unix_seconds));
+    auto when = fs::file_time_type::clock::now() + duration_cast<fs::file_time_type::duration>(sys - system_clock::now());
+    std::error_code ec;
+    fs::last_write_time(file, when, ec);
 }
 
 }  // namespace
@@ -175,6 +188,7 @@ private:
         if (std::memcmp(header_ + 257, "ustar", 5) == 0 && !prefix.empty()) name = prefix + "/" + name;
         if (!long_name_.empty()) name = long_name_, long_name_.clear();
         if (!pax_path_.empty()) name = pax_path_, pax_path_.clear();
+        if (type != 'x' && type != 'g' && type != 'L' && type != 'K') pax_mtime_ = pending_mtime_, pending_mtime_ = 0;
         std::string link = Field(header_ + 157, 100);
         if (!long_link_.empty()) link = long_link_, long_link_.clear();
 
@@ -203,6 +217,7 @@ private:
                 }
                 out_path_ = out;
                 out_mode_ = uint32_t(Number(header_ + 100, 8));
+                out_time_ = pax_mtime_ ? pax_mtime_ : int64_t(Number(header_ + 136, 12));
                 keep_ = true;
                 written_[name] = rel_;
             }
@@ -223,6 +238,7 @@ private:
                     fs::copy_file(Under(dest_, it->second), out, fs::copy_options::overwrite_existing, ec);
                     if (!ec) written_[name] = rel;
                     if (!ec) KeepMode(out, uint32_t(Number(header_ + 100, 8)));
+                    if (!ec) KeepTime(out, pax_mtime_ ? pax_mtime_ : int64_t(Number(header_ + 136, 12)));
                 }
             }
         }
@@ -238,6 +254,7 @@ private:
         if (out_.is_open()) {
             out_.close();
             KeepMode(out_path_, out_mode_);
+            KeepTime(out_path_, out_time_);
         }
         if (meta_) {
             if (meta_type_ == 'L') long_name_ = meta_buf_.c_str();
@@ -253,6 +270,7 @@ private:
                     std::string rec = meta_buf_.substr(sp + 1, at + len - sp - 2);
                     if (rec.rfind("path=", 0) == 0) pax_path_ = rec.substr(5);
                     if (rec.rfind("linkpath=", 0) == 0) long_link_ = rec.substr(9);
+                    if (rec.rfind("mtime=", 0) == 0) pending_mtime_ = std::atoll(rec.c_str() + 6);
                     at += len;
                 }
             }
@@ -288,6 +306,7 @@ private:
     std::ofstream out_;
     fs::path out_path_;
     uint32_t out_mode_ = 0;
+    int64_t out_time_ = 0, pax_mtime_ = 0, pending_mtime_ = 0;  // the entry's time; a pax header's for the next entry
     std::string rel_, meta_buf_, long_name_, long_link_, pax_path_;
     std::map<std::string, std::string> written_;  // archive name -> where it was written
 };

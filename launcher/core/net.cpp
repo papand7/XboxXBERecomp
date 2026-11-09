@@ -20,8 +20,19 @@ std::string Lower(std::string s) {
 
 }  // namespace
 
+constexpr const char* kMirror = "https://mirror.dankelsoft.dk/";
+
+std::string MirrorUrl(const std::string& url) {
+    const std::string https = "https://";
+    if (url.rfind(https, 0) != 0) return {};
+    std::string rest = url.substr(https.size());
+    if (rest.rfind("api.github.com/repos/", 0) == 0 && rest.find("/releases/latest") != std::string::npos)
+        return std::string(kMirror) + "latest.json";
+    if (rest.rfind("github.com/", 0) == 0 || rest.rfind("raw.githubusercontent.com/", 0) == 0) return kMirror + rest;
+    return {};
+}
+
 bool FetchText(Http& http, const std::string& url, std::string& out, std::string& error) {
-    out.clear();
     for (int attempt = 0; attempt < 3; attempt++) {
         out.clear();
         if (http.Get(url, 0, [&](const uint8_t* p, size_t n) {
@@ -30,11 +41,40 @@ bool FetchText(Http& http, const std::string& url, std::string& out, std::string
             }, nullptr, error))
             return true;
     }
+    std::string mirror = MirrorUrl(url), first = error;
+    if (mirror.empty()) return false;
+    out.clear();
+    if (http.Get(mirror, 0, [&](const uint8_t* p, size_t n) {
+            out.append(reinterpret_cast<const char*>(p), n);
+            return true;
+        }, nullptr, error))
+        return true;
+    error = first + " (the mirror too: " + error + ")";
     return false;
 }
 
+namespace {
+bool DownloadFrom(Http& http, const std::string& url, const fs::path& path, const std::string& sha256, uint64_t size,
+                  const Progress& progress, const std::atomic<bool>* cancel, std::string& error);
+}  // namespace
+
 bool Download(Http& http, const std::string& url, const fs::path& path, const std::string& sha256, uint64_t size,
               const Progress& progress, const std::atomic<bool>* cancel, std::string& error) {
+    if (DownloadFrom(http, url, path, sha256, size, progress, cancel, error)) return true;
+    std::string mirror = MirrorUrl(url), first = error;
+    if (mirror.empty() || (cancel && cancel->load())) return false;
+    std::error_code ec;
+    fs::path part = path;
+    part += ".part";
+    fs::remove(part, ec);  // the mirror's copy from its start
+    if (DownloadFrom(http, mirror, path, sha256, size, progress, cancel, error)) return true;
+    error = first + " (the mirror too: " + error + ")";
+    return false;
+}
+
+namespace {
+bool DownloadFrom(Http& http, const std::string& url, const fs::path& path, const std::string& sha256, uint64_t size,
+                  const Progress& progress, const std::atomic<bool>* cancel, std::string& error) {
     std::error_code ec;
     std::string want = Lower(sha256);
     if (fs::exists(path, ec) && (want.empty() ? fs::file_size(path, ec) == size || !size : FileSha256(path) == want))
@@ -83,5 +123,6 @@ bool Download(Http& http, const std::string& url, const fs::path& path, const st
     if (error.empty()) error = "the download of " + url + " failed";
     return false;
 }
+}  // namespace
 
 }  // namespace launcher
