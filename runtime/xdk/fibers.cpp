@@ -1,3 +1,13 @@
+// (macOS keeps getcontext, makecontext and swapcontext behind _XOPEN_SOURCE, and the rest of its API behind
+// _DARWIN_C_SOURCE: both before any header)
+#if defined(__APPLE__)
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 600
+#endif
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+#endif
 // XAPI fibers on host coroutines. SwitchToFiber swaps the guest stack in assembly, which recompiled code cannot
 // follow: each fiber runs on a host stack of its own (Windows fibers, ucontext elsewhere) with guest registers of its
 // own, and a switch moves the host thread between them. XAPI's CreateFiber and ConvertThreadToFiber keep their
@@ -20,6 +30,9 @@
 #include <sys/mman.h>
 #ifndef __ANDROID__
 #include <ucontext.h>
+#ifndef MAP_STACK
+#define MAP_STACK 0  // macOS: no such flag (a plain mapping is a stack there)
+#endif
 #endif
 #endif
 

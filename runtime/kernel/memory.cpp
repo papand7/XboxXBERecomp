@@ -16,6 +16,7 @@
 #define NOMINMAX
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -67,7 +68,18 @@ bool Init() {
 #else
     void* p = mmap(reinterpret_cast<void*>(0x100000000ull), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     g_base = p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
+#ifdef __APPLE__
+    // no memfd_create on macOS: a shared memory object, unlinked at once (only this mapping keeps it)
+    int fd = -1;
+    if (g_base) {
+        char name[64];
+        std::snprintf(name, sizeof name, "/xbe-ram-%d", int(getpid()));
+        fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) shm_unlink(name);
+    }
+#else
     int fd = g_base ? memfd_create("ram", 0) : -1;
+#endif
     if (fd < 0 || ftruncate(fd, kMappedPhysical) ||
         mmap(g_base + kContiguousBase, kMappedPhysical, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED ||
         mmap(g_base + kWriteCombineBase, kMappedPhysical, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
