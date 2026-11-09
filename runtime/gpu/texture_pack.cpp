@@ -5,6 +5,7 @@
 // through SetReplacement, so every renderer that honours those draws it; its levels are made from it.
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <mutex>
 #include <unordered_map>
@@ -130,6 +131,23 @@ void TexturePackSeen(const TextureDesc& d, const uint8_t* guest, const uint32_t*
     uint64_t key = TextureKey(d, guest, palette_hash);
     char name[32];
     std::snprintf(name, sizeof(name), "%016llx.png", (unsigned long long)key);
+    // XBE_TEXTURE_TRACE=1 (diagnostic): each picture's key, where the game has it and its first bytes, to find them
+    // in the level files
+    static const bool trace = std::getenv("XBE_TEXTURE_TRACE") != nullptr;
+    if (trace) {
+        char head[64] = {};
+        for (int i = 0; i < 16; i++) std::snprintf(head + i * 2, 3, "%02x", guest[i]);
+        LOGR("texture trace: %016llx at %08X format %02X %ux%u levels %u linear %d size %u: %s",
+             (unsigned long long)key, d.data, d.format, d.width, d.height, d.levels, d.linear ? 1 : 0, LevelSize(d, 0), head);
+        if (std::getenv("XBE_TEXTURE_TRACE")[0] == '2') {  // the raw bytes too: mods/textures/raw/<key>.bin
+            std::error_code ec;
+            std::filesystem::create_directories(PackDir() / "raw", ec);
+            char raw[40];
+            std::snprintf(raw, sizeof raw, "%016llx.bin", (unsigned long long)key);
+            if (FILE* f = std::fopen((PackDir() / "raw" / raw).string().c_str(), "wb"))
+                std::fwrite(guest, 1, LevelSize(d, 0), f), std::fclose(f);
+        }
+    }
     bool moving = false;
     if (st.dump_textures) {
         auto now = std::chrono::steady_clock::now();
@@ -191,6 +209,28 @@ void TexturePackSeen(const TextureDesc& d, const uint8_t* guest, const uint32_t*
             PACK_LOG(32, "texture pack: %s in place of %08X (%ux%u, %ux%u)", name, d.data, d.width, d.height, w, h);
         }
     }
+}
+
+bool TexturePackCollect(uint32_t format, uint32_t width, uint32_t height, const uint8_t* bytes) {
+    if (!bytes || !width || !height || width > 4096 || height > 4096 || Format(format).depth) return false;
+    TextureDesc d;
+    d.format = format, d.width = width, d.height = height;
+    std::lock_guard lock(g_lock);
+    uint64_t key = TextureKey(d, bytes, 0);
+    if (!g_dumped.insert(key).second) return false;
+    char name[32];
+    std::snprintf(name, sizeof(name), "%016llx.png", (unsigned long long)key);
+    std::error_code ec;
+    std::filesystem::path dir = PackDir() / "dump";
+    std::filesystem::create_directories(dir, ec);
+    std::vector<uint32_t> px;
+    if (std::filesystem::exists(dir / name, ec) || !DecodeBgra(d, 0, bytes, px) || px.size() < size_t(width) * height)
+        return false;
+    std::filesystem::path tmp = dir / (std::string(name) + ".tmp");  // a half-written picture would stop later dumps
+    bool ok = WritePng(tmp, px, width, height);
+    if (ok) std::filesystem::rename(tmp, dir / name, ec);
+    if (!ok || ec) return std::filesystem::remove(tmp, ec), false;
+    return true;
 }
 
 }  // namespace gpu

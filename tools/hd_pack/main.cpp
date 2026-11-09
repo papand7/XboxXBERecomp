@@ -1,8 +1,9 @@
 // hd_pack: a texture pack made on the player's own PC from the textures the game dumped (Graphics Style > Textures >
-// Dump the game's textures: mods/textures/dump/<key>.png beside the exe). Each picture is upscaled 4x by Real-ESRGAN
-// (realesrgan-ncnn-vulkan, any Vulkan GPU, beside this tool in tools/realesrgan) and written as mods/textures/<key>.png,
-// which the runtime's texture pack loads in place of the game's (gpu/texture_pack.cpp). Nothing of the game's leaves
-// the PC: the tool ships no game data, and the pack it makes is the player's own copy, not to be shared.
+// Dump the game's textures, or the launcher's Collect button: mods/textures/dump/<key>.png beside the exe). Each
+// picture is upscaled 4x by Real-ESRGAN (realesrgan-ncnn-vulkan, any Vulkan GPU, beside this tool in tools/realesrgan)
+// and written as mods/textures/<key>.png, which the runtime's texture pack loads in place of the game's
+// (gpu/texture_pack.cpp). Nothing of the game's leaves the PC: the tool ships no game data, and the pack it makes is
+// the player's own copy, not to be shared. Windows, Linux and macOS (pictures through app/image.cpp).
 //
 //   hd_pack [--scale 2|4] [--pbr] [--force] [--model x4plus|anime] [--dir <the game's folder>]
 //
@@ -13,6 +14,7 @@
 //   <key>_r.png, roughness (white rough, black polished) from its local contrast and brightness. Generated, so an
 //   approximation: the runtime reads roughness for reflections.
 // - Done pictures are skipped (--force does them again): play more of the game with the dump on, run it again.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -20,8 +22,15 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <wincodec.h>
-#include <wrl/client.h>
+#else
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+extern char** environ;
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -31,7 +40,8 @@
 #include <string>
 #include <vector>
 
-using Microsoft::WRL::ComPtr;
+#include "app/image.h"
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -43,63 +53,24 @@ struct Picture {
     uint32_t at(uint32_t x, uint32_t y) const { return px[size_t(y) * w + x]; }
 };
 
-IWICImagingFactory* Wic() {
-    static ComPtr<IWICImagingFactory> f = [] {
-        ComPtr<IWICImagingFactory> w;
-        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&w));
-        return w;
-    }();
-    return f.Get();
+std::string U8(const fs::path& p) {
+    auto s = p.u8string();
+    return std::string(s.begin(), s.end());
 }
+fs::path FromU8(const std::string& s) { return fs::path(std::u8string(s.begin(), s.end())); }
 
 bool Read(const fs::path& path, Picture& p) {
-    ComPtr<IWICBitmapDecoder> dec;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    ComPtr<IWICFormatConverter> conv;
-    HRESULT hr = Wic() ? Wic()->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-                                                          WICDecodeMetadataCacheOnLoad, &dec)
-                       : E_FAIL;
-    if (SUCCEEDED(hr)) hr = dec->GetFrame(0, &frame);
-    if (SUCCEEDED(hr)) hr = Wic()->CreateFormatConverter(&conv);
-    if (SUCCEEDED(hr))
-        hr = conv->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0,
-                              WICBitmapPaletteTypeCustom);
-    UINT w = 0, h = 0;
-    if (SUCCEEDED(hr)) hr = conv->GetSize(&w, &h);
-    if (SUCCEEDED(hr) && (!w || !h || w > 16384 || h > 16384)) hr = E_INVALIDARG;
-    if (SUCCEEDED(hr)) {
-        p.w = w, p.h = h;
-        p.px.resize(size_t(w) * h);
-        hr = conv->CopyPixels(nullptr, w * 4, UINT(p.px.size() * 4), reinterpret_cast<BYTE*>(p.px.data()));
-    }
-    return SUCCEEDED(hr);
+    return app::DecodeImage(path, p.px, p.w, p.h, false, 16384) && p.w && p.h;
 }
 
 // through a temporary file: the game never reads a half-written picture
 bool Write(const fs::path& path, const Picture& p) {
     fs::path tmp = path;
-    tmp += L".tmp";
-    ComPtr<IWICStream> stream;
-    ComPtr<IWICBitmapEncoder> enc;
-    ComPtr<IWICBitmapFrameEncode> frame;
-    HRESULT hr = Wic() ? Wic()->CreateStream(&stream) : E_FAIL;
-    if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(tmp.c_str(), GENERIC_WRITE);
-    if (SUCCEEDED(hr)) hr = Wic()->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc);
-    if (SUCCEEDED(hr)) hr = enc->Initialize(stream.Get(), WICBitmapEncoderNoCache);
-    if (SUCCEEDED(hr)) hr = enc->CreateNewFrame(&frame, nullptr);
-    if (SUCCEEDED(hr)) hr = frame->Initialize(nullptr);
-    if (SUCCEEDED(hr)) hr = frame->SetSize(p.w, p.h);
-    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
-    if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&fmt);
-    if (SUCCEEDED(hr))
-        hr = frame->WritePixels(p.h, p.w * 4, UINT(p.px.size() * 4),
-                                reinterpret_cast<BYTE*>(const_cast<uint32_t*>(p.px.data())));
-    if (SUCCEEDED(hr)) hr = frame->Commit();
-    if (SUCCEEDED(hr)) hr = enc->Commit();
-    stream.Reset(), enc.Reset(), frame.Reset();
+    tmp += ".tmp";
     std::error_code ec;
-    if (SUCCEEDED(hr)) fs::rename(tmp, path, ec);
-    if (FAILED(hr) || ec) {
+    bool ok = app::EncodePng(tmp, p.px, p.w, p.h);
+    if (ok) fs::rename(tmp, path, ec);
+    if (!ok || ec) {
         fs::remove(tmp, ec);
         return false;
     }
@@ -199,10 +170,12 @@ bool Opaque(const Picture& p) {
     return true;
 }
 
-int Run(const std::wstring& cmd) {
+int Run(const fs::path& exe, const std::vector<std::string>& args) {
+#ifdef _WIN32
+    std::wstring line = L"\"" + exe.wstring() + L"\"";
+    for (const std::string& a : args) line += L" \"" + FromU8(a).wstring() + L"\"";
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
-    std::wstring line = cmd;
     if (!CreateProcessW(nullptr, line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) return -1;
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 1;
@@ -210,54 +183,82 @@ int Run(const std::wstring& cmd) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return int(code);
+#else
+    std::error_code ec;  // a copy of the program may have lost its execute bit
+    fs::permissions(exe, fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec, fs::perm_options::add, ec);
+    std::string path = U8(exe);
+    std::vector<std::string> copy = args;
+    std::vector<char*> argv{path.data()};
+    for (std::string& a : copy) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    pid_t pid = 0;
+    if (posix_spawn(&pid, path.c_str(), nullptr, nullptr, argv.data(), environ) != 0) return -1;
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+#endif
 }
 
 fs::path ExeDir() {
+#ifdef _WIN32
     wchar_t buf[MAX_PATH];
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
     return fs::path(buf).parent_path();
+#elif defined(__APPLE__)
+    char buf[4096];
+    uint32_t size = sizeof buf;
+    if (_NSGetExecutablePath(buf, &size) != 0) return fs::current_path();
+    std::error_code ec;
+    return fs::canonical(buf, ec).parent_path();
+#else
+    std::error_code ec;
+    return fs::read_symlink("/proc/self/exe", ec).parent_path();
+#endif
 }
 
-}  // namespace
+#ifdef _WIN32
+const char* const kUpscaler = "realesrgan-ncnn-vulkan.exe";
+#else
+const char* const kUpscaler = "realesrgan-ncnn-vulkan";
+#endif
 
-int wmain(int argc, wchar_t** argv) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+int Main(const std::vector<std::string>& argv) {
     uint32_t scale = 4;
     bool pbr = false, force = false;
-    std::wstring model = L"realesrgan-x4plus";
+    std::string model = "realesrgan-x4plus";
     fs::path dir = ExeDir();
-    if (dir.filename() == L"tools") dir = dir.parent_path();  // beside the game as tools\hd_pack.exe
-    for (int i = 1; i < argc; i++) {
-        std::wstring a = argv[i];
-        if (a == L"--scale" && i + 1 < argc) scale = std::wstring(argv[++i]) == L"2" ? 2 : 4;
-        else if (a == L"--pbr") pbr = true;
-        else if (a == L"--force") force = true;
-        else if (a == L"--model" && i + 1 < argc) model = std::wstring(argv[++i]) == L"anime" ? L"realesrgan-x4plus-anime"
-                                                                                               : L"realesrgan-x4plus";
-        else if (a == L"--dir" && i + 1 < argc) dir = argv[++i];
+    if (dir.filename() == "tools") dir = dir.parent_path();  // beside the game as tools/hd_pack
+    for (size_t i = 0; i < argv.size(); i++) {
+        const std::string& a = argv[i];
+        if (a == "--scale" && i + 1 < argv.size()) scale = argv[++i] == "2" ? 2 : 4;
+        else if (a == "--pbr") pbr = true;
+        else if (a == "--force") force = true;
+        else if (a == "--model" && i + 1 < argv.size())
+            model = argv[++i] == "anime" ? "realesrgan-x4plus-anime" : "realesrgan-x4plus";
+        else if (a == "--dir" && i + 1 < argv.size()) dir = FromU8(argv[++i]);
         else {
             std::printf("hd_pack [--scale 2|4] [--pbr] [--force] [--model x4plus|anime] [--dir <game folder>]\n");
             return 2;
         }
     }
     fs::path dump = dir / "mods" / "textures" / "dump", out = dir / "mods" / "textures";
-    fs::path esr = ExeDir() / "realesrgan" / "realesrgan-ncnn-vulkan.exe";
-    if (!fs::exists(esr)) esr = dir / "tools" / "realesrgan" / "realesrgan-ncnn-vulkan.exe";
+    fs::path esr = ExeDir() / "realesrgan" / kUpscaler;
+    if (!fs::exists(esr)) esr = dir / "tools" / "realesrgan" / kUpscaler;
     std::error_code ec;
     if (!fs::exists(esr, ec)) {
-        std::printf("hd_pack: the upscaler is missing (tools\\realesrgan\\realesrgan-ncnn-vulkan.exe)\n");
+        std::printf("hd_pack: the upscaler is missing (tools/realesrgan/%s)\n", kUpscaler);
         return 1;
     }
     if (!fs::exists(dump, ec)) {
-        std::printf("hd_pack: no dumped textures in %s: turn on Dump the game's textures and play first\n",
-                    dump.string().c_str());
+        std::printf("hd_pack: no dumped textures in %s: collect the textures first (the launcher's Collect button, "
+                    "or turn on Dump the game's textures and play)\n", U8(dump).c_str());
         return 1;
     }
     // the pictures not done yet
     std::vector<fs::path> todo;
     for (auto& e : fs::directory_iterator(dump, ec)) {
-        std::wstring stem = e.path().stem().wstring();
-        if (e.path().extension() != L".png" || stem.size() != 16) continue;
+        std::string stem = U8(e.path().stem());
+        if (e.path().extension() != ".png" || stem.size() != 16) continue;
         if (force || !fs::exists(out / e.path().filename(), ec)) todo.push_back(e.path());
     }
     std::sort(todo.begin(), todo.end());
@@ -276,34 +277,32 @@ int wmain(int argc, wchar_t** argv) {
     for (const fs::path& f : todo) {
         Picture p;
         if (!Read(f, p)) {
-            std::printf("  %s: not readable, left out\n", f.filename().string().c_str());
+            std::printf("  %s: not readable, left out\n", U8(f.filename()).c_str());
             continue;
         }
         uint32_t m = Margin(p);
         bool alpha = !Opaque(p);
-        std::wstring stem = f.stem().wstring();
-        if (!Write(in / (stem + L".png"), Wrapped(p, m, false)) ||
-            (alpha && !Write(in / (stem + L"_a.png"), Wrapped(p, m, true)))) {
-            std::printf("  %s: could not be prepared, left out\n", f.filename().string().c_str());
+        std::string stem = U8(f.stem());
+        if (!Write(in / (stem + ".png"), Wrapped(p, m, false)) ||
+            (alpha && !Write(in / (stem + "_a.png"), Wrapped(p, m, true)))) {
+            std::printf("  %s: could not be prepared, left out\n", U8(f.filename()).c_str());
             continue;
         }
         items.push_back({f, p.w, p.h, m, alpha});
     }
     // one run over the folder: the model is loaded once
-    std::wstring cmd = L"\"" + esr.wstring() + L"\" -i \"" + in.wstring() + L"\" -o \"" + up.wstring() + L"\" -n " +
-                       model + L" -s 4 -f png";
     std::printf("hd_pack: upscaling %zu pictures on the GPU (Real-ESRGAN)...\n", items.size());
     std::fflush(stdout);
-    if (int code = Run(cmd); code != 0) {
+    if (int code = Run(esr, {"-i", U8(in), "-o", U8(up), "-n", model, "-s", "4", "-f", "png"}); code != 0) {
         std::printf("hd_pack: the upscaler failed (exit %d); is the GPU's Vulkan driver installed?\n", code);
         return 1;
     }
     size_t done = 0;
     for (const Item& it : items) {
-        std::wstring stem = it.src.stem().wstring();
+        std::string stem = U8(it.src.stem());
         Picture big, a;
-        if (!Read(up / (stem + L".png"), big) || (it.alpha && !Read(up / (stem + L"_a.png"), a))) {
-            std::printf("  %ls: no upscaled picture\n", stem.c_str());
+        if (!Read(up / (stem + ".png"), big) || (it.alpha && !Read(up / (stem + "_a.png"), a))) {
+            std::printf("  %s: no upscaled picture\n", stem.c_str());
             continue;
         }
         Picture rgb = Crop(big, it.m * 4, it.w * 4, it.h * 4);
@@ -312,21 +311,38 @@ int wmain(int argc, wchar_t** argv) {
             for (size_t i = 0; i < rgb.px.size(); i++) rgb.px[i] = (rgb.px[i] & 0xFFFFFF) | (al.px[i] & 0xFF) << 24;
         }
         if (scale == 2) rgb = Half(rgb);
-        if (!Write(out / (stem + L".png"), rgb)) {
-            std::printf("  %ls: could not be written\n", stem.c_str());
+        if (!Write(out / (stem + ".png"), rgb)) {
+            std::printf("  %s: could not be written\n", stem.c_str());
             continue;
         }
         if (pbr) {
             Picture n, r;
             Pbr(rgb, n, r);
-            Write(out / (stem + L"_n.png"), n);
-            Write(out / (stem + L"_r.png"), r);
+            Write(out / (stem + "_n.png"), n);
+            Write(out / (stem + "_r.png"), r);
         }
         done++;
     }
     fs::remove_all(work, ec);
     std::printf("hd_pack: %zu of %zu textures written to %s (the game loads them at its next start)\n", done,
-                todo.size(), out.string().c_str());
+                todo.size(), U8(out).c_str());
     std::printf("hd_pack: the pack is made from your copy of the game: keep it to yourself, do not share it\n");
     return done == items.size() ? 0 : 1;
 }
+
+}  // namespace
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) {
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; i++) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string s(size_t(std::max(n, 1)) - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, s.data(), n, nullptr, nullptr);
+        args.push_back(s);
+    }
+    return Main(args);
+}
+#else
+int main(int argc, char** argv) { return Main(std::vector<std::string>(argv + 1, argv + argc)); }
+#endif

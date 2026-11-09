@@ -199,14 +199,25 @@ else()
 endif()
 
 # hd_pack (tools/hd_pack): a texture pack upscaled on the player's PC by Real-ESRGAN (BSD-3; its ncnn Vulkan build,
-# MIT, with the realesrgan-x4plus models), copied beside each game exe in tools/
+# MIT, with the realesrgan-x4plus models), copied beside each game exe in tools/ (Windows, Linux and macOS builds)
 if(WIN32)
     FetchContent_Declare(realesrgan URL https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip
         URL_HASH SHA256=abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d)
+elseif(APPLE)
+    FetchContent_Declare(realesrgan URL https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-macos.zip
+        URL_HASH SHA256=e0ad05580abfeb25f8d8fb55aaf7bedf552c375b5b4d9bd3c8d59764d2cc333a)
+elseif(NOT ANDROID)
+    FetchContent_Declare(realesrgan URL https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+        URL_HASH SHA256=e5aa6eb131234b87c0c51f82b89390f5e3e642b7b70f2b9bbe95b6a285a40c96)
+endif()
+if(NOT ANDROID)
     FetchContent_MakeAvailable(realesrgan)
-    add_executable(hd_pack ${XBE_SDK_DIR}/tools/hd_pack/main.cpp)
-    target_compile_definitions(hd_pack PRIVATE UNICODE _UNICODE)
-    target_link_libraries(hd_pack PRIVATE windowscodecs ole32)
+    add_executable(hd_pack ${XBE_SDK_DIR}/tools/hd_pack/main.cpp ${XBE_SDK_DIR}/runtime/app/image.cpp)
+    target_include_directories(hd_pack PRIVATE ${XBE_SDK_DIR}/runtime)
+    if(WIN32)
+        target_compile_definitions(hd_pack PRIVATE UNICODE _UNICODE)
+        target_link_libraries(hd_pack PRIVATE windowscodecs ole32)
+    endif()
 endif()
 
 if(NOT CMAKE_CROSSCOMPILING)
@@ -358,6 +369,18 @@ function(xbe_runtime_target target)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:hd_pack> $<TARGET_FILE_DIR:${target}>/tools
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${realesrgan_SOURCE_DIR}/realesrgan-ncnn-vulkan.exe
                     ${realesrgan_SOURCE_DIR}/vcomp140.dll $<TARGET_FILE_DIR:${target}>/tools/realesrgan
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.bin
+                    ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.param ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.bin
+                    ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.param $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models)
+    elseif(NOT WIN32 AND TARGET hd_pack)
+        # the same off Windows: one upscaler program (its runtime libraries are the system's), execute bit kept
+        add_dependencies(${target} hd_pack)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:hd_pack> $<TARGET_FILE_DIR:${target}>/tools
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${realesrgan_SOURCE_DIR}/realesrgan-ncnn-vulkan
+                    $<TARGET_FILE_DIR:${target}>/tools/realesrgan
+            COMMAND chmod +x $<TARGET_FILE_DIR:${target}>/tools/realesrgan/realesrgan-ncnn-vulkan
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.bin
                     ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.param ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.bin
                     ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.param $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models)

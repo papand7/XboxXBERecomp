@@ -20,5 +20,8 @@ float PackRoughness(uint64_t key);
 // R and G the normal's x and y, B roughness, A height; handed over once (the renderer keeps it)
 bool TakePackMaterial(uint64_t key, std::vector<std::vector<uint32_t>>& levels, uint32_t& w, uint32_t& h);
 void TexturePackSeen(const TextureDesc& d, const uint8_t* guest, const uint32_t* palette, uint64_t palette_hash);
+// a 2D picture read from the game's files instead of drawn (level 0's bytes, swizzled as the Xbox has them): dumped
+// under its key like TexturePackSeen's, whatever the Dump setting; false when it was dumped before or cannot be
+bool TexturePackCollect(uint32_t format, uint32_t width, uint32_t height, const uint8_t* bytes);
 
 }  // namespace gpu
