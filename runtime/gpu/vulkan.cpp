@@ -3747,6 +3747,7 @@ private:
 
     // Vulkan objects
     void* lib_ = nullptr;  // vulkan-1.dll / libvulkan.so.1 when this loaded it
+    bool portability_ = false;  // VK_KHR_portability_enumeration on (MoltenVK)
     VkInstance instance_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
     VkPhysicalDevice pd_ = VK_NULL_HANDLE;
@@ -4196,10 +4197,17 @@ bool VulkanBackend::LoadVulkan() {
     // the loader SDL opened for the window, else the system's
     vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(app::VulkanGetInstanceProcAddr());
     if (!vkGetInstanceProcAddr) {
+#ifdef __APPLE__
+        // the Vulkan loader, else MoltenVK itself (beside the exe, or Homebrew's)
+        for (const char* name : {"libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib",
+                                 "/opt/homebrew/lib/libvulkan.1.dylib", "/opt/homebrew/lib/libMoltenVK.dylib"})
+            if (!lib_) lib_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+#else
         lib_ = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
         if (!lib_) lib_ = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+#endif
         if (!lib_) {
-            LOGE("vulkan: libvulkan.so.1 not found (no Vulkan loader)");
+            LOGE("vulkan: no Vulkan loader found (libvulkan.so.1; on macOS libvulkan.1.dylib or MoltenVK)");
             return false;
         }
         vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib_, "vkGetInstanceProcAddr"));
@@ -4235,6 +4243,10 @@ bool VulkanBackend::CreateInstance() {
         for (auto& e : ep)
             if (!std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
                 exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME), colorspaces_ = true;
+        // MoltenVK (macOS) is a portability driver: the loader lists it only when asked to
+        for (auto& e : ep)
+            if (!std::strcmp(e.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
+                exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME), portability_ = true;
         // DLSS's (gpu/upscale_dlss.cpp), where this loader offers them all
         static const std::vector<std::string> dlss = DlssInstanceExtensions();
         dlss_inst_ = DlssBuiltIn();
@@ -4263,6 +4275,7 @@ bool VulkanBackend::CreateInstance() {
     app.pEngineName = "xbe-recomp";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    if (portability_) ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     ci.pApplicationInfo = &app;
     ci.enabledExtensionCount = uint32_t(exts.size());
     ci.ppEnabledExtensionNames = exts.data();
@@ -4376,6 +4389,8 @@ bool VulkanBackend::CreateDevice() {
     std::vector<VkExtensionProperties> ext(en);
     vkEnumerateDeviceExtensionProperties(pd_, nullptr, &en, ext.data());
     std::vector<const char*> want = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    // a portability driver (MoltenVK) must have its subset extension turned on when it offers it
+    if (HasExtension(ext, "VK_KHR_portability_subset")) want.push_back("VK_KHR_portability_subset");
     bool robust2 = HasExtension(ext, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     bool border = HasExtension(ext, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     // ray tracing: ray queries from any shader (Khronos', not a vendor's: NVIDIA, AMD and Intel GPUs alike)

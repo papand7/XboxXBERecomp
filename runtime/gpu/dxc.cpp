@@ -36,7 +36,11 @@ using Ptr = CComPtr<T>;
 #ifdef _WIN32
 constexpr const char* kLibrary = "dxcompiler.dll";
 #else
+#ifdef __APPLE__
+constexpr const char* kLibrary = "libdxcompiler.dylib";
+#else
 constexpr const char* kLibrary = "libdxcompiler.so";
+#endif
 #endif
 
 std::mutex g_lock;
