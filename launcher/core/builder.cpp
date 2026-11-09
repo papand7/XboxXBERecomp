@@ -1063,12 +1063,27 @@ bool Builder::ImportMusic(const fs::path& folder, std::string& summary, std::str
 
 bool Builder::StartOver(std::string& error) {
     std::error_code ec;
+    // the installed game first: "built" is whether its exe is in the play folder, so leaving it there kept the launcher
+    // saying "Built and ready". Only what a build puts there goes (the exes, hd_pack and the upscaler); the player's
+    // saves, settings, HD pack and game copy stay.
+    for (const std::string& x : game_.exes) {
+        fs::remove(PlayDir() / (x + platform_.ExeSuffix()), ec);
+        if (ec) {
+            error = "Could not remove " + x + platform_.ExeSuffix() + " (" + ec.message() + "): close the game and try again.";
+            return false;
+        }
+    }
+    fs::remove(PlayDir() / "tools" / ("hd_pack" + platform_.ExeSuffix()), ec);
+    fs::remove_all(PlayDir() / "tools" / "realesrgan", ec);
+    fs::remove(PlayDir() / "tools", ec);  // only when nothing else is in it
+    ec.clear();
     fs::remove_all(root_ / "source", ec);
     if (ec) {
         error = "Could not remove the downloaded source (" + ec.message() + "): close the game and try again.";
         return false;
     }
-    Log("start over: the source and its build removed");
+    Remember("built", "");
+    Log("start over: the installed game, the source and its build removed");
     return true;
 }
 
