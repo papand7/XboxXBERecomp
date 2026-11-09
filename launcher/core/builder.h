@@ -62,6 +62,10 @@ public:
     // the downloaded source and its build removed (a download that broke, a build gone wrong): the next Install starts
     // from a clean copy; the build tools, the game copy and the saves (play/) are kept
     bool StartOver(std::string& error);
+    // Linux: the packages CheckSystem found missing installed through pkexec (the system's own password prompt), with
+    // the command it would have shown (install_command, empty when nothing is missing or the distribution is unknown)
+    bool InstallRequirements(std::string& error);
+    std::string install_command;
     bool SourceFromMirror(const std::filesystem::path& src, const std::string& ref, std::string& error);
     std::string RepoName() const;
     std::filesystem::path ShippedBundle(const std::string& name) const;

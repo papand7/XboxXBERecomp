@@ -117,6 +117,7 @@ struct Service {
                   {"build_bytes", builder->BuildFilesBytes()},
                   {"path_too_long", !built && builder->PathTooLong(too_long)},
                   {"path_message", too_long},
+                  {"install_command", busy ? std::string() : builder->install_command},  // written by jobs only
                   {"music", game.music},
                   {"music_dir", U8(builder->SavedMusic())},
                   {"game", {{"ok", copy.ok}, {"iso", copy.iso}, {"release", copy.release}, {"path", U8(copy.path)},
@@ -218,6 +219,11 @@ struct Service {
             Start("start_over", [this](std::string& e, std::string& m) {
                 m = "Cleaned up. Press Install to download and build again.";
                 return builder->StartOver(e);
+            });
+        } else if (cmd == "install_requirements") {
+            Start("install_requirements", [this](std::string& e, std::string& m) {
+                m = "The build packages are installed. Press Install.";
+                return builder->InstallRequirements(e);
             });
         } else if (cmd == "remove_build") {
             Start("remove_build", [this](std::string& e, std::string& m) {

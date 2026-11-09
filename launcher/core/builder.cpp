@@ -405,6 +405,13 @@ bool Builder::SystemTool(const Tool& tool, std::string& found) {
 
 bool Builder::CheckSystem(std::string& error) {
     if (platform_.Os() == "windows") return true;
+    install_command.clear();
+#ifdef __APPLE__
+    // the launcher runs on macOS, the game does not build there yet (no Mac port of its renderer and build)
+    error = "The game cannot be built on macOS yet: this launcher works, but the game's Mac version is still being "
+            "made. Build it on Windows or Linux for now.";
+    return false;
+#endif
     Say("Checking this system's build packages");
     std::map<std::string, std::string> env = BuildEnv(plan_);
     const std::string path = env.count("PATH") ? env["PATH"] : platform_.GetEnv("PATH");
@@ -465,13 +472,52 @@ bool Builder::CheckSystem(std::string& error) {
                   "libXrandr-devel libXcursor-devel libXfixes-devel libXi-devel libXss-devel libXtst-devel "
                   "libxkbcommon-devel wayland-devel wayland-protocols-devel Mesa-libEGL-devel libdecor-devel "
                   "alsa-devel libpulse-devel pipewire-devel systemd-devel dbus-1-devel libvulkan1";
+    install_command = command;
     error = "This system lacks what the build needs: ";
     for (size_t i = 0; i < missing.size(); i++) error += (i ? "; " : "") + missing[i];
     error += command.empty() ? ". Install them with your distribution's package manager (git, curl, clang, lld, CMake, "
                                "Ninja, pkg-config and the development packages of X11, Wayland, xkbcommon, EGL, ALSA, "
                                "PulseAudio or PipeWire), then press Install again."
-                             : ". Install them (in a terminal): " + command + " - then press Install again.";
+                             : ". Press Install the requirements (it asks for your password), or in a terminal: " +
+                                   command + " - then press Install again.";
     return false;
+}
+
+bool Builder::InstallRequirements(std::string& error) {
+    if (install_command.empty()) {
+        error = "Nothing to install that the launcher knows of: press Install to check again.";
+        return false;
+    }
+    std::map<std::string, std::string> env = BuildEnv(plan_);
+    const std::string path = env.count("PATH") ? env["PATH"] : platform_.GetEnv("PATH");
+    if (!OnPath(path, platform_.PathSeparator(), "pkexec")) {
+        error = "No pkexec here to ask for your password: in a terminal run " + install_command + " - then press Install.";
+        return false;
+    }
+    // the shown command made unattended: the package manager answers yes itself (the password is pkexec's)
+    std::string cmd = install_command.substr(5);  // without "sudo "
+    auto swap = [&](const std::string& from, const std::string& to) {
+        if (cmd.compare(0, from.size(), from) == 0) cmd = to + cmd.substr(from.size());
+    };
+    swap("apt install", "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y");
+    swap("dnf install", "dnf install -y");
+    swap("pacman -S --needed", "pacman -S --needed --noconfirm");
+    swap("zypper install", "zypper --non-interactive install");
+    Say("Installing the build packages (your system asks for your password)");
+    Log("requirements: pkexec sh -c \"" + cmd + "\"");
+    int code = platform_.Run({"pkexec", "sh", "-c", cmd}, root_, env, [&](const std::string& l) { Log(l); }, &cancel);
+    if (code == 126 || code == 127) {
+        error = "The password prompt was closed or refused: nothing was installed.";
+        return false;
+    }
+    if (code != 0) {
+        error = "Installing the packages failed (exit " + std::to_string(code) + "; see the log). In a terminal: " +
+                install_command;
+        return false;
+    }
+    install_command.clear();
+    Log("requirements installed");
+    return true;
 }
 
 bool Builder::GetSource(std::string& error) {
