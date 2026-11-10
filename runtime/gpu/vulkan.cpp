@@ -2555,6 +2555,33 @@ float4 blur(O i) : SV_Target {
 // the screen times its distance (the acceleration structure's instance scales x and y by the view's width), the
 // distance as the scene pass's viewz reads a depth, then the fog's share (RtRelightPass); 16 bytes on, its texture coordinates and diffuse colour (a cut-out's
 // alpha, a reflection's colour where it is off screen). %s the shader's parameters, %s its argument.
+// points without a geometry shader (VulkanBackend::PointQuadShader): the draw's own vertex shader (renamed game_main)
+// run for each corner of an instance's four-vertex strip, the corner moved as PointHlsl's geometry shader moves it.
+// %s the shader's parameters, %s its argument.
+const char* kPointQuadMain = R"(
+VOut main(%s, uint pq_vid : SV_VertexID) {
+    VOut o = game_main(%s);
+    uint pq_c = pq_vid & 3;  // the corner (not i: the game's shaders name their input so)
+    float2 half_pixel = o.pos.w / surf.xy;
+    float2 back = (0.5 - 1e-3) * 2 * half_pixel / surf.w;
+    if (pts.x > 0) {
+        float size = clamp(o.psize > 0 ? o.psize : pts.w, pts.y, max(pts.y, pts.z));
+        float2 half_size = size * o.pos.w / surf.xy;
+        o.pos.x += (pq_c & 1) ? half_size.x : -half_size.x;
+        o.pos.y += (pq_c & 2) ? -half_size.y : half_size.y;
+        float4 tc = float4(pq_c & 1, (pq_c & 2) ? 1 : 0, 0, 1);
+        o.tc0 = tc;
+        o.tc1 = tc;
+        o.tc2 = tc;
+        o.tc3 = tc;
+    } else {
+        o.pos.x += (pq_c & 1) ? half_pixel.x : -half_pixel.x - back.x;
+        o.pos.y += (pq_c & 2) ? -half_pixel.y : half_pixel.y + back.y;
+    }
+    return o;
+}
+)";
+
 const char* kCaptureMain = R"(
 RWByteAddressBuffer rt_cap : register(u0);
 struct RtCap { uint base; uint count; int vmin; uint pad; };
@@ -3603,6 +3630,7 @@ constexpr uint64_t kSoftKeySalt = 0x736F667470617274ull;  // "softpart"
 constexpr uint64_t kMaskKeySalt = 0x6D61736B6D61736Cull;
 constexpr uint64_t kGlowKeySalt = 0x676C6F776C696768ull;  // "glowligh"
 constexpr uint64_t kCaptureKeySalt = 0x7274636170747572ull;  // "rtcaptur"
+constexpr uint64_t kPointQuadKeySalt = 0x7074717561647321ull;  // "ptquads!": a vertex shader's point quad variant
 constexpr uint32_t kLightTilesX = 16, kLightTilesY = 9, kLights = 32;
 constexpr VkFormat kMaskFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr uint32_t kMaskRtFmt = 0x4D41534Bu;  // PsoKey::rtfmt of the mask's pipelines  // "maskmask": the mask's pixel shaders apart from the game's
@@ -3833,6 +3861,13 @@ private:
     bool fill_lines_ = false;
     bool aniso_ok_ = false;
     bool gs_ok_ = false;  // geometry shaders, which points are drawn with
+    // points as instanced quads instead: no geometry shaders (MoltenVK), or XBE_POINT_QUADS=1 (a test)
+    bool PointQuads() const {
+        static const bool forced = std::getenv("XBE_POINT_QUADS") != nullptr;
+        return !gs_ok_ || forced;
+    }
+    uint64_t PointQuadShader(const State& s, const Assembled& a, const DrawShaders& sh);
+    bool point_quads_draw_ = false;  // this draw's points go as instanced quads (DrawGeometry)
     bool open_ = false;  // a rendering instance is open
     Attachments cur_;
     bool dirty_ = false;  // writes since the last barrier
@@ -6532,7 +6567,8 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k) {
     uint64_t h = Hash(&k, sizeof(k));
     auto it = pipelines_.find(h);
     if (it != pipelines_.end()) return it->second;
-    bool points = k.topo == uint32_t(Topology::Points);
+    const bool quads = k.quads != 0;  // points as instanced quads (PointQuadShader's variant, no geometry shader)
+    bool points = k.topo == uint32_t(Topology::Points) && !quads;
     if (points && !gs_ok_) return pipelines_[h] = VK_NULL_HANDLE;  // not drawn, see the log
     if (points && !point_gs_) Compile(PointHlsl(), "main", "gs_5_0", point_gs_);
     VkPipelineShaderStageCreateInfo st[3]{};
@@ -6557,7 +6593,7 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k) {
             LOG_FIRST(8, "vulkan: vertex format %u has no Vulkan equivalent here", e & 0xFF);
         if (!(bound >> buf & 1)) {
             bound |= 1u << buf;
-            binds[n_bind++] = {buf, 0, VK_VERTEX_INPUT_RATE_VERTEX};
+            binds[n_bind++] = {buf, 0, quads ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
         }
     }
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -6566,7 +6602,8 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k) {
     vi.vertexAttributeDescriptionCount = n_attr;
     vi.pVertexAttributeDescriptions = attrs;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = points ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+    ia.topology = quads ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+                  : points ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
                   : k.topo == uint32_t(Topology::Lines) ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
                                                         : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -6574,7 +6611,7 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k) {
     // a point is drawn as its whole console pixel by a geometry shader, solid, front facing and never culled
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = k.fill == kFillWireframe && !points && fill_lines_ ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
-    rs.cullMode = k.cull && !points ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    rs.cullMode = k.cull && !points && !quads ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     // D3D's facing is that of the picture, which the flipped viewport keeps
     rs.frontFace = k.ccw && !points ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
     rs.depthBiasEnable = k.zbias || k.zslope;
@@ -6663,14 +6700,41 @@ void VulkanBackend::PushDescriptors(const Stretch& vsc, const Stretch& dc, const
 void VulkanBackend::DrawGeometry(const Assembled& a) {
     VkBuffer bufs[16];
     VkDeviceSize offsets[16], strides[16];
+    // points as instanced quads: a vertex an instance, so an indexed draw's vertices go in index order (no index
+    // buffer for instances)
+    const bool quads = point_quads_draw_;
+    auto index = [&](uint32_t j) -> int64_t {
+        return int64_t(a.index16 ? static_cast<const uint16_t*>(a.index_src)[j] : static_cast<const uint32_t*>(a.index_src)[j]) +
+               a.base_vertex;
+    };
     for (uint32_t i = 0; i < a.buffer_count; i++) {
         const VertexBuffer& b = a.buffers[i];
+        if (quads && a.index_count && b.stride) {
+            Stretch s = Stream(std::max<uint32_t>(a.index_count * b.stride, 4));
+            if (!s.p) return;
+            for (uint32_t j = 0; j < a.index_count; j++) {
+                const int64_t v = index(j);
+                if (v >= 0 && uint64_t(v + 1) * b.stride <= b.bytes)
+                    std::memcpy(s.p + size_t(j) * b.stride, static_cast<const uint8_t*>(b.src) + size_t(v) * b.stride, b.stride);
+                else
+                    std::memset(s.p + size_t(j) * b.stride, 0, b.stride);
+            }
+            bufs[i] = s.buf, offsets[i] = s.off, strides[i] = b.stride;
+            continue;
+        }
         Stretch s = Stream(std::max<uint32_t>(b.bytes, 4));
         if (!s.p) return;
         std::memcpy(s.p, b.src, b.bytes);
         bufs[i] = s.buf;
         offsets[i] = s.off;
         strides[i] = b.stride;
+    }
+    if (quads) {
+        if (a.buffer_count) vkCmdBindVertexBuffers2(cmd_, 0, a.buffer_count, bufs, offsets, nullptr, strides);
+        const int strip = int(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
+        if (ds_.topo != strip) vkCmdSetPrimitiveTopology(cmd_, VkPrimitiveTopology(ds_.topo = strip));
+        vkCmdDraw(cmd_, 4, a.index_count ? a.index_count : a.draw_count, 0, 0);
+        return;
     }
     if (a.buffer_count) vkCmdBindVertexBuffers2(cmd_, 0, a.buffer_count, bufs, offsets, nullptr, strides);
     int topo = int(VkTopology(PrimitiveTopology(a)));
@@ -7046,6 +7110,14 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // ray tracing: an opaque draw of the 3D scene writes its vertices' places (its variants and mask draw do the same)
     uint32_t rt_push[4] = {};
     rt_capturing_ = RtWanted() && RtCapture(s, a, sh, k, stages.view[0], rt_push);
+    // points without a geometry shader: instanced quads, their vertex shader's variant
+    point_quads_draw_ = false;
+    if (k.topo == uint32_t(Topology::Points) && PointQuads()) {
+        const uint64_t pv = PointQuadShader(s, a, sh);
+        if (!pv) return;
+        k.vs = pv, k.quads = 1;
+        point_quads_draw_ = true;
+    }
     VkPipeline p = EnsurePipeline(k);
     if (!p) {
         if (rt_capturing_) {
@@ -7406,6 +7478,28 @@ VulkanBackend::SkyCheck VulkanBackend::SkyDraw(const State& s, const Assembled& 
         if (zmin < -300.0f && zmax > 300.0f) sky_.sky = true;
     }
     return sky_;
+}
+
+// a vertex shader's point quad variant (kPointQuadMain around the game's own), made once
+uint64_t VulkanBackend::PointQuadShader(const State& s, const Assembled& a, const DrawShaders& sh) {
+    const uint64_t key = sh.vkey ^ kPointQuadKeySalt;
+    if (auto it = shader_src_.find(key); it != shader_src_.end()) return it->second;
+    uint64_t vh = 0;
+    std::string src = VertexHlsl(s, a, sh);
+    size_t at = src.find("VOut main(");
+    size_t close = at == std::string::npos ? at : src.find(')', at);
+    if (close != std::string::npos) {
+        std::string params = src.substr(at + 10, close - at - 10);
+        std::string arg = params.substr(params.find_last_of(' ') + 1);
+        src.replace(at, 10, "VOut game_main(");
+        char tail[4096];
+        std::snprintf(tail, sizeof(tail), kPointQuadMain, params.c_str(), arg.c_str());
+        src += tail;
+        if (!Compile(src, "main", "vs_5_0", vh)) vh = 0;
+    }
+    if (!vh) LOG_FIRST(4, "vulkan: a vertex shader's point quad variant could not be made; its points are not drawn");
+    else LOG_FIRST(1, "vulkan: points drawn as instanced quads (no geometry shaders, or XBE_POINT_QUADS)");
+    return shader_src_[key] = vh;
 }
 
 bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, VkImageView tex,
