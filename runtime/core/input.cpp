@@ -622,11 +622,43 @@ void Rumble(int port, uint16_t left, uint16_t right) {
 
 }  // namespace input
 
+// a game's own controller rebinding: the physical buttons of controller 1 as the pad is read (before the settings'
+// remap); what is held when the capture is armed does not count
+namespace input {
+namespace {
+float g_arm_down[kControls] = {};
+bool g_armed = false;
+}  // namespace
+void ArmPadCapture() {
+    std::lock_guard lock(g_lock);
+    const app::Settings& s = app::Get();
+    float in[kControls] = {};
+    UpdatePads();
+    if (SDL_Gamepad* pad = PadOf(0, s)) ReadPad(pad, in);
+    std::memcpy(g_arm_down, in, sizeof in);
+    g_armed = true;
+}
+int PadPressedControl() {
+    std::lock_guard lock(g_lock);
+    if (!g_armed) return -1;
+    const app::Settings& s = app::Get();
+    float in[kControls] = {};
+    UpdatePads();
+    if (SDL_Gamepad* pad = PadOf(0, s)) ReadPad(pad, in);
+    int found = -1;
+    for (int c = 0; c < kControls && found < 0; c++)
+        if (in[c] > 0.5f && g_arm_down[c] <= 0.5f) found = c;
+    if (found >= 0) g_armed = false;
+    return found;
+}
+}  // namespace input
+
 #ifndef _WIN32
 // ---- no steering wheel support off Windows yet (core/wheel.cpp is DirectInput): no devices, nothing bound
 namespace input {
 void WheelInit(void*) {}
 void WheelSetup() {}
+namespace {
 bool WheelRead(float*, bool* steers) {
     if (steers) *steers = false;
     return false;

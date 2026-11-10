@@ -25,6 +25,10 @@ enum Control : int {
 const char* ControlName(int c);  // settings file name, "dpad_up" ...
 const char* ControlLabel(int c); // shown to the player, "D-pad up" ...
 int ControlByName(const char* name);  // -1 when unknown
+// a game's own rebinding of a controller button (its menus): ArmPadCapture when the wait starts (what is down then does
+// not count); PadPressedControl then gives the physical input of controller 1 pressed since, -1 none
+void ArmPadCapture();
+int PadPressedControl();
 
 void Init();  // window thread, before boot
 #ifndef _WIN32
