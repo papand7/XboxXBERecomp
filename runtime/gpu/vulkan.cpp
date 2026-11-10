@@ -4319,6 +4319,9 @@ private:
         ~PerfScope() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
     };
     uint64_t perf_frames_ = 0, perf_submits_ = 0, perf_draws_ = 0;
+    uint64_t perf_bytes_ = 0, perf_indexed_ = 0, perf_uniq_bytes_ = 0;  // streamed vertex/index bytes, indexed draws
+    std::unordered_set<uint64_t> perf_seen_;  // (source address, size) of this frame's meshes, for the repeats
+    uint64_t perf_frame_uniq_ = 0, perf_uniq_count_ = 0;  // this frame's distinct meshes' bytes; the window's count
     uint64_t perf_glow_ = 0;
     uint64_t perf_prog_ = 0, perf_fixed_ = 0, perf_lit_ = 0, perf_2d_ = 0, perf_reflect_ = 0, perf_soft_ = 0,
              perf_mat_ = 0;  // draws by kind
@@ -7500,6 +7503,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (counting) vkCmdBeginQuery(cb, queries_, q, 0);
     DrawGeometry(a);
     perf_draws_++;
+    perf_bytes_ += a.index_count ? a.index_count * (a.index16 ? 2u : 4u) : 0;
+    for (uint32_t i = 0; i < a.buffer_count; i++) perf_bytes_ += a.buffers[i].bytes;
+    perf_indexed_ += a.index_count ? 1 : 0;
+    if (a.buffer_count) {
+        const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(a.buffers[0].src)) ^ (uint64_t(a.buffers[0].bytes) << 40) ^ (uint64_t(a.index_count) << 52);
+        if (perf_seen_.insert(key).second) perf_uniq_bytes_ += a.buffers[0].bytes, perf_frame_uniq_ += a.buffers[0].bytes, perf_uniq_count_++;
+    }
     if (draw_2d_) perf_2d_++;
     else if (sh.prog) perf_prog_++;
     else if (sh.fixed_transform) perf_fixed_++, perf_lit_ += (sh.fk.light & 1);
@@ -11181,6 +11191,7 @@ void VulkanBackend::ReadStamps(uint32_t slot) {
 
 void VulkanBackend::LogPerf() {
     perf_frames_++;
+    perf_seen_.clear(), perf_frame_uniq_ = 0;  // the repeats are counted within one frame
     auto now = std::chrono::steady_clock::now();
     double el = std::chrono::duration<double>(now - perf_t_).count();
     if (el < 1) return;
@@ -11206,6 +11217,8 @@ void VulkanBackend::LogPerf() {
         if (!passes.empty()) LOGR("perf: vulkan scene passes (GPU ms):%s", passes.c_str());
         for (uint32_t k = 0; k < 24; k++) pass_ms_[k] = 0, pass_n_[k] = 0;
     }
+    LOGR("perf: vulkan streamed a frame: %.1f KB in vertex and index data, %.0f indexed draws; %.1f KB of distinct meshes (%zu)",
+         perf_bytes_ / n / 1024.0, perf_indexed_ / n, perf_uniq_bytes_ / n / 1024.0, size_t(perf_uniq_count_ / n));
     LOGR("perf: vulkan draws a frame: %.0f 2D, %.0f vertex programs, %.0f fixed function (%.0f lit)",
          perf_2d_ / n, perf_prog_ / n, perf_fixed_ / n, perf_lit_ / n);
     LOGR("perf: vulkan soft particles a frame: %.1f, material draws %.1f, glowing draws %.1f", perf_soft_ / n,
@@ -11235,6 +11248,7 @@ void VulkanBackend::LogPerf() {
     logx::Flush();
     perf_t_ = now;
     perf_frames_ = perf_submits_ = perf_draws_ = 0;
+    perf_bytes_ = perf_indexed_ = perf_uniq_bytes_ = perf_uniq_count_ = 0, perf_seen_.clear();
     perf_wait_ = 0;
 }
 
