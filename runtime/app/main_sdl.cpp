@@ -635,6 +635,16 @@ int main(int argc, char** argv) {
     app::g_event_base = SDL_RegisterEvents(1);
     std::string title = app::Utf8(app::kGame.title);
     if (app::Instance()) title += " [" + std::to_string(app::Instance()) + "]";
+#ifdef __APPLE__
+    // macOS: Vulkan is MoltenVK, shipped beside the exe (the build copies it): loaded from there first, else SDL's own
+    // search (a Vulkan SDK, Homebrew's) when the window is made
+    {
+        const std::filesystem::path molten = app::ExeDir() / "libMoltenVK.dylib";
+        std::error_code ec;
+        if (std::filesystem::exists(molten, ec) && !SDL_Vulkan_LoadLibrary(molten.string().c_str()))
+            LOGE("vulkan: %s could not be loaded: %s", molten.string().c_str(), SDL_GetError());
+    }
+#endif
     app::g_window = SDL_CreateWindow(title.c_str(), 1280, 720,
                                      SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!app::g_window || app::g_event_base == 0) {

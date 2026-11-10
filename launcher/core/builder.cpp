@@ -403,15 +403,37 @@ bool Builder::SystemTool(const Tool& tool, std::string& found) {
     return true;
 }
 
+// macOS: Apple's command line developer tools (clang, git and the SDK headers), which CMake and Ninja (downloaded or
+// the system's) build with. They cannot be downloaded here: Apple's licence, and xcode-select asks for them.
+bool Builder::CheckSystemMac(std::string& error) {
+    Say("Checking this Mac's developer tools");
+    std::map<std::string, std::string> env = BuildEnv(plan_);
+    auto runs = [&](const std::vector<std::string>& args, const fs::path& cwd) {
+        std::string out;
+        int code = platform_.Run(args, cwd, env, [&](const std::string& l) { out += l + "\n"; }, &cancel);
+        if (code != 0) Log("system check: " + args[0] + " failed (" + std::to_string(code) + "): " + out);
+        return code == 0;
+    };
+    // a program compiled and linked as the game is (Apple's linker): clang++, the C++ library and the SDK's headers
+    fs::path dir = root_ / "check";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    std::ofstream(dir / "check.cpp") << "#include <cstdio>\n#include <string>\n#include <thread>\n"
+                                        "int main() { std::string s = \"ok\"; std::thread([&] { std::puts(s.c_str()); }).join(); }\n";
+    const bool tools = runs({"xcode-select", "-p"}, root_) && runs({"git", "--version"}, root_) &&
+                       runs({"clang++", "-std=c++20", "check.cpp", "-o", "check", "-lpthread"}, dir);
+    if (tools) return true;
+    install_command = "xcode-select --install";
+    error = "This Mac lacks Apple's command line developer tools (the compiler and git the build needs). Press Install "
+            "the requirements: a window from macOS asks to install them (about 1 GB, from Apple); when it is done "
+            "press Install again. Or in a terminal: xcode-select --install";
+    return false;
+}
+
 bool Builder::CheckSystem(std::string& error) {
     if (platform_.Os() == "windows") return true;
     install_command.clear();
-#ifdef __APPLE__
-    // the launcher runs on macOS, the game does not build there yet (no Mac port of its renderer and build)
-    error = "The game cannot be built on macOS yet: this launcher works, but the game's Mac version is still being "
-            "made. Build it on Windows or Linux for now.";
-    return false;
-#endif
+    if (platform_.Os() == "macos") return CheckSystemMac(error);
     Say("Checking this system's build packages");
     std::map<std::string, std::string> env = BuildEnv(plan_);
     const std::string path = env.count("PATH") ? env["PATH"] : platform_.GetEnv("PATH");
@@ -486,6 +508,15 @@ bool Builder::CheckSystem(std::string& error) {
 bool Builder::InstallRequirements(std::string& error) {
     if (install_command.empty()) {
         error = "Nothing to install that the launcher knows of: press Install to check again.";
+        return false;
+    }
+    if (platform_.Os() == "macos") {
+        // macOS shows its own installer window (the command returns at once; the player finishes it there)
+        std::map<std::string, std::string> env = BuildEnv(plan_);
+        Say("Asking macOS to install the developer tools");
+        platform_.Run({"xcode-select", "--install"}, root_, env, [&](const std::string& l) { Log(l); }, &cancel);
+        error = "A window from macOS is installing the command line developer tools: wait for it to finish (a few "
+                "minutes), then press Install again.";
         return false;
     }
     std::map<std::string, std::string> env = BuildEnv(plan_);
@@ -786,7 +817,8 @@ bool Builder::Compile(std::string& error) {
     ReadAll(seen, last);
     last.erase(std::remove(last.begin(), last.end(), '\r'), last.end());  // written in text mode before 1.5.4
     // clang links with lld (no Microsoft linker in the kit)
-    std::vector<std::string> configure = {cmake, "--preset", "release", "-DCMAKE_LINKER_TYPE=LLD"};
+    std::vector<std::string> configure = {cmake, "--preset", "release"};
+    if (platform_.Os() != "macos") configure.push_back("-DCMAKE_LINKER_TYPE=LLD");  // (Apple's clang has no lld)
     // (a build folder from before this record counts as another toolchain). The cache goes, and CMake's records of
     // the compilers (CMakeFiles/<its version>/ and the files directly in CMakeFiles), so its compiler and header checks
     // are made again with the new tools; the targets' folders (CMakeFiles/<target>.dir), the compiled objects, stay, so
@@ -838,7 +870,7 @@ bool Builder::Install(std::string& error) {
     for (const auto& e : fs::directory_iterator(out, ec)) {
         std::string ext = Lower(U8(e.path().extension()));
         // the exes (".exe", none on Linux) and the libraries beside them (dxcompiler, DLSS; libdxcompiler.so)
-        const bool exe = ext == Lower(platform_.ExeSuffix()), lib = ext == ".dll" || ext == ".so";
+        const bool exe = ext == Lower(platform_.ExeSuffix()), lib = ext == ".dll" || ext == ".so" || ext == ".dylib";
         if (!e.is_regular_file(ec) || (!exe && !lib)) continue;
         std::string name = Lower(U8(e.path().stem()));
         // the game's exes (GameConfig::exes); the build's own tools (xbe_recomp) stay

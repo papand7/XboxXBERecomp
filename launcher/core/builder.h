@@ -88,6 +88,7 @@ public:
     // off Windows: what the build needs of the system and cannot fetch (git, the C++ library, the window's and sound's
     // development headers); false with what to install, as the distribution's package manager names it
     bool CheckSystem(std::string& error);
+    bool CheckSystemMac(std::string& error);
     bool GetSource(std::string& error);
     bool PutXbe(std::string& error);
     bool Compile(std::string& error);

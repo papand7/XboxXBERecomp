@@ -110,7 +110,11 @@ public:
     // LAUNCHER_OS=windows lets the test tool resolve and fetch Windows' tools (the msi parts aside)
     std::string Os() const override {
         const char* e = std::getenv("LAUNCHER_OS");
+#ifdef __APPLE__
+        return e && *e ? e : "macos";
+#else
         return e && *e ? e : "linux";
+#endif
     }
     std::string GetEnv(const std::string& name) const override {
         const char* v = std::getenv(name.c_str());

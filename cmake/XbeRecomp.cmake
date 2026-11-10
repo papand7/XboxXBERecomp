@@ -61,6 +61,19 @@ else()
     FetchContent_MakeAvailable(stb)
     set_source_files_properties(${XBE_SDK_DIR}/runtime/app/image.cpp PROPERTIES INCLUDE_DIRECTORIES "${stb_SOURCE_DIR}")
 endif()
+# MoltenVK (Apache 2.0, Khronos): Vulkan on Metal, the Mac's only Vulkan; its dylib goes beside each game exe, where the
+# window's loader takes it (app/main_sdl.cpp), so a Mac needs no Vulkan SDK or Homebrew package installed
+if(APPLE)
+    FetchContent_Declare(moltenvk URL https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar
+        URL_HASH SHA256=f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e)
+    FetchContent_MakeAvailable(moltenvk)
+    file(GLOB_RECURSE XBE_MOLTENVK_DYLIB ${moltenvk_SOURCE_DIR}/*/dynamic/dylib/macOS/libMoltenVK.dylib
+         ${moltenvk_SOURCE_DIR}/dynamic/dylib/macOS/libMoltenVK.dylib)
+    list(GET XBE_MOLTENVK_DYLIB 0 XBE_MOLTENVK_DYLIB)
+    if(NOT EXISTS "${XBE_MOLTENVK_DYLIB}")
+        message(FATAL_ERROR "MoltenVK's libMoltenVK.dylib is not in ${moltenvk_SOURCE_DIR}")
+    endif()
+endif()
 # SMAA (MIT, Jimenez et al.): the Vulkan renderer's scene antialiasing; its shader source as a string, its lookup
 # textures' bytes from its headers (gpu/smaa.cpp)
 FetchContent_Declare(smaa URL https://github.com/iryoku/smaa/archive/71c806a838bdd7d517df19192a20f0c61b3ca29d.tar.gz
@@ -365,6 +378,11 @@ function(xbe_runtime_target target)
         target_link_libraries(${target} PRIVATE ${XBE_DLSS_LIB})
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_DLSS_DLL} $<TARGET_FILE_DIR:${target}>)
+    endif()
+    # macOS: MoltenVK beside the exe
+    if(APPLE AND XBE_MOLTENVK_DYLIB)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${XBE_MOLTENVK_DYLIB}" $<TARGET_FILE_DIR:${target}>)
     endif()
     # the texture pack tool and its upscaler, in tools\ beside the exe
     if(WIN32 AND TARGET hd_pack)
