@@ -515,6 +515,24 @@ uint32_t TakeParticles(ParticleEvent* out, uint32_t max) {
     g_particles.clear();
     return n;
 }
+namespace {
+std::mutex g_blood_lock;
+std::vector<BloodStain> g_blood;
+}  // namespace
+void AddBloodStain(const float pos[3], const float normal[3], float strength) {
+    BloodStain b{{pos[0], pos[1], pos[2]}, {0, 1, 0}, strength, ParticleClock()};
+    if (normal) std::copy(normal, normal + 3, b.normal);
+    std::lock_guard<std::mutex> lock(g_blood_lock);
+    if (g_blood.size() < 64) g_blood.push_back(b);
+}
+uint32_t TakeBloodStains(BloodStain* out, uint32_t max) {
+    std::lock_guard<std::mutex> lock(g_blood_lock);
+    uint32_t n = 0;
+    for (const BloodStain& b : g_blood)
+        if (n < max) out[n++] = b;
+    g_blood.clear();
+    return n;
+}
 void SetSceneLights(const SceneLight* lights, uint32_t count) {
     std::lock_guard<std::mutex> lock(g_lights_lock);
     g_lights.assign(lights, lights + count);

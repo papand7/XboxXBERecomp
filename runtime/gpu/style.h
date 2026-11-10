@@ -292,6 +292,16 @@ struct ParticleEvent {
 void EmitParticles(uint32_t kind, const float pos[3], const float normal[3], float strength, const float rgb[3]);
 uint32_t TakeParticles(ParticleEvent* out, uint32_t max);  // the renderer, once a frame: the queue emptied
 uint32_t FootprintEpoch();      // counts the clears
+// blood that stays (GraphicsStyle::blood): a hit's stain in the world's units (the game's thread); at most 64 wait for
+// the renderer, which takes them once a frame and keeps them on the level for a minute and a half
+struct BloodStain {
+    float pos[3];
+    float normal[3];  // the surface's at the hit, up when unknown
+    float strength;   // 1 a bullet's
+    double time;      // seconds (steady clock) it was made
+};
+void AddBloodStain(const float pos[3], const float normal[3], float strength);
+uint32_t TakeBloodStains(BloodStain* out, uint32_t max);
 
 // screenshots (frame_info.cpp): the next frame as shown (the overlays drawn over it included) written as a PNG at path
 // by the Vulkan renderer; any thread. The renderer takes the request at its next present and reports it written

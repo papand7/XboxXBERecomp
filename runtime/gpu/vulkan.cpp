@@ -1152,6 +1152,110 @@ float4 ps(O i) : SV_Target {
 }
 )";
 
+// blood that stays (VulkanBackend::BloodPass, GraphicsStyle::blood): over the scene before its snow. Each pixel's place in
+// the world (the world's depth, the camera's inverse) against the stains: a spatter sphere (droplets in the world's own
+// cells, thick near the middle and a blot there, on any surface) and a pool (up-facing surfaces under the hit within its
+// reach, an uneven edge); the stain tints what is there (the picture's texture and light kept), dark red, drier and
+// darker with age, faded out at the end of its life. b1 p: [0] 1/width, 1/height, tan of half the vertical view,
+// width / height; [1] the depth was kept, seconds, stains, metres a world unit; [2]-[4] the view to the world (rows);
+// [16 + 2n] a stain: its place and radius (metres); its seed, age (seconds), kind (0 spatter, 1 pool), strength.
+// t0 the scene, t1 its depth, t2 the kept depth; s1 point
+const char* kBloodHlsl = R"(
+cbuffer P : register(b1) { float4 p[16 + 2 * 64]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D<float> keptz : register(t2);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float depthat(float2 uv) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    return p[1].x != 0 ? min(d, keptz.SampleLevel(pt, uv, 0)) : d;
+}
+bool gunat(float2 uv) {
+    return p[1].x != 0 && depthtex.SampleLevel(pt, uv, 0) < keptz.SampleLevel(pt, uv, 0) - 1e-6;
+}
+float3 viewpos(float2 uv, float z) { return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z); }
+float3 toworld(float3 v) { return float3(dot(p[2].xyz, v) + p[2].w, dot(p[3].xyz, v) + p[3].w, dot(p[4].xyz, v) + p[4].w); }
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float hash1(float3 c) {
+    uint3 q = uint3(int3(c) + 65536) * uint3(1597334673u, 3812015801u, 2798796415u);
+    uint n = (q.x ^ q.y ^ q.z) * 1597334673u;
+    n ^= n >> 15;
+    n *= 2246822519u;
+    n ^= n >> 13;
+    return float(n & 0xFFFFFF) / 16777216.0;
+}
+float3 hash3(float3 c) { return float3(hash1(c), hash1(c + 17.3), hash1(c + 91.7)); }
+// smooth value noise on a plane of the world
+float vnoise(float2 v, float s) {
+    float2 i = floor(v), f = frac(v);
+    f = f * f * (3 - 2 * f);
+    float a = hash1(float3(i, s)), b = hash1(float3(i + float2(1, 0), s)), c = hash1(float3(i + float2(0, 1), s)),
+          d = hash1(float3(i + 1, s));
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+float4 ps(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    float d = depthat(uv);
+    if (d >= 0.99999 || gunat(uv)) return float4(c, 1);
+    float zs = d * 4096, unit = p[1].w;
+    float3 W = toworld(viewpos(uv, zs));
+    float3 N = normalize(cross(ddx(W), ddy(W)));
+    float3 Vw = normalize(toworld(float3(0, 0, 0)) - W);
+    if (dot(N, Vw) < 0) N = -N;
+    float cover = 0;
+    int n = int(p[1].z);
+    [loop] for (int k = 0; k < n; k++) {
+        float4 a = p[16 + 2 * k], b = p[17 + 2 * k];
+        float3 off = (W - a.xyz) * unit;  // metres from the hit
+        float r = a.w, life = saturate(1 - max(b.y - 60, 0) / 30);
+        if (life <= 0) continue;
+        float amount = 0;
+        if (b.z < 0.5) {
+            float dist = length(off);
+            if (dist > r) continue;
+            float near = 1 - dist / r;
+            // droplets: a cell of 3 cm on the surface's own plane, a drop in some cells, more near the middle
+            float3 ax = abs(N);
+            float2 g = ax.y > ax.x && ax.y > ax.z ? W.xz : ax.x > ax.z ? W.yz : W.xy;
+            float cell = 0.035 / unit;
+            float2 cid = floor(g / cell), cf = frac(g / cell) - 0.5;
+            float3 h = hash3(float3(cid, b.x));
+            float drop = h.x < 0.15 + 0.7 * near * near ? 1 : 0;
+            float2 at = (h.yz - 0.5) * 0.5;
+            float rad = (0.18 + 0.25 * h.y) * (0.5 + near);
+            float dd = smoothstep(rad, rad * 0.55, length(cf - at));
+            // a blot at the middle, its edge torn by noise
+            float blot = smoothstep(0.0, 0.25, near - 0.55 + 0.35 * vnoise(g / cell * 0.25, b.x) - 0.1);
+            amount = max(drop * dd, blot * 0.95);
+        } else {
+            // a pool: only up-facing surfaces, within two metres of the hit's height
+            if (N.y < 0.6 || abs(off.y) > 2.0) continue;
+            float dist = length(off.xz);
+            if (dist > r) continue;
+            float edge = r * (0.65 + 0.35 * vnoise(W.xz * unit * 5.0, b.x));
+            amount = smoothstep(edge, edge * 0.6, dist);
+        }
+        cover = max(cover, amount * life * b.w);
+    }
+    if (cover <= 0.003) return float4(c, 1);
+    // dark red, drier (browner, darker) with age; the picture's own light and texture show through
+    float L = luma(c);
+    float3 wet = float3(0.30, 0.012, 0.012), dry = float3(0.14, 0.02, 0.015);
+    float3 blood = lerp(wet, dry, 0.5);
+    float3 stained = c * float3(0.55, 0.12, 0.12) * 0.7 + blood * (0.15 + 0.9 * L);
+    return float4(lerp(c, stained, saturate(cover * 0.92)), 1);
+}
+)";
+
 // light shafts and fog (VulkanBackend::AtmospherePass, RGBA16F images): src makes a quarter-size picture of what
 // lights the air (the sky, by its brightness, and the brightest surfaces: lamps, windows) as colour times weight, a
 // the weight; down halves it four times to find local light sources. shafts integrates at quarter resolution;
@@ -3937,6 +4041,18 @@ private:
     void DofPass(Target& rt, Target* ds);         // depth of field (GraphicsStyle::dof)
     void MotionBlurPass(Target& rt, Target* ds);  // motion blur (GraphicsStyle::motion_blur)
     void ContactPass(Target& rt, Target* ds);     // contact shadows (GraphicsStyle::contact_shadows)
+    void BloodPass(Target& rt, Target* ds);       // blood that stays (kBloodHlsl)
+    struct BloodMark {
+        float pos[3];
+        float radius;  // metres
+        uint32_t seed;
+        uint32_t kind;  // 0 spatter, 1 pool
+        float strength;
+        double made;    // seconds (presents / 60)
+    };
+    std::vector<BloodMark> blood_;   // the level's stains
+    uint32_t blood_epoch_ = 0;       // FootprintEpoch when they were made: a new level clears them
+    bool BloodWanted() const { return Style().blood && Style().mode != kStyleRetro && !blood_.empty(); }
     // smooth turning (GraphicsStyle::smooth_turn): the frame last presented, a frame turned from it between presents
     void MidFrame() override;
     bool WarpWanted() const { return Style().smooth_turn && refresh_hz_ >= 100 && ViewCount() < 2; }
@@ -3988,7 +4104,7 @@ private:
         const GraphicsStyle& st = Style();
         return DofWanted() || st.mode == kStyleNoir ||
                (st.mode != kStyleRetro && (st.effect_lights || st.bounce_light || QualityAo(st) > 0 || st.weather ||
-                                           st.motion_blur || st.smooth_turn || st.contact_shadows || st.particles || st.upscaler ||
+                                           st.motion_blur || st.smooth_turn || st.contact_shadows || st.particles || st.upscaler || BloodWanted() ||
                                            (st.water && WaterDrawn()) || st.reflections != kReflectOff));
     }
     float dof_aim_ = 0;          // aiming down the sights, eased 0 to 1
@@ -7075,7 +7191,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
     if (!draw_2d_ && bound_ds_) scene_wbuf_ = pk.wbuf;
     // snow: how much of the world is snow, and (without ray tracing's capture) the level's camera (snow, motion blur)
-    if ((WeatherWanted() || ParticlesWanted() || UpscaleWanted() || ((Style().motion_blur || Style().contact_shadows || Style().floor_reflections || (Style().water && WaterDrawn())) &&
+    if ((WeatherWanted() || ParticlesWanted() || UpscaleWanted() || BloodWanted() || ((Style().motion_blur || Style().contact_shadows || Style().floor_reflections || (Style().water && WaterDrawn())) &&
                               Style().mode != kStyleRetro)) && !draw_2d_ && sh.prog && pk.wbuf && a.topology == Topology::Triangles && !sh.quad &&
         bound_ds_ && bound_ds_->rt_depth_frame != presents_ + 1) {
         uint64_t n = (a.index_count ? a.index_count : a.draw_count) / 3;
@@ -9407,6 +9523,22 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     if (Style().atmosphere && Style().mode != kStyleRetro) AtmospherePass(rt, ds), timed(6);
     // the upscaler's reactive mask: the scene before the snow and the particles, which move by no camera
     const bool up_reactive = UpscaleWanted() && (WeatherWanted() || ParticlesWanted()) && UpscaleBefore(rt);
+    {
+        BloodStain ev[64];
+        const uint32_t ne = Style().blood ? TakeBloodStains(ev, 64) : 0;
+        if (FootprintEpoch() != blood_epoch_) blood_epoch_ = FootprintEpoch(), blood_.clear();
+        const double now = double(presents_) / 60.0;
+        for (uint32_t i = 0; i < ne; i++) {
+            uint32_t seed = uint32_t(presents_) * 2654435761u + i * 40503u;
+            const float s = std::clamp(ev[i].strength, 0.5f, 2.0f);
+            blood_.push_back({{ev[i].pos[0], ev[i].pos[1], ev[i].pos[2]}, 1.0f * s, seed, 0, 1.0f, now});
+            blood_.push_back({{ev[i].pos[0], ev[i].pos[1], ev[i].pos[2]}, 0.55f * s, seed ^ 0x9E3779B9u, 1, 0.9f, now});
+        }
+        blood_.erase(std::remove_if(blood_.begin(), blood_.end(), [&](const BloodMark& m) { return now - m.made > 90; }),
+                     blood_.end());
+        if (blood_.size() > 64) blood_.erase(blood_.begin(), blood_.begin() + (blood_.size() - 64));
+    }
+    if (BloodWanted() && scene_wbuf_ && one_view && !rt_cams_.empty()) BloodPass(rt, ds), timed(24);
     if (WeatherWanted()) WeatherPass(rt, ds), timed(7);
     if (ParticlesWanted()) ParticlePass(rt, ds), timed(23);
     if (up_reactive) UpscaleReactive(rt);
@@ -9788,6 +9920,77 @@ void VulkanBackend::WeatherPass(Target& rt, Target* ds) {
              snow_level_, outdoors, st.snow_amount, prints_.size(), np, unit, nw, eye[0], eye[1], eye[2],
              nw ? ws[0].pos[0] : 0.0f, nw ? ws[0].pos[1] : 0.0f, nw ? ws[0].pos[2] : 0.0f);
     }
+}
+
+void VulkanBackend::BloodPass(Target& rt, Target* ds) {
+    if (!ds || ds->w != rt.w || ds->h != rt.h) return;
+    uint64_t vh, ph;
+    if (!Compile(kBloodHlsl, "vs", "vs_5_0", vh) || !Compile(kBloodHlsl, "ps", "ps_5_0", ph)) {
+        LOG_FIRST(1, "vulkan: the blood stains did not compile; none drawn");
+        return;
+    }
+    VkPipeline pl = PassPipeline({vh, ph, scene_fmt_, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pl) return;
+    if (!rt.fb.img && !MakeImage(rt.fb, VK_IMAGE_TYPE_2D, scene_fmt_, rt.w, rt.h, 1, 1, 1,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    // the level's camera and its inverse, as WeatherPass takes them
+    const RtCam* cam = nullptr;
+    for (const auto& [h, c] : rt_cams_)
+        if (!cam || c.tris > cam->tris) cam = &c;
+    const float ty = 0.5774f, aspect = float(rt.w) / float(rt.h);
+    const float scale[3] = {ty * aspect, ty, 1};
+    float m[3][4];
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 4; k++) m[r][k] = cam->r[r][k] * scale[r];
+    const float unit = std::sqrt(m[2][0] * m[2][0] + m[2][1] * m[2][1] + m[2][2] * m[2][2]);  // metres a world unit
+    float a = m[0][0], b = m[0][1], c3 = m[0][2], d = m[1][0], e = m[1][1], f = m[1][2], g = m[2][0], h = m[2][1], k = m[2][2];
+    float det = a * (e * k - f * h) - b * (d * k - f * g) + c3 * (d * h - e * g);
+    if (std::abs(det) < 1e-12f || unit <= 0) return;
+    float inv[3][4] = {{(e * k - f * h) / det, (c3 * h - b * k) / det, (b * f - c3 * e) / det, 0},
+                       {(f * g - d * k) / det, (a * k - c3 * g) / det, (c3 * d - a * f) / det, 0},
+                       {(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det, 0}};
+    for (int r = 0; r < 3; r++) inv[r][3] = -(inv[r][0] * m[0][3] + inv[r][1] * m[1][3] + inv[r][2] * m[2][3]);
+    const bool kept = ds->rt_depth.img && ds->rt_depth_frame == presents_ + 1;
+    const double now = double(presents_) / 60.0;
+    // the nearest 64 stains to the eye
+    struct Closest { float key; const BloodMark* m; };
+    std::vector<Closest> closest;
+    for (const BloodMark& s : blood_) {
+        float dx = s.pos[0] - inv[0][3], dy = s.pos[1] - inv[1][3], dz = s.pos[2] - inv[2][3];
+        closest.push_back({std::sqrt(dx * dx + dy * dy + dz * dz) * unit, &s});
+    }
+    std::sort(closest.begin(), closest.end(), [](const Closest& x, const Closest& y) { return x.key < y.key; });
+    const uint32_t ns = uint32_t(std::min<size_t>(closest.size(), 64));
+    std::vector<float> cb((16 + 2 * 64) * 4, 0.0f);
+    const float head[5 * 4] = {1.0f / rt.w, 1.0f / rt.h, ty, aspect,
+                               kept ? 1.0f : 0.0f, float(now), float(ns), unit,
+                               inv[0][0], inv[0][1], inv[0][2], inv[0][3],
+                               inv[1][0], inv[1][1], inv[1][2], inv[1][3],
+                               inv[2][0], inv[2][1], inv[2][2], inv[2][3]};
+    std::memcpy(cb.data(), head, sizeof(head));
+    for (uint32_t i = 0; i < ns; i++) {
+        const BloodMark& s = *closest[i].m;
+        const float v0[4] = {s.pos[0], s.pos[1], s.pos[2], s.radius};
+        const float v1[4] = {float(s.seed & 0xFFFF), float(now - s.made), float(s.kind), s.strength};
+        std::memcpy(&cb[(16 + 2 * i) * 4], v0, sizeof(v0));
+        std::memcpy(&cb[(17 + 2 * i) * 4], v1, sizeof(v1));
+    }
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt.fb.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    Barrier();
+    VkImageView views[3] = {rt.fb.view, ds->res.view, kept ? ds->rt_depth.view : ds->res.view};
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    FullScreen(pl, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, cb.data(), uint32_t(cb.size()), views, 3);
+    End();
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: blood stains drawn (%zu in the level, a world unit %.3f m)", blood_.size(), unit);
 }
 
 // GPU particles (kParticleHlsl, GraphicsStyle::particles): the game's effects since the last frame (TakeParticles)
