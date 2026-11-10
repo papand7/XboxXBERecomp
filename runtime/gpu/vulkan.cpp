@@ -237,6 +237,8 @@ constexpr uint32_t kBindRtVerts = 12, kBindRtTris = 13;
 constexpr uint32_t kBindRtMats = 14, kRtTextures = 1024;
 // and where the level lighting adds up its outdoor pixels' baked light (RtFrame::stats, RtRelightPass)
 constexpr uint32_t kBindRtStats = 15;
+// each vertex's triangles (RtBuild: the vertex count, each vertex's first entry, the triangles), for smooth normals
+constexpr uint32_t kBindRtAdj = 16;
 constexpr uint32_t kRtLights = 64;  // the game's lights the level lighting takes, the nearest (RtRelightPass)
 // a captured vertex: its place (float4), then its texture coordinates (float2), diffuse colour (RGBA8) and a pad
 constexpr uint32_t kRtVertBytes = 32;
@@ -2589,6 +2591,7 @@ const char* kRtCommonHlsl = R"(
 [[vk::binding(12, 0)]] ByteAddressBuffer rt_verts;
 [[vk::binding(13, 0)]] ByteAddressBuffer rt_tris;
 [[vk::binding(14, 0)]] ByteAddressBuffer rt_mats;
+[[vk::binding(16, 0)]] ByteAddressBuffer rt_adj;
 [[vk::binding(0, 1)]] Texture2D rt_tex[1024];
 [[vk::binding(1, 1)]] SamplerState rt_smp;
 // a hit's triangle: the world's instance (custom index 0) its opaque geometry then its cut-outs, the gun's (1) after
@@ -2597,6 +2600,35 @@ uint rt_tri(uint inst, uint geom, uint prim) {
 }
 uint rt_mat(uint tri) { return rt_mats.Load(8 + tri * 4); }
 float3 rt_place(uint v) { return asfloat(rt_verts.Load3(v * 32)); }
+// a vertex's normal for a triangle there whose own (unit) normal is nf: the triangles at the vertex facing within
+// about 50 degrees of it, by their area (a real corner, a box's, keeps its edge; a low-poly curve shades round). s
+// the instance's scale; nf where there is no list or nothing near it
+float3 rt_vertex_normal(uint v, float3 nf, float3 s) {
+    uint V = rt_adj.Load(0);
+    if (v >= V) return nf;
+    uint first = rt_adj.Load(4 + v * 4), last = min(rt_adj.Load(8 + v * 4), first + 24);
+    float3 sum = 0;
+    [loop] for (uint e = first; e < last; e++) {
+        uint t = rt_adj.Load(8 + V * 4 + e * 4);
+        uint3 i = rt_tris.Load3(t * 12);
+        float3 a = rt_place(i.x) * s, b = rt_place(i.y) * s, c = rt_place(i.z) * s;
+        float3 n = cross(b - a, c - a);
+        float l = length(n);
+        if (l < 1e-12) continue;
+        if (dot(n / l, nf) < 0) n = -n;  // a mesh wound either way
+        if (dot(n / l, nf) > 0.64) sum += n;
+    }
+    return dot(sum, sum) > 1e-20 ? normalize(sum) : nf;
+}
+// the smooth normal at a point of a triangle (its corners' normals over it); nf its flat one, facing the viewer
+float3 rt_smooth(uint tri, float2 bary, float3 nf, float3 s) {
+    uint3 t = rt_tris.Load3(tri * 12);
+    float w0 = 1 - bary.x - bary.y;
+    float3 n = rt_vertex_normal(t.x, nf, s) * w0 + rt_vertex_normal(t.y, nf, s) * bary.x +
+               rt_vertex_normal(t.z, nf, s) * bary.y;
+    n = dot(n, n) > 1e-20 ? normalize(n) : nf;
+    return dot(n, nf) > 0 ? n : nf;
+}
 float4 rt_unpack(uint c) { return float4(c & 255, (c >> 8) & 255, (c >> 16) & 255, c >> 24) / 255.0; }
 // a point of a triangle: its texture coordinates and diffuse colour
 void rt_attr(uint tri, float2 bary, out float2 uv, out float4 col) {
@@ -3024,6 +3056,7 @@ int surface(float2 uv, out float3 P, out float3 N, out float3 baked, out float f
     if (dot(N, N) < 1e-20) return 1;
     N = normalize(N);
     if (dot(N, P) > 0) N = -N;
+    N = rt_smooth(hit, bary, N, s);  // smooth over the mesh (XBE_RT_FLAT=1: the flat face's, no lists)
     P = pr.Direction * q.CommittedRayT();
     baked = col.rgb * 2;
     return 2;
@@ -3932,6 +3965,7 @@ private:
         Buffer verts;  // float4 places, written by the capture shaders (device)
         Buffer tris;   // the triangles, indices into verts (host): the opaque ones, then the cut-outs
         Buffer mats;   // their materials (host): the opaque triangles' count, then a word a triangle (RtMaterial)
+        Buffer adj;    // each vertex's triangles (host, kBindRtAdj): the relight's smooth normals
         VkDescriptorSet tex_set = VK_NULL_HANDLE;  // set 1: the textures the materials name
         uint32_t tex_written = 0;                  // of them written with a texture last time (the rest the dummy)
         Buffer inst;   // the top level's one instance (host)
@@ -3972,6 +4006,7 @@ private:
     VkPipelineLayout rt_layout_ = VK_NULL_HANDLE;
     bool rt_capturing_ = false;  // the draw being recorded writes its places (PushDescriptors adds u0)
     uint32_t rt_used_ = 0;       // vertices captured this frame
+    std::vector<uint32_t> rt_adj_;  // RtBuild's vertex-to-triangle lists, kept between frames for their memory
     uint32_t rt_want_ = 1u << 20;  // the capture buffers' size in vertices: doubled after a frame that ran out
     bool rt_full_ = false;
     bool rt_drawn_ = false;  // this frame's occlusion was traced: the screen-space one is left out
@@ -4790,15 +4825,16 @@ bool VulkanBackend::CreateFixed() {
     if (vkCreatePipelineLayout(dev_, &pl, nullptr, &layout_) != VK_SUCCESS) return false;
     // the ray traced passes': the same, and the acceleration structure
     if (rt_ok_) {
-        VkDescriptorSetLayoutBinding rb[kBindRtStats + 1]{};
+        VkDescriptorSetLayoutBinding rb[kBindRtAdj + 1]{};
         std::memcpy(rb, b, sizeof(VkDescriptorSetLayoutBinding) * (kBindCapture + 1));
         rb[kBindTlas] = {kBindTlas, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_ALL_GRAPHICS, nullptr};
         rb[kBindRtVerts] = {kBindRtVerts, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         rb[kBindRtTris] = {kBindRtTris, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         rb[kBindRtMats] = {kBindRtMats, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         rb[kBindRtStats] = {kBindRtStats, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        rb[kBindRtAdj] = {kBindRtAdj, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo rdl = dl;
-        rdl.bindingCount = kBindRtStats + 1;
+        rdl.bindingCount = kBindRtAdj + 1;
         rdl.pBindings = rb;
         // set 1: the frame's textures and their sampler (repeating, linear)
         VkDescriptorSetLayoutBinding tb[2] = {
@@ -5822,7 +5858,7 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
     v.height = -vp.height;
     vkCmdSetViewport(c, 0, 1, &v);
     vkCmdSetScissor(c, 0, 1, &sc);
-    VkWriteDescriptorSet w[1 + 4 + 4 + 5]{};
+    VkWriteDescriptorSet w[1 + 4 + 4 + 6]{};  // constants, textures, samplers, the ray traced ones (tlas to adj)
     VkDescriptorBufferInfo bi{};
     VkDescriptorImageInfo ii[4]{}, si[4]{};
     uint32_t n = 0;
@@ -5844,7 +5880,7 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
                   VK_DESCRIPTOR_TYPE_SAMPLER, &si[i], nullptr, nullptr};
     }
     VkWriteDescriptorSetAccelerationStructureKHR wa{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
-    VkDescriptorBufferInfo rv{}, rtr{}, rm{}, rs{};
+    VkDescriptorBufferInfo rv{}, rtr{}, rm{}, rs{}, ra{};
     if (tlas) {
         wa.accelerationStructureCount = 1;
         wa.pAccelerationStructures = &tlas;
@@ -5864,6 +5900,9 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
         rs = {f.stats.buf ? f.stats.buf : f.mats.buf, 0, VK_WHOLE_SIZE};
         w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindRtStats, 0, 1,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rs, nullptr};
+        ra = {f.adj.buf, 0, VK_WHOLE_SIZE};  // RtBuild made it (no structure without it)
+        w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindRtAdj, 0, 1,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ra, nullptr};
         vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_layout_, 1, 1, &f.tex_set, 0, nullptr);
     }
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, tlas ? rt_layout_ : layout_, 0, n, w);
@@ -7523,6 +7562,35 @@ bool VulkanBackend::RtBuild(float aspect) {
     std::memcpy(mw + 2, rt_mats_.data(), rt_mats_.size() * 4);
     std::memcpy(mw + 2 + opaque, rt_cut_mats_.data(), rt_cut_mats_.size() * 4);
     std::memcpy(mw + 2 + opaque + cut, rt_gun_mats_.data(), rt_gun_mats_.size() * 4);
+    // each vertex's triangles, for the relight's smooth normals: [0] the vertex count, [1 + v] its first entry
+    // ([1 + V] the end), then the triangles (their place in tris, as rt_tri gives a hit's)
+    {
+        static const bool flat = std::getenv("XBE_RT_FLAT") != nullptr;  // diagnostic: the flat normals
+        const uint32_t V = flat ? 0 : rt_used_;
+        // (the CPU's copies: reading the mapped buffer back, write-combined memory, took seconds a frame)
+        const size_t n1 = rt_tris_.size(), n2 = n1 + rt_cut_.size();
+        auto ti = [&](size_t i) { return i < n1 ? rt_tris_[i] : i < n2 ? rt_cut_[i - n1] : rt_gun_[i - n2]; };
+        rt_adj_.assign(size_t(V) + 2 + size_t(tris) * 3, 0);
+        uint32_t* off = rt_adj_.data() + 1;
+        rt_adj_[0] = V;
+        for (uint32_t i = 0; i < tris * 3; i++)
+            if (uint32_t v = ti(i); v < V) off[v + 1]++;
+        for (uint32_t v = 1; v <= V; v++) off[v] += off[v - 1];
+        std::vector<uint32_t> at(off, off + V);
+        uint32_t* list = rt_adj_.data() + V + 2;
+        for (uint32_t t = 0; t < tris; t++)
+            for (uint32_t k = 0; k < 3; k++)
+                if (uint32_t v = ti(size_t(t) * 3 + k); v < V) list[at[v]++] = t;
+        const VkDeviceSize abytes = VkDeviceSize(rt_adj_.size()) * 4;
+        if (f.adj.size < abytes) {
+            DropBuffer(f.adj);
+            if (!MakeBuffer(f.adj, std::max<VkDeviceSize>(abytes + abytes / 2, 1u << 20), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            true))
+                return false;
+        }
+        if (!f.adj.mem.map) return false;
+        std::memcpy(f.adj.mem.map, rt_adj_.data(), abytes);
+    }
     // the textures the materials name; those another frame wrote past them back to the dummy (they may be gone)
     {
         uint32_t used = uint32_t(rt_views_.size()), upto = std::max(used, f.tex_written);
@@ -8018,6 +8086,7 @@ void VulkanBackend::DropRt(RtFrame& f) {
     f.blas = f.tlas = f.gun_blas = VK_NULL_HANDLE;
     DropBuffer(f.gun_blas_mem);
     DropBuffer(f.verts), DropBuffer(f.tris), DropBuffer(f.mats), DropBuffer(f.inst), DropBuffer(f.scratch);
+    DropBuffer(f.adj);
     DropBuffer(f.stats);
     DropBuffer(f.blas_mem), DropBuffer(f.tlas_mem);
     f.vert_cap = 0;
