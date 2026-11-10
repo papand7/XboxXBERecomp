@@ -5695,6 +5695,13 @@ VkShaderModule VulkanBackend::Compile(const std::string& source, const char* ent
     uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
     hash = Hash(src.data(), src.size(), entry_seed);
     if (modules_.count(hash)) return modules_[hash];
+    // XBE_HLSL_DUMP=<folder> (diagnostic): each shader's HLSL as compiled, <hash>.<profile>.<entry>.hlsl
+    static const char* dump = std::getenv("XBE_HLSL_DUMP");
+    if (dump && *dump) {
+        char name[160];
+        std::snprintf(name, sizeof name, "%s/%016llx.%s.%s.hlsl", dump, (unsigned long long)hash, profile, entry);
+        if (FILE* f = std::fopen(name, "wb")) std::fwrite(src.data(), 1, src.size(), f), std::fclose(f);
+    }
     std::vector<uint32_t> code;
     if (ComPtr<ID3DBlob> kept; CachedShader(hash, kept.GetAddressOf())) {
         code.resize(kept->GetBufferSize() / 4);
@@ -9225,9 +9232,20 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
     if (WeatherWanted()) WeatherPass(rt, ds), timed(7);
     if (ParticlesWanted()) ParticlePass(rt, ds), timed(23);
     if (up_reactive) UpscaleReactive(rt);
-    if (TaaWanted() && ds) TaaPass(rt, ds), timed(21);
-    if (tone_drawn_) ToneResolve(rt), timed(8);
-    if (StylePassWanted()) StylePass(rt, ds), timed(9);
+    // toon and noir: their outlines (the style pass's edges, from this frame's depth) drawn before TAA, so TAA smooths
+    // them with the rest; after it they sat where things are now while TAA's colour still trailed them (the outline
+    // looked late on moving things)
+    const bool outlines_first = TaaWanted() && ds && StylePassWanted() &&
+                                (Style().mode == kStyleToon || Style().mode == kStyleNoir);
+    if (outlines_first) {
+        if (tone_drawn_) ToneResolve(rt), timed(8);
+        StylePass(rt, ds), timed(9);
+        TaaPass(rt, ds), timed(21);
+    } else {
+        if (TaaWanted() && ds) TaaPass(rt, ds), timed(21);
+        if (tone_drawn_) ToneResolve(rt), timed(8);
+        if (StylePassWanted()) StylePass(rt, ds), timed(9);
+    }
     if (app::Get().smaa && Style().mode != kStyleRetro && !TaaWanted() && !UpscaleWanted()) SmaaPass(rt), timed(10);
     if (DofWanted() && one_view) DofPass(rt, ds), timed(11);
     if (Style().motion_blur && Style().mode != kStyleRetro && one_view) MotionBlurPass(rt, ds), timed(19);
