@@ -58,6 +58,7 @@ ASSETS=${ASSETS:-$REPO/assets}
 ASSETS=$(cd "$ASSETS" && pwd)
 
 # DXC for the ABI
+echo "package: step 1 of 4: the DXC compiler (done once; it is kept for the next package)"
 if [ -z "$DXC" ]; then
     bash "$HERE/build_dxc.sh" -n "$NDK" -a "$ABI"
     DXC=${HOME}/.cache/xbe-android/dxc/out/$ABI
@@ -67,17 +68,19 @@ fi
 # the build-time tools for this machine
 HOSTB=$REPO/out/build/android-host
 mkdir -p "$REPO/out/build"
+echo "package: step 2 of 4: the build tools for this PC"
 cmake -S "$REPO" -B "$HOSTB" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${CC:-clang} \
     -DCMAKE_CXX_COMPILER=${CXX:-clang++} -DXBE_DLSS=OFF > "$HOSTB.cfg.log" 2>&1 || { tail -20 "$HOSTB.cfg.log"; exit 1; }
-cmake --build "$HOSTB" -j "$JOBS" --target xbe_recomp fsr2_shaders > "$HOSTB.build.log" 2>&1 || { tail -30 "$HOSTB.build.log"; exit 1; }
+cmake --build "$HOSTB" -j "$JOBS" --target xbe_recomp fsr2_shaders 2>&1 | tee "$HOSTB.build.log" || { tail -30 "$HOSTB.build.log"; exit 1; }
 
 # the game for Android
+echo "package: step 3 of 4: the game for $ABI (the longest step: a few minutes to over an hour on a slow PC)"
 B=$REPO/out/build/android-$ABI
 cmake -S "$REPO" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI="$ABI" \
     -DANDROID_PLATFORM=android-29 -DANDROID_STL=c++_static -DXBE_HOST_TOOLS="$HOSTB" -DXBE_ANDROID_DXC="$DXC" \
     -DXBE_DLSS=OFF > "$B.cfg.log" 2>&1 || { tail -30 "$B.cfg.log"; exit 1; }
-cmake --build "$B" -j "$JOBS" --target $EXES > "$B.build.log" 2>&1 || { grep -m 20 -B2 -A8 "error" "$B.build.log" | head -80; exit 1; }
+cmake --build "$B" -j "$JOBS" --target $EXES 2>&1 | tee "$B.build.log" || { grep -m 20 -B2 -A8 "error" "$B.build.log" | head -80; exit 1; }
 
 # the package: libraries, DXC, the disc, a manifest the app checks
 STAGE=$REPO/out/android-package-$ABI
@@ -112,6 +115,7 @@ JSON
 mkdir -p "$(dirname "$ZIP")"
 rm -f "$ZIP"
 # the libraries and manifest compressed, the disc stored (it barely compresses and the phone unpacks it faster)
+echo "package: step 4 of 4: packing the zip (the disc is about 2 GB and is stored, not compressed: a few minutes)"
 (cd "$STAGE" && zip -q -9 "$ZIP" package.json lib*.so && zip -q -0 -r "$ZIP" assets $( [ -e texture_pack ] && echo texture_pack ))
 rm -rf "$STAGE"
 ls -la "$ZIP"
