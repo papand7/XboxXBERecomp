@@ -86,6 +86,9 @@ struct Settings {
     // Discord Rich Presence (discord.cpp): on, and the application's id from Discord's developer portal (empty: off)
     bool discord = true;
     std::string discord_app_id;
+    // Online list: a host publishes its game to the master server (its address, map and players, every 30 s) when on
+    bool publish_server = false;
+    std::string master_url = "https://masterserver.dankelsoft.dk/api.php";
 };
 // the wheel buttons of a Logitech G920/G923 (Xbox) for each input::Control, -1 none
 int8_t DefaultWheelButton(int c);
