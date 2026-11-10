@@ -233,6 +233,7 @@ void Load() {
     s.discord = t["discord"].value_or(s.discord);
     s.discord_app_id = t["discord_app_id"].value_or(s.discord_app_id);
     s.publish_server = t["publish_server"].value_or(s.publish_server);
+    s.hurt_effects = t["hurt_effects"].value_or(s.hurt_effects);
     s.master_url = t["master_url"].value_or(s.master_url);
     std::string aspect = t["aspect"].value_or(std::string(kAspects[s.aspect % kAspectCount]));
     for (uint32_t i = 0; i < kAspectCount; i++)
@@ -349,6 +350,7 @@ toml::table Table() {
                   {"join_ip", s.join_ip},
                   {"discord", s.discord},
                   {"publish_server", s.publish_server},
+                  {"hurt_effects", s.hurt_effects},
                   {"master_url", s.master_url},
                   {"discord_app_id", s.discord_app_id},
                   {"aspect", kAspects[s.aspect % kAspectCount]},

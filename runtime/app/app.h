@@ -88,6 +88,7 @@ struct Settings {
     std::string discord_app_id;
     // Online list: a host publishes its game to the master server (its address, map and players, every 30 s) when on
     bool publish_server = false;
+    bool hurt_effects = true;  // the red pulse at low health (app/blood.cpp SetHealth)
     std::string master_url = "https://masterserver.dankelsoft.dk/api.php";
 };
 // the wheel buttons of a Logitech G920/G923 (Xbox) for each input::Control, -1 none
@@ -156,6 +157,9 @@ void MixHitSound(float* out, uint32_t frames);  // the ticks into the mixer's st
 // the shown frame's fractions, strength 0 to 1), and a player's view (its corners, the same) hit, by how much (0 to 1)
 void BloodSpray(float x, float y, float strength);
 void BloodHurt(float x0, float y0, float x1, float y1, float amount);
+// Low health (Settings::hurt_effects): the player's health as a fraction (1 full, 0 none), set each frame by the game;
+// under a third the view's edges go red and pulse, faster the lower it is (drawn over the picture, every renderer)
+void SetHealth(float fraction);
 void DrawBlood();                               // inside the ImGui frame, from DrawHud
 void FeedPad();                   // controllers to the settings window's navigation, before each ImGui frame
 Mode Output();

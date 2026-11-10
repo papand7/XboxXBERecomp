@@ -107,10 +107,37 @@ void BloodHurt(float x0, float y0, float x1, float y1, float amount) {
     g_hurts.push_back(std::move(h));
 }
 
+namespace {
+float g_health = 1.0f;  // the player's, as a fraction (SetHealth)
+}  // namespace
+
+void SetHealth(float fraction) { g_health = std::clamp(fraction, 0.0f, 1.0f); }
+
+// the low-health warning: red soaking in from every edge, steady below a third of health and swelling with each beat
+// (a beat every 1.1 s at a third, every 0.45 s at none)
+static void DrawLowHealth(const ImGuiViewport* vp) {
+    if (!app::Get().hurt_effects || g_health >= 0.34f) return;
+    const float low = std::clamp((0.34f - g_health) / 0.34f, 0.0f, 1.0f);  // 0 at a third, 1 at none
+    const float period = 1.1f - 0.65f * low;
+    const float t = std::fmod(std::chrono::duration<float>(Clock::now().time_since_epoch()).count(), period) / period;
+    const float swell = std::sin(3.14159f * t);
+    const float alpha = std::clamp(0.10f + 0.12f * low + (0.10f + 0.22f * low) * swell * swell, 0.0f, 0.6f);  // steady, swelling
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImVec2 a = vp->Pos, b(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
+    const float band = std::min(vp->Size.x, vp->Size.y) * (0.22f + 0.13f * low);
+    const ImU32 red = IM_COL32(200, 6, 10, int(alpha * 255));
+    const ImU32 clear = IM_COL32(200, 6, 10, 0);
+    dl->AddRectFilledMultiColor(a, ImVec2(a.x + band, b.y), red, clear, clear, red);  // left
+    dl->AddRectFilledMultiColor(ImVec2(b.x - band, a.y), b, clear, red, red, clear);  // right
+    dl->AddRectFilledMultiColor(a, ImVec2(b.x, a.y + band), red, red, clear, clear);  // top
+    dl->AddRectFilledMultiColor(ImVec2(a.x, b.y - band), b, clear, clear, red, red);  // bottom
+}
+
 void DrawBlood() {
     std::lock_guard<std::mutex> l(g_lock);
-    if (g_sprays.empty() && g_hurts.empty()) return;
     ImGuiViewport* vp = ImGui::GetMainViewport();
+    DrawLowHealth(vp);
+    if (g_sprays.empty() && g_hurts.empty()) return;
     float w = vp->Size.x, h = vp->Size.y, aspect = FrameAspect();
     float fw = std::min(w, h * aspect), fh = fw / aspect;
     float fx = vp->Pos.x + (w - fw) / 2, fy = vp->Pos.y + (h - fh) / 2;
