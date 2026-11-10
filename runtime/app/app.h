@@ -89,6 +89,12 @@ struct Settings {
     // Online list: a host publishes its game to the master server (its address, map and players, every 30 s) when on
     bool publish_server = false;
     bool hurt_effects = true;  // the red pulse at low health (app/blood.cpp SetHealth)
+    // the crosshair (app/crosshair.cpp): 0 the game's own, 1 dot, 2 cross, 3 ring, 4 cross and dot; colour as RGBA
+    // (IM_COL32 layout, red in the low byte), size and gap in pixels at 1080 lines, thickness too
+    uint32_t crosshair_style = 0;
+    uint32_t crosshair_color = 0xFFFFFFFFu;
+    uint32_t crosshair_size = 10, crosshair_gap = 4;
+    uint32_t crosshair_thickness = 2;
     std::string master_url = "https://masterserver.dankelsoft.dk/api.php";
 };
 // the wheel buttons of a Logitech G920/G923 (Xbox) for each input::Control, -1 none
@@ -160,6 +166,7 @@ void BloodHurt(float x0, float y0, float x1, float y1, float amount);
 // Low health (Settings::hurt_effects): the player's health as a fraction (1 full, 0 none), set each frame by the game;
 // under a third the view's edges go red and pulse, faster the lower it is (drawn over the picture, every renderer)
 void SetHealth(float fraction);
+void DrawCrosshair();  // the custom crosshair, if one is set (app/crosshair.cpp)
 void DrawBlood();                               // inside the ImGui frame, from DrawHud
 void FeedPad();                   // controllers to the settings window's navigation, before each ImGui frame
 Mode Output();

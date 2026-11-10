@@ -234,6 +234,11 @@ void Load() {
     s.discord_app_id = t["discord_app_id"].value_or(s.discord_app_id);
     s.publish_server = t["publish_server"].value_or(s.publish_server);
     s.hurt_effects = t["hurt_effects"].value_or(s.hurt_effects);
+    s.crosshair_style = uint32_t(t["crosshair_style"].value_or(int64_t(s.crosshair_style)));
+    s.crosshair_color = uint32_t(t["crosshair_color"].value_or(int64_t(s.crosshair_color)));
+    s.crosshair_size = uint32_t(t["crosshair_size"].value_or(int64_t(s.crosshair_size)));
+    s.crosshair_gap = uint32_t(t["crosshair_gap"].value_or(int64_t(s.crosshair_gap)));
+    s.crosshair_thickness = uint32_t(t["crosshair_thickness"].value_or(int64_t(s.crosshair_thickness)));
     s.master_url = t["master_url"].value_or(s.master_url);
     std::string aspect = t["aspect"].value_or(std::string(kAspects[s.aspect % kAspectCount]));
     for (uint32_t i = 0; i < kAspectCount; i++)
@@ -351,6 +356,11 @@ toml::table Table() {
                   {"discord", s.discord},
                   {"publish_server", s.publish_server},
                   {"hurt_effects", s.hurt_effects},
+                  {"crosshair_style", int64_t(s.crosshair_style)},
+                  {"crosshair_color", int64_t(s.crosshair_color)},
+                  {"crosshair_size", int64_t(s.crosshair_size)},
+                  {"crosshair_gap", int64_t(s.crosshair_gap)},
+                  {"crosshair_thickness", int64_t(s.crosshair_thickness)},
                   {"master_url", s.master_url},
                   {"discord_app_id", s.discord_app_id},
                   {"aspect", kAspects[s.aspect % kAspectCount]},

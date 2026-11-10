@@ -514,6 +514,7 @@ void DrawHud(double fps) {
     if (OverlaysHidden()) return;
     DrawUnlock();
     DrawBlood();
+    DrawCrosshair();
     DrawHitMarkers();
     if (!Get().show_fps) return;
     ImGuiViewport* vp = ImGui::GetMainViewport();
