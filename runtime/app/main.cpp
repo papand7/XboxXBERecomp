@@ -419,7 +419,16 @@ void Pace(uint32_t vblanks) {
     }
     uint32_t cap = PaceRate(Get().fps_cap, vblanks);
     auto now = clock::now();
-    if (!cap) {
+    if (!cap) {  // NF_UNCAPPED=1 (diagnostic): the frame's work time, averaged over 10 s
+        static clock::time_point last_u = now, report_u = now + std::chrono::seconds(10);
+        static double work_u = 0;
+        static uint32_t n_u = 0;
+        work_u += std::chrono::duration<double, std::milli>(now - last_u).count(), n_u++;
+        last_u = now;
+        if (now >= report_u && n_u) {
+            LOGR("frames uncapped: %.2f ms a frame on average (%.0f a second)", work_u / n_u, 1000.0 * n_u / work_u);
+            work_u = 0, n_u = 0, report_u = now + std::chrono::seconds(10);
+        }
         next = now;
         return;
     }
@@ -448,8 +457,19 @@ void Pace(uint32_t vblanks) {
     if (next < now - period) next = now;
     // the renderer's frame in between (smooth turning): asked for now, drawn by it half way to the next present
     if (g_mid_frame) g_mid_frame();
+    // NF_PERF_WORK (the capped run): the frame's work, the period less the time this frame's pacing waits
+    static double waited_last = 0, work_sum = 0;
+    static uint32_t work_n = 0;
+    static clock::time_point work_report = now + std::chrono::seconds(10);
+    work_sum += took - waited_last, work_n++;
+    if (now >= work_report && work_n) {
+        LOGR("frame work: %.2f ms a frame on average (paced at %u a second)", work_sum / work_n, cap);
+        work_sum = 0, work_n = 0, work_report = now + std::chrono::seconds(10);
+    }
+    const auto wait_from = clock::now();
     while (clock::now() + std::chrono::milliseconds(2) < next) Sleep(1);
     while (clock::now() < next) std::this_thread::yield();
+    waited_last = std::chrono::duration<double, std::milli>(clock::now() - wait_from).count();
     netplay::Frame();  // LAN play: the next frame's controllers of every player
 }
 

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -340,6 +341,9 @@ void Pace(uint32_t vblanks = 1);
 void SetMidFrame(void (*fn)());
 // frames a second for a title asking for vblanks within cap (0 unlimited); 0 unpaced
 inline uint32_t PaceRate(uint32_t cap, uint32_t vblanks) {
+    // NF_UNCAPPED=1 (diagnostic): no pacing, so the frame's real work time shows (the 10 s average, from Pace)
+    static const bool uncapped = [] { const char* e = std::getenv("NF_UNCAPPED"); return e && *e == '1'; }();
+    if (uncapped) return 0;
     if (!vblanks) return cap;
     uint32_t fps = 60 / vblanks;
     return cap && cap < fps ? cap : fps;
