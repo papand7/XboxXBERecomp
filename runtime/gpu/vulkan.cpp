@@ -66,6 +66,7 @@
 #include "gpu/backend.h"
 #include "gpu/d3d_common.h"
 #include "gpu/dxc.h"
+#include "gpu/glslang_hlsl.h"
 #include "gpu/ext.h"
 #include "gpu/shaders.h"
 #include "gpu/smaa.h"
@@ -4970,7 +4971,8 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     scale_ = app::RenderScale(guest_h_);
     if (!LoadVulkan() || !CreateInstance() || !PickDevice() || !CreateDevice() || !CreateFixed() || !CreateSwapchain())
         return false;
-    if (!dxc::Load()) return false;
+    // DXC, unless glslang compiles the shaders (macOS has no DXC: ray tracing, its 6.5 shaders, is off there)
+    if (!GlslangWanted() && !dxc::Load()) return false;
     // the shaders the passes need, compiled once now: a DXC that cannot make SPIR-V fails here, not mid-game
     uint64_t h;
     if (!Compile(kBlitHlsl, "vs", "vs_5_0", h) || !Compile(kBlitHlsl, "psmain", "ps_5_0", h)) {
@@ -5727,7 +5729,9 @@ void VulkanBackend::RecordLate(uint32_t data) {
 // entry point named "main" in the module
 VkShaderModule VulkanBackend::Compile(const std::string& source, const char* entry, const char* profile, uint64_t& hash) {
     std::string src = profile[0] == 'v' ? LocateInputs(source) : source;
-    uint64_t profile_seed = Hash(profile, std::strlen(profile), 0x5350495256ull);  // "SPIRV": apart from D3D blobs
+    // glslang instead of DXC (macOS; XBE_SHADER_COMPILER=glslang): its SPIR-V kept apart from DXC's in the cache
+    const bool by_glslang = GlslangWanted() && !std::strstr(profile, "6_5");
+    uint64_t profile_seed = Hash(profile, std::strlen(profile), by_glslang ? 0x474C534Cull : 0x5350495256ull);
     uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
     hash = Hash(src.data(), src.size(), entry_seed);
     if (modules_.count(hash)) return modules_[hash];
@@ -5743,6 +5747,16 @@ VkShaderModule VulkanBackend::Compile(const std::string& source, const char* ent
         code.resize(kept->GetBufferSize() / 4);
         std::memcpy(code.data(), kept->GetBufferPointer(), code.size() * 4);
     } else {
+        if (by_glslang) {
+            std::string errors;
+            if (!CompileHlslGlslang(src, entry, profile, code, errors)) {
+                LOGE("vulkan: %s compile failed (glslang): %s", profile, errors.c_str());
+                LOGE("%s", src.c_str());
+                return modules_[hash] = VK_NULL_HANDLE;
+            }
+            static bool told = false;
+            if (!told) told = true, LOGR("vulkan: shaders compiled by glslang (XBE_SHADER_COMPILER=glslang or macOS)");
+        } else {
         if (!dxc::Load()) return modules_[hash] = VK_NULL_HANDLE;
         // a 6.x profile (ray queries: 6.5) as it is, on Vulkan 1.2's SPIR-V; the D3D 5 ones at 6.0
         bool sm6 = profile[3] == '6';
@@ -5759,6 +5773,7 @@ VkShaderModule VulkanBackend::Compile(const std::string& source, const char* ent
             LOGE("vulkan: %s compile failed: %s", profile, errors.c_str());
             LOGE("%s", src.c_str());
             return modules_[hash] = VK_NULL_HANDLE;
+        }
         }
         g_shaders_compiled.fetch_add(1, std::memory_order_relaxed);
         ComPtr<ID3DBlob> keep;
