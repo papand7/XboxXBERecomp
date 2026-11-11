@@ -6,6 +6,7 @@
 // the player's own copy, not to be shared. Windows, Linux and macOS (pictures through app/image.cpp).
 //
 //   hd_pack [--scale 2|4] [--pbr] [--force] [--model x4plus|anime] [--dir <the game's folder>]
+//   hd_pack --movies [--movie-model fast|quality] [--force] [--dir <the game's folder>]
 //
 // - Seams: game textures repeat, so each is padded with its own opposite edges before upscaling and cropped after.
 // - Alpha: upscaled as a picture of its own (grey), so cut-outs and glass keep their shape.
@@ -14,9 +15,12 @@
 //   <key>_r.png, roughness (white rough, black polished) from its local contrast and brightness. Generated, so an
 //   approximation: the runtime reads roughness for reflections.
 // - Done pictures are skipped (--force does them again): play more of the game with the dump on, run it again.
-// - Movies (gpu/movie_pack.h): the frames a title collected in mods/movies/dump/ (<key>.png, <movie>.txt their order)
-//   upscaled 2x into mods/movies/<key>.jpg (the 4x model's result halved), a hundred at a time so the work folder
-//   stays small; each collected frame is removed once its picture is written (the orders are kept beside them).
+// - --movies (gpu/movie_pack.h), a run of its own: the frames a title collected in mods/movies/dump/ (<key>.png,
+//   <movie>.txt their order) upscaled 2x into mods/movies/<key>.jpg, a hundred at a time so the work folder stays
+//   small; each collected frame is removed once its picture is written (the orders are kept beside them). fast (the
+//   default): realesr-animevideov3, a 2x video model, several times quicker; quality: x4plus's 4x halved. Some GPUs
+//   (an RTX 5060 here) make black or broken pictures with the fast model: its first frames are checked against the
+//   collected ones (shrunk back, they must match), and quality is used instead when they do not.
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -37,6 +41,7 @@ extern char** environ;
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -225,8 +230,18 @@ const char* const kUpscaler = "realesrgan-ncnn-vulkan.exe";
 const char* const kUpscaler = "realesrgan-ncnn-vulkan";
 #endif
 
+// an upscaled frame shrunk back to its source's size matches it (a real picture, not black or noise)
+bool Matches(const Picture& src, const Picture& up) {
+    if (!src.w || up.w != src.w * 2 || up.h != src.h * 2) return false;
+    const Picture back = Half(up);
+    double diff = 0;
+    for (size_t i = 0; i < src.px.size(); i++)
+        for (int k = 0; k < 3; k++) diff += std::abs(int(src.px[i] >> (k * 8) & 0xFF) - int(back.px[i] >> (k * 8) & 0xFF));
+    return diff / (double(src.px.size()) * 3) < 12;
+}
+
 // the movies' frames: mods/movies/dump/<key>.png to mods/movies/<key>.jpg, 2x; false when one failed
-bool Movies(const fs::path& dir, const fs::path& esr, const std::string& model, bool force) {
+bool Movies(const fs::path& dir, const fs::path& esr, bool fast, bool force) {
     const fs::path dump = dir / "mods" / "movies" / "dump", out = dir / "mods" / "movies";
     std::error_code ec;
     if (!fs::exists(dump, ec)) return true;
@@ -256,7 +271,27 @@ bool Movies(const fs::path& dir, const fs::path& esr, const std::string& model, 
             fs::create_hard_link(todo[i], in / todo[i].filename(), ec);  // the same drive: no copy
             if (ec) fs::copy_file(todo[i], in / todo[i].filename(), ec);
         }
-        if (int code = Run(esr, {"-i", U8(in), "-o", U8(up), "-n", model, "-s", "4", "-f", "png"}); code != 0) {
+        auto upscale = [&] {
+            return fast ? Run(esr, {"-i", U8(in), "-o", U8(up), "-n", "realesr-animevideov3", "-s", "2", "-f", "png"})
+                        : Run(esr, {"-i", U8(in), "-o", U8(up), "-n", "realesrgan-x4plus", "-s", "4", "-f", "png"});
+        };
+        int code = upscale();
+        if (code == 0 && fast && first == 0) {  // the fast model's first frames checked: some GPUs make black or noise
+            bool good = true;
+            for (size_t i = first; i < std::min(end, first + 3) && good; i++) {
+                Picture src, out;
+                good = Read(todo[i], src) && Read(up / todo[i].filename(), out) && Matches(src, out);
+            }
+            if (!good) {
+                std::printf("hd_pack: the fast model makes broken pictures on this GPU: using the quality model (slower)\n");
+                std::fflush(stdout);
+                fast = false;
+                fs::remove_all(up, ec);
+                fs::create_directories(up, ec);
+                code = upscale();
+            }
+        }
+        if (code != 0) {
             std::printf("hd_pack: the upscaler failed on the movie frames (exit %d)\n", code);
             fs::remove_all(work, ec);
             return false;
@@ -268,7 +303,7 @@ bool Movies(const fs::path& dir, const fs::path& esr, const std::string& model, 
                 std::printf("  %s: no upscaled frame\n", stem.c_str());
                 continue;
             }
-            const Picture half = Half(big);
+            const Picture half = fast ? big : Half(big);
             fs::path tmp = out / (stem + ".jpg.tmp");
             if (!app::EncodeJpeg(tmp, half.px, half.w, half.h, 90)) {
                 fs::remove(tmp, ec);
@@ -288,7 +323,7 @@ bool Movies(const fs::path& dir, const fs::path& esr, const std::string& model, 
 
 int Main(const std::vector<std::string>& argv) {
     uint32_t scale = 4;
-    bool pbr = false, force = false;
+    bool pbr = false, force = false, movies = false, fast = true;
     std::string model = "realesrgan-x4plus";
     fs::path dir = ExeDir();
     if (dir.filename() == "tools") dir = dir.parent_path();  // beside the game as tools/hd_pack
@@ -300,8 +335,11 @@ int Main(const std::vector<std::string>& argv) {
         else if (a == "--model" && i + 1 < argv.size())
             model = argv[++i] == "anime" ? "realesrgan-x4plus-anime" : "realesrgan-x4plus";
         else if (a == "--dir" && i + 1 < argv.size()) dir = FromU8(argv[++i]);
+        else if (a == "--movies") movies = true;
+        else if (a == "--movie-model" && i + 1 < argv.size()) fast = argv[++i] != "quality";
         else {
-            std::printf("hd_pack [--scale 2|4] [--pbr] [--force] [--model x4plus|anime] [--dir <game folder>]\n");
+            std::printf("hd_pack [--scale 2|4] [--pbr] [--force] [--model x4plus|anime] [--dir <game folder>]\n"
+                        "hd_pack --movies [--movie-model fast|quality] [--force] [--dir <game folder>]\n");
             return 2;
         }
     }
@@ -313,8 +351,15 @@ int Main(const std::vector<std::string>& argv) {
         std::printf("hd_pack: the upscaler is missing (tools/realesrgan/%s)\n", kUpscaler);
         return 1;
     }
-    const bool movies = fs::exists(dir / "mods" / "movies" / "dump", ec);
-    if (!fs::exists(dump, ec) && !movies) {
+    if (movies) {
+        if (!fs::exists(dir / "mods" / "movies" / "dump", ec)) {
+            std::printf("hd_pack: no movie frames collected in %s: collect them first (the launcher's HD Movies)\n",
+                        U8(dir / "mods" / "movies" / "dump").c_str());
+            return 1;
+        }
+        return Movies(dir, esr, fast, force) ? 0 : 1;
+    }
+    if (!fs::exists(dump, ec)) {
         std::printf("hd_pack: no dumped textures in %s: collect the textures first (the launcher's Collect button, "
                     "or turn on Dump the game's textures and play)\n", U8(dump).c_str());
         return 1;
@@ -328,7 +373,7 @@ int Main(const std::vector<std::string>& argv) {
     }
     std::sort(todo.begin(), todo.end());
     std::printf("hd_pack: %zu textures to upscale %ux%s\n", todo.size(), scale, pbr ? " with normal and roughness maps" : "");
-    if (todo.empty()) return Movies(dir, esr, model, force) ? 0 : 1;
+    if (todo.empty()) return 0;
     fs::path work = dir / "mods" / "textures" / "hd_pack_work", in = work / "in", up = work / "out";
     fs::remove_all(work, ec);
     fs::create_directories(in, ec);
@@ -391,9 +436,8 @@ int Main(const std::vector<std::string>& argv) {
     fs::remove_all(work, ec);
     std::printf("hd_pack: %zu of %zu textures written to %s (the game loads them at its next start)\n", done,
                 todo.size(), U8(out).c_str());
-    const bool movies_ok = Movies(dir, esr, model, force);
     std::printf("hd_pack: the pack is made from your copy of the game: keep it to yourself, do not share it\n");
-    return done == items.size() && movies_ok ? 0 : 1;
+    return done == items.size() ? 0 : 1;
 }
 
 }  // namespace

@@ -394,7 +394,9 @@ function(xbe_runtime_target target)
                     ${realesrgan_SOURCE_DIR}/vcomp140.dll $<TARGET_FILE_DIR:${target}>/tools/realesrgan
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.bin
                     ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.param ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.bin
-                    ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.param $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models)
+                    ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.param
+                    ${realesrgan_SOURCE_DIR}/models/realesr-animevideov3-x2.bin
+                    ${realesrgan_SOURCE_DIR}/models/realesr-animevideov3-x2.param $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models)
     elseif(NOT WIN32 AND TARGET hd_pack)
         # the same off Windows: one upscaler program (its runtime libraries are the system's), execute bit kept
         add_dependencies(${target} hd_pack)
@@ -406,7 +408,9 @@ function(xbe_runtime_target target)
             COMMAND chmod +x $<TARGET_FILE_DIR:${target}>/tools/realesrgan/realesrgan-ncnn-vulkan
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.bin
                     ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.param ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.bin
-                    ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.param $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models)
+                    ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.param
+                    ${realesrgan_SOURCE_DIR}/models/realesr-animevideov3-x2.bin
+                    ${realesrgan_SOURCE_DIR}/models/realesr-animevideov3-x2.param $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models)
     endif()
     # lld keeps the recompiled weak functions overridable by the host ones (macOS: Apple's linker, which does the same
     # with weak definitions; its clang has no lld)
