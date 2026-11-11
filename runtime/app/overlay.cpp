@@ -488,6 +488,8 @@ void Graphics(Settings& s) {
         s.bloom = uint32_t(bloom);
         Save();
     }
+    if (RowCheck("Ambient occlusion", &s.ambient_occlusion,
+                 "Darkens corners and nearby surfaces using scene depth. Vulkan only; works best with the default W-buffer.")) Save();
     const char* style_names[] = {"Original", "Enhanced Color", "Toon (Screen)", "Retro", "Noir"};
     int vignette = int(s.vignette);
     if (RowSlider("Vignette", &vignette, 0, 100, 5, "%", "Darkens the edges of the finished frame.")) {

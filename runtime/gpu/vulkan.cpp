@@ -714,6 +714,7 @@ private:
     bool Acquire(uint32_t& index);
     void UploadGammaRamp();
     void BlitFrame(Target& t, VkImageView view, VkImageView source);
+    VkImageView AmbientOcclusion(Target& t, VkImageView source, VkImageView depth);
     void RenderUi();
     void ReleaseOldTextures();
     void CountFps();
@@ -858,6 +859,8 @@ private:
     uint32_t smaa_w_ = 0, smaa_h_ = 0;
     bool smaa_tried_ = false, smaa_ready_ = false;
     uint64_t smaa_edge_vs_ = 0, smaa_edge_ps_ = 0, smaa_weight_vs_ = 0, smaa_weight_ps_ = 0;
+    Image ao_half_, ao_scene_;
+    uint32_t ao_w_ = 0, ao_h_ = 0;
     std::vector<Chunk> chunks_;  // stream chunks: [0] is being filled
     Buffer readback_;
     Dxc dxc_;
@@ -1444,6 +1447,8 @@ VulkanBackend::~VulkanBackend() {
     targets_.clear();
     for (auto& [k, t] : textures_) DropImage(t.img);
     textures_.clear();
+    DropImage(ao_half_);
+    DropImage(ao_scene_);
     for (auto& [k, m] : movie_up_) DropImage(m.up), DropImage(m.out);
     movie_up_.clear();
     DropImage(lut_);
@@ -2453,6 +2458,105 @@ VkImageView VulkanBackend::SmaaFrame(Target& t) {
     End();
     return smaa_result_.view;
 }
+VkImageView VulkanBackend::AmbientOcclusion(Target& t, VkImageView source, VkImageView depth) {
+    if (!source || !depth) return source;
+    static const std::string hlsl = R"(
+cbuffer P : register(b1) { float4 p[2]; };
+Texture2D<float> depthtex : register(t1);
+Texture2D scene : register(t0);
+Texture2D ao_tex : register(t2);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o; float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o;
+}
+float z_at(float2 uv) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    return p[1].x > 0.5 ? d * 4096.0 : rcp(max(1.0 - d, 1e-5));
+}
+float3 pos_at(float2 uv) {
+    float z = z_at(uv);
+    return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z);
+}
+float4 ao(O i) : SV_Target {
+    float d = depthtex.SampleLevel(pt, i.uv, 0);
+    if (d >= 0.99999) return float4(1, 1, 1, 1);
+    float3 P = pos_at(i.uv);
+    float3 dx = pos_at(i.uv + float2(p[0].x, 0)) - pos_at(i.uv - float2(p[0].x, 0));
+    float3 dy = pos_at(i.uv + float2(0, p[0].y)) - pos_at(i.uv - float2(0, p[0].y));
+    float3 N = normalize(cross(dx, dy));
+    if (dot(N, P) > 0) N = -N;
+    float radius = max(p[1].y, 0.05);
+    float2 radius_uv = min(radius / max(P.z * p[0].z * 2, 1e-3), 0.2) * float2(1 / p[0].w, 1);
+    float occlusion = 0;
+    [unroll] for (int s = 0; s < 8; ++s) {
+        float a = (s + frac(i.pos.x * 0.067 + i.pos.y * 0.113)) * 0.785398163;
+        float2 dir = float2(cos(a), sin(a));
+        [unroll] for (int k = 1; k <= 3; ++k) {
+            float2 uv = i.uv + dir * radius_uv * (float(k) / 3.0);
+            float3 delta = pos_at(uv) - P;
+            float dist = length(delta);
+            float facing = max(dot(N, delta / max(dist, 1e-4)) - 0.08, 0);
+            occlusion += facing * saturate(1.0 - dist / radius);
+        }
+    }
+    float visibility = saturate(1.0 - p[1].z * occlusion / 24.0);
+    return float4(visibility, visibility, visibility, 1);
+}
+float4 composite(O i) : SV_Target {
+    float4 c = scene.SampleLevel(ls, i.uv, 0);
+    if (depthtex.SampleLevel(pt, i.uv, 0) >= 0.99999) return c;
+    float visibility = ao_tex.SampleLevel(ls, i.uv, 0).r;
+    c.rgb *= visibility;
+    return c;
+}
+)";
+    uint64_t vs_hash, ao_hash, comp_hash;
+    if (!Compile(hlsl, "vs", "vs_5_0", vs_hash) || !Compile(hlsl, "ao", "ps_5_0", ao_hash) ||
+        !Compile(hlsl, "composite", "ps_5_0", comp_hash)) {
+        LOG_FIRST(1, "vulkan: ambient occlusion shaders did not compile; drawing without AO");
+        return source;
+    }
+    const uint32_t aw = std::max<uint32_t>(t.w / 2, 1), ah = std::max<uint32_t>(t.h / 2, 1);
+    if (ao_half_.img && (ao_w_ != t.w || ao_h_ != t.h)) DropImage(ao_half_), DropImage(ao_scene_);
+    if (!ao_half_.img || !ao_scene_.img) {
+        const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (!MakeImage(ao_half_, VK_IMAGE_TYPE_2D, kBgra, aw, ah, 1, 1, 1, usage) ||
+            !MakeImage(ao_scene_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1, usage)) {
+            DropImage(ao_half_);
+            DropImage(ao_scene_);
+            LOG_FIRST(1, "vulkan: ambient occlusion targets could not be made; drawing without AO");
+            return source;
+        }
+        ao_w_ = t.w;
+        ao_h_ = t.h;
+    }
+    VkPipeline pao = PassPipeline({vs_hash, ao_hash, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pc = PassPipeline({vs_hash, comp_hash, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pao || !pc) return source;
+    static const bool wbuffer = [] {
+        const char* e = std::getenv("XBE_WBUFFER");
+        return !(e && *e == '0');
+    }();
+    float constants[8] = {1.0f / t.w, 1.0f / t.h, 0.5774f, float(t.w) / float(t.h),
+                          wbuffer ? 1.0f : 0.0f, 0.75f, 0.85f, 0.0f};
+    VkViewport avp{0, 0, float(aw), float(ah), 0, 1};
+    VkRect2D asc{{0, 0}, {aw, ah}};
+    VkImageView av[4] = {VK_NULL_HANDLE, depth, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    FullScreen(pao, {ao_half_.att, VK_NULL_HANDLE, aw, ah}, avp, asc, constants, 8, av, 2);
+    End();
+    Barrier();
+    VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
+    VkRect2D sc{{0, 0}, {t.w, t.h}};
+    VkImageView cv[4] = {source, depth, ao_half_.view, VK_NULL_HANDLE};
+    FullScreen(pc, {ao_scene_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, constants, 8, cv, 3);
+    End();
+    Barrier();
+    return ao_scene_.view;
+}
+
 VkImageView VulkanBackend::UpscaleMovie(Tex& tx, const TextureDesc& d) {
     for (auto it = movie_up_.begin(); it != movie_up_.end();) {
         if (it->second.frame + 300 < presents_ + 1) {
@@ -3761,6 +3865,10 @@ void VulkanBackend::Present(const Surface& front) {
         BuildRtStructures();
         VkCommandBuffer cb = Cmd();
         if (dirty_) Barrier();
+        if (t && app::Get().ambient_occlusion && scene_depth_frame_ == presents_ + 1 &&
+            scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
+            frame_source = AmbientOcclusion(*t, frame_source, scene_depth_view_);
+        cb = Cmd();
         VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
         ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         ib.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
