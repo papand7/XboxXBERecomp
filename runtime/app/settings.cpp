@@ -229,6 +229,7 @@ void Load() {
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.low_latency = t["low_latency"].value_or(s.low_latency);
     s.sharpen = std::min<uint32_t>(t["sharpen"].value_or(s.sharpen), 100);
+    s.color_style = std::min<uint32_t>(t["color_style"].value_or(s.color_style), 2);
     std::string renderer = t["renderer"].value_or(std::string(kRenderers[s.renderer % kRendererCount]));
     for (uint32_t i = 0; i < kRendererCount; i++)
         if (renderer == kRenderers[i]) s.renderer = i;
@@ -325,6 +326,7 @@ toml::table Table() {
                   {"dump_textures", s.dump_textures},
                   {"low_latency", s.low_latency},
                   {"sharpen", int64_t(s.sharpen)},
+                  {"color_style", int64_t(s.color_style)},
                   {"renderer", kRenderers[s.renderer % kRendererCount]},
                   {"wheel_range", int64_t(s.wheel_range)},
                   {"wheel_lock", int64_t(s.wheel_lock)},

@@ -307,6 +307,18 @@ float4 psfinal(O i) : SV_Target {
     float3 c = (mode & 2) != 0 ? scaled(i.uv, t, fwidth(i.uv)) : tap(i.uv);
     if ((mode & 1) != 0) c = fxaa(c, i.uv, t);
     if (opts.z > 0) c = sharpen(c, i.uv, px, opts.z);
+    int style = (mode >> 2) & 3;
+    if (style == 1) {
+        float3 levels = float3(5, 6, 5);
+        float dither = frac(dot(floor(i.uv * size), float2(0.06711056, 0.00583715)) * 52.9829189) - 0.5;
+        c = floor(saturate(c * float3(1.05, 1.0, 0.88)) * levels + 0.5 + dither) / levels;
+    } else if (style == 2) {
+        float y = luma(c);
+        float red = saturate((c.r - max(c.g, c.b) * 0.65 - 0.04) * 4);
+        float3 mono = y.xxx;
+        float3 noir = lerp(mono, float3(y * 0.32, y * 0.015, y * 0.02), smoothstep(0.12, 0.48, y));
+        c = lerp(noir, float3(y, y * 0.025, y * 0.015), red * 0.85);
+    }
     c *= opts.w;
     if (opts.x > 0) c = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
     return float4(c, 1);
