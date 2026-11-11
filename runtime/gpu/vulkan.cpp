@@ -470,6 +470,7 @@ struct BlitOptions {
     uint32_t taps = 1;   // n x n box filter per pixel
     bool over = false;   // premultiplied over the target, which keeps its alpha
     bool final = false;  // the finished frame: psfinal with the settings' FXAA and sharpening (taps, alpha unused)
+    VkImageView depth = VK_NULL_HANDLE;  // matching scene depth, for depth-aware screen styles
 };
 
 // what a rendering instance draws into
@@ -855,6 +856,9 @@ private:
     Target* bound_ds_ = nullptr;
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
     Target* draw_ds_ = nullptr;
+    VkImageView scene_depth_view_ = VK_NULL_HANDLE;
+    uint32_t scene_depth_w_ = 0, scene_depth_h_ = 0, scene_color_data_ = 0;
+    uint64_t scene_depth_frame_ = 0;
     uint32_t guest_w_ = 640, guest_h_ = 480;
     uint32_t bb_w_ = 0, bb_h_ = 0;
     float scale_ = 1;
@@ -1849,6 +1853,11 @@ bool VulkanBackend::CreateTarget(Target& t) {
 }
 
 void VulkanBackend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
+    if (scene_depth_view_ == it->second.res.view) {
+        scene_depth_view_ = VK_NULL_HANDLE;
+        scene_depth_w_ = scene_depth_h_ = scene_color_data_ = 0;
+        scene_depth_frame_ = 0;
+    }
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) Unbind();
     DropImage(it->second.res);
     DropImage(it->second.fb);
@@ -2285,8 +2294,9 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
         const uint32_t bloom = (std::min<uint32_t>(st.bloom, 100) * 63 + 50) / 100;
         const uint32_t vignette = (std::min<uint32_t>(st.vignette, 100) * 63 + 50) / 100;
         const uint32_t grain = (std::min<uint32_t>(st.film_grain, 100) * 63 + 50) / 100;
-        const uint32_t mode = (fxaa ? 1u : 0u) | (st.scale_filter ? 2u : 0u) | ((st.color_style & 7u) << 2) |
+        uint32_t mode = (fxaa ? 1u : 0u) | (st.scale_filter ? 2u : 0u) | ((st.color_style & 7u) << 2) |
                               ((bloom & 63u) << 5) | ((vignette & 63u) << 11) | ((grain & 63u) << 17);
+        if (o.depth) mode |= 1u << 23;
         c[5] = float(mode);
         const uint32_t sharp = std::min<uint32_t>(st.sharpen, 100) / 5;
         const uint32_t contrast = (std::clamp<uint32_t>(st.contrast, 50, 150) - 50) / 5;
@@ -2297,8 +2307,8 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
         c[7] = float(std::clamp<uint32_t>(st.exposure, 50, 150)) + float(uint32_t(presents_ & 255u)) / 256.0f;
     }
     VkPipeline p = PassPipeline({vh, ph, fmt, VK_FORMAT_UNDEFINED, o.over ? 1u : 0u, 0});
-    VkImageView views[2] = {src, lut_.view};
-    FullScreen(p, a, vp, sc, c, 8, views, 2);
+    VkImageView views[4] = {src, lut_.view, VK_NULL_HANDLE, o.depth};
+    FullScreen(p, a, vp, sc, c, 8, views, 4);
 }
 
 // src over all of dst
@@ -3215,6 +3225,14 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     bool counting = s.simple[kMCountEnable >> 2] && queries_ && NewQuery(q);
     if (counting) vkCmdBeginQuery(cb, queries_, q, 0);
     DrawGeometry(a);
+    if (!draw_2d_ && k.zwrite && bound_rt_ && bound_ds_ && bound_rt_->gw == guest_w_ &&
+        bound_rt_->gh == guest_h_ && bound_rt_->w == bound_ds_->w && bound_rt_->h == bound_ds_->h) {
+        scene_depth_view_ = bound_ds_->res.view;
+        scene_depth_w_ = bound_ds_->w;
+        scene_depth_h_ = bound_ds_->h;
+        scene_color_data_ = bound_rt_->data;
+        scene_depth_frame_ = presents_ + 1;
+    }
     perf_draws_++;
     if (counting) {
         vkCmdEndQuery(cb, queries_, q);
@@ -3302,10 +3320,14 @@ void VulkanBackend::BlitFrame(Target& t, VkImageView view, VkImageView source) {
     VkViewport vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     VkRect2D sc{{0, 0}, {bb_w_, bb_h_}};
     float uv[4] = {0, 0, 1, 1};
+    VkImageView depth = VK_NULL_HANDLE;
+    if (scene_depth_frame_ == presents_ + 1 && scene_color_data_ == t.data && scene_depth_view_ &&
+        scene_depth_w_ == t.w && scene_depth_h_ == t.h)
+        depth = scene_depth_view_;
     // the swap chain image's rendering instance is already open (Present)
     open_ = true;
     cur_ = {view, VK_NULL_HANDLE, bb_w_, bb_h_};
-    Blit(source, cur_, vp, sc, uv, {.gamma = gamma_, .final = true}, swap_fmt_);
+    Blit(source, cur_, vp, sc, uv, {.gamma = gamma_, .final = true, .depth = depth}, swap_fmt_);
 }
 
 void VulkanBackend::RenderUi() {

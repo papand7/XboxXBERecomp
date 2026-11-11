@@ -215,6 +215,7 @@ const char* kBlitHlsl = R"(
 cbuffer B : register(b1) { float4 uvrect; float4 opts; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
+Texture2D<float> depthimg : register(t3);
 SamplerState ls : register(s0);
 SamplerState ps : register(s1);
 struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
@@ -362,6 +363,17 @@ float4 psfinal(O i) : SV_Target {
         float edge = max(
             max(abs(y - luma(tap(i.uv + float2(t.x, 0)))), abs(y - luma(tap(i.uv - float2(t.x, 0))))),
             max(abs(y - luma(tap(i.uv + float2(0, t.y)))), abs(y - luma(tap(i.uv - float2(0, t.y))))));
+        if ((mode & 0x800000) != 0) {
+            float2 ds;
+            depthimg.GetDimensions(ds.x, ds.y);
+            float2 dp = 1 / ds;
+            float z = depthimg.SampleLevel(ps, i.uv, 0);
+            float dz = max(max(abs(z - depthimg.SampleLevel(ps, i.uv + float2(dp.x, 0), 0)),
+                               abs(z - depthimg.SampleLevel(ps, i.uv - float2(dp.x, 0), 0))),
+                           max(abs(z - depthimg.SampleLevel(ps, i.uv + float2(0, dp.y), 0)),
+                               abs(z - depthimg.SampleLevel(ps, i.uv - float2(0, dp.y), 0))));
+            edge = max(edge, saturate((dz - max(0.001, z * 0.004)) * 80));
+        }
         float bands = floor(saturate(y) * 5) / 4;
         c = saturate(c * (bands / max(y, 0.05)));
         c = lerp(c, float3(0.025, 0.03, 0.04), saturate((edge - 0.08) * 10) * 0.85);
