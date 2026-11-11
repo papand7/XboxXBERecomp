@@ -163,11 +163,19 @@ namespace {
     X(vkCmdBeginQuery)              \
     X(vkCmdEndQuery)
 
+#define VK_RT_DEVICE_FUNCS(X)                  \
+    X(vkGetBufferDeviceAddress)                 \
+    X(vkCreateAccelerationStructureKHR)         \
+    X(vkDestroyAccelerationStructureKHR)        \
+    X(vkGetAccelerationStructureBuildSizesKHR)  \
+    X(vkCmdBuildAccelerationStructuresKHR)       \
+    X(vkGetAccelerationStructureDeviceAddressKHR)
 #define VK_DECLARE(f) PFN_##f f = nullptr;
 VK_GLOBAL_FUNCS(VK_DECLARE)
 VK_INSTANCE_FUNCS(VK_DECLARE)
 VK_DEBUG_FUNCS(VK_DECLARE)
 VK_DEVICE_FUNCS(VK_DECLARE)
+VK_RT_DEVICE_FUNCS(VK_DECLARE)
 #undef VK_DECLARE
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
 VkInstance g_instance = VK_NULL_HANDLE;  // for ImGui's loader
@@ -798,6 +806,7 @@ private:
     VkDescriptorPool ui_pool_ = VK_NULL_HANDLE;
     VkQueryPool queries_ = VK_NULL_HANDLE;
     VkFormat depth_fmt_ = VK_FORMAT_D24_UNORM_S8_UINT;
+    bool rt_ok_ = false;  // ray-query Vulkan prerequisites are available
     bool null_descriptor_ = false;
     bool custom_border_ = false;
     bool mirror_once_ = false;
@@ -1033,11 +1042,16 @@ bool VulkanBackend::CreateDevice() {
     std::vector<const char*> want = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
     bool robust2 = HasExtension(ext, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     bool border = HasExtension(ext, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    bool rt_exts = HasExtension(ext, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+                   HasExtension(ext, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+                   HasExtension(ext, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     if (HasExtension(ext, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)) want.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
 
     // what the device offers
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceRobustness2FeaturesEXT robust_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR as_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    VkPhysicalDeviceRayQueryFeaturesKHR rq_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -1046,6 +1060,7 @@ bool VulkanBackend::CreateDevice() {
     void** tail = &f13.pNext;
     if (robust2) *tail = &robust_f, tail = &robust_f.pNext;
     if (border) *tail = &border_f, tail = &border_f.pNext;
+    if (rt_exts) *tail = &as_f, as_f.pNext = &rq_f, tail = &rq_f.pNext;
     vkGetPhysicalDeviceFeatures2(pd_, &f2);
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
         LOGE("vulkan: the GPU lacks dynamic rendering, synchronization2 or timeline semaphores");
@@ -1055,6 +1070,8 @@ bool VulkanBackend::CreateDevice() {
     // what is turned on
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceRobustness2FeaturesEXT robust_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR as_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    VkPhysicalDeviceRayQueryFeaturesKHR rq_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceVulkan13Features on13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features on12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -1092,6 +1109,19 @@ bool VulkanBackend::CreateDevice() {
         *tail = &border_on, tail = &border_on.pNext;
         custom_border_ = true;
     }
+    if (rt_exts && as_f.accelerationStructure && rq_f.rayQuery && f12.bufferDeviceAddress &&
+        f2.features.vertexPipelineStoresAndAtomics && f12.shaderSampledImageArrayNonUniformIndexing) {
+        want.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        want.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        want.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+        as_on.accelerationStructure = VK_TRUE;
+        rq_on.rayQuery = VK_TRUE;
+        on12.bufferDeviceAddress = VK_TRUE;
+        on12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+        on.features.vertexPipelineStoresAndAtomics = VK_TRUE;
+        *tail = &as_on, as_on.pNext = &rq_on, tail = &rq_on.pNext;
+        rt_ok_ = true;
+    }
     float prio = 1;
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = family_;
@@ -1113,6 +1143,14 @@ bool VulkanBackend::CreateDevice() {
     if (!f) f = reinterpret_cast<PFN_##f>(vkGetInstanceProcAddr(instance_, #f));
     VK_DEVICE_FUNCS(VK_LOAD)
 #undef VK_LOAD
+    if (rt_ok_) {
+#define VK_LOAD_RT(f) f = reinterpret_cast<PFN_##f>(vkGetDeviceProcAddr(dev_, #f));
+        VK_RT_DEVICE_FUNCS(VK_LOAD_RT)
+#undef VK_LOAD_RT
+        rt_ok_ = vkGetBufferDeviceAddress && vkCreateAccelerationStructureKHR && vkDestroyAccelerationStructureKHR &&
+                 vkGetAccelerationStructureBuildSizesKHR && vkCmdBuildAccelerationStructuresKHR &&
+                 vkGetAccelerationStructureDeviceAddressKHR;
+    }
 #define VK_CHECK_LOADED(f)                                   \
     if (!f) {                                                \
         LOGE("vulkan: %s missing from the driver", #f);      \
@@ -1127,8 +1165,9 @@ bool VulkanBackend::CreateDevice() {
     vkGetPhysicalDeviceFormatProperties(pd_, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
     const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
     depth_fmt_ = (fp.optimalTilingFeatures & need) == need ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
-    LOGR("vulkan: depth %s, null descriptors %s, custom border colours %s", depth_fmt_ == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8",
-         null_descriptor_ ? "yes" : "no", custom_border_ ? "yes" : "no");
+    LOGR("vulkan: depth %s, null descriptors %s, custom border colours %s, ray queries %s",
+         depth_fmt_ == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8", null_descriptor_ ? "yes" : "no",
+         custom_border_ ? "yes" : "no", rt_ok_ ? "available" : "unavailable");
     return true;
 }
 
