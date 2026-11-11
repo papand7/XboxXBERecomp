@@ -14,6 +14,9 @@
 //   <key>_r.png, roughness (white rough, black polished) from its local contrast and brightness. Generated, so an
 //   approximation: the runtime reads roughness for reflections.
 // - Done pictures are skipped (--force does them again): play more of the game with the dump on, run it again.
+// - Movies (gpu/movie_pack.h): the frames a title collected in mods/movies/dump/ (<key>.png, <movie>.txt their order)
+//   upscaled 2x into mods/movies/<key>.jpg (the 4x model's result halved), a hundred at a time so the work folder
+//   stays small; each collected frame is removed once its picture is written (the orders are kept beside them).
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -222,6 +225,67 @@ const char* const kUpscaler = "realesrgan-ncnn-vulkan.exe";
 const char* const kUpscaler = "realesrgan-ncnn-vulkan";
 #endif
 
+// the movies' frames: mods/movies/dump/<key>.png to mods/movies/<key>.jpg, 2x; false when one failed
+bool Movies(const fs::path& dir, const fs::path& esr, const std::string& model, bool force) {
+    const fs::path dump = dir / "mods" / "movies" / "dump", out = dir / "mods" / "movies";
+    std::error_code ec;
+    if (!fs::exists(dump, ec)) return true;
+    for (auto& e : fs::directory_iterator(dump, ec))
+        if (e.path().extension() == ".txt") fs::copy_file(e.path(), out / e.path().filename(), fs::copy_options::overwrite_existing, ec);
+    std::vector<fs::path> todo;
+    for (auto& e : fs::directory_iterator(dump, ec)) {
+        std::string stem = U8(e.path().stem());
+        if (e.path().extension() != ".png" || stem.size() != 16) continue;
+        if (force || !fs::exists(out / (stem + ".jpg"), ec)) todo.push_back(e.path());
+        else fs::remove(e.path(), ec);  // done before
+    }
+    std::sort(todo.begin(), todo.end());
+    std::printf("hd_pack: %zu movie frames to upscale 2x\n", todo.size());
+    std::fflush(stdout);
+    if (todo.empty()) return true;
+    const fs::path work = out / "hd_pack_work", in = work / "in", up = work / "out";
+    constexpr size_t kBatch = 100;
+    size_t done = 0;
+    for (size_t first = 0; first < todo.size(); first += kBatch) {
+        fs::remove_all(work, ec);
+        fs::create_directories(in, ec);
+        fs::create_directories(up, ec);
+        const size_t end = std::min(todo.size(), first + kBatch);
+        for (size_t i = first; i < end; i++) {
+            ec.clear();
+            fs::create_hard_link(todo[i], in / todo[i].filename(), ec);  // the same drive: no copy
+            if (ec) fs::copy_file(todo[i], in / todo[i].filename(), ec);
+        }
+        if (int code = Run(esr, {"-i", U8(in), "-o", U8(up), "-n", model, "-s", "4", "-f", "png"}); code != 0) {
+            std::printf("hd_pack: the upscaler failed on the movie frames (exit %d)\n", code);
+            fs::remove_all(work, ec);
+            return false;
+        }
+        for (size_t i = first; i < end; i++) {
+            const std::string stem = U8(todo[i].stem());
+            Picture big;
+            if (!Read(up / (stem + ".png"), big)) {
+                std::printf("  %s: no upscaled frame\n", stem.c_str());
+                continue;
+            }
+            const Picture half = Half(big);
+            fs::path tmp = out / (stem + ".jpg.tmp");
+            if (!app::EncodeJpeg(tmp, half.px, half.w, half.h, 90)) {
+                fs::remove(tmp, ec);
+                std::printf("  %s: could not be written\n", stem.c_str());
+                continue;
+            }
+            fs::rename(tmp, out / (stem + ".jpg"), ec);
+            if (!ec) fs::remove(todo[i], ec), done++;
+        }
+        std::printf("hd_pack: movie frames %zu of %zu\n", done, todo.size());
+        std::fflush(stdout);
+    }
+    fs::remove_all(work, ec);
+    std::printf("hd_pack: %zu of %zu movie frames written to %s\n", done, todo.size(), U8(out).c_str());
+    return done == todo.size();
+}
+
 int Main(const std::vector<std::string>& argv) {
     uint32_t scale = 4;
     bool pbr = false, force = false;
@@ -249,7 +313,8 @@ int Main(const std::vector<std::string>& argv) {
         std::printf("hd_pack: the upscaler is missing (tools/realesrgan/%s)\n", kUpscaler);
         return 1;
     }
-    if (!fs::exists(dump, ec)) {
+    const bool movies = fs::exists(dir / "mods" / "movies" / "dump", ec);
+    if (!fs::exists(dump, ec) && !movies) {
         std::printf("hd_pack: no dumped textures in %s: collect the textures first (the launcher's Collect button, "
                     "or turn on Dump the game's textures and play)\n", U8(dump).c_str());
         return 1;
@@ -263,7 +328,7 @@ int Main(const std::vector<std::string>& argv) {
     }
     std::sort(todo.begin(), todo.end());
     std::printf("hd_pack: %zu textures to upscale %ux%s\n", todo.size(), scale, pbr ? " with normal and roughness maps" : "");
-    if (todo.empty()) return 0;
+    if (todo.empty()) return Movies(dir, esr, model, force) ? 0 : 1;
     fs::path work = dir / "mods" / "textures" / "hd_pack_work", in = work / "in", up = work / "out";
     fs::remove_all(work, ec);
     fs::create_directories(in, ec);
@@ -326,8 +391,9 @@ int Main(const std::vector<std::string>& argv) {
     fs::remove_all(work, ec);
     std::printf("hd_pack: %zu of %zu textures written to %s (the game loads them at its next start)\n", done,
                 todo.size(), U8(out).c_str());
+    const bool movies_ok = Movies(dir, esr, model, force);
     std::printf("hd_pack: the pack is made from your copy of the game: keep it to yourself, do not share it\n");
-    return done == items.size() ? 0 : 1;
+    return done == items.size() && movies_ok ? 0 : 1;
 }
 
 }  // namespace

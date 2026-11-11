@@ -63,11 +63,13 @@ struct Replacement {
     uint32_t width = 0, height = 0;
     uint64_t version = 0;
     bool sharpened = false;  // made by Sharpen2D (Settings::sharp_2d), not the title
+    bool movie = false;      // a movie pack's frame (movie_pack.cpp): one level, replaced every frame without a word
     // the texture it stands for (Sharpen2D's; 0 any): the same memory read in another format or size is not it
     uint32_t format = 0, src_width = 0, src_height = 0;
     std::vector<uint32_t> bgra;
 };
-void SetReplacement(uint32_t data_va, uint32_t guest_bytes, uint32_t width, uint32_t height, std::vector<uint32_t> bgra);
+void SetReplacement(uint32_t data_va, uint32_t guest_bytes, uint32_t width, uint32_t height, std::vector<uint32_t> bgra,
+                    bool movie = false);
 // a texture a 2D draw samples (GameInfo::sharpen_2d), from the render thread: its level 0 copied and enlarged on a
 // background thread, then set as its replacement (sharpened); one whose bytes keep changing is left alone
 void Sharpen2D(const TextureDesc& d);

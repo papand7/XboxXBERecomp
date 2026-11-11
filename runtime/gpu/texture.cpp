@@ -468,7 +468,8 @@ static void RegisterReplacement(std::shared_ptr<Replacement> r) {
     g_replace_count = g_replace.size();
 }
 
-void SetReplacement(uint32_t data, uint32_t guest_bytes, uint32_t width, uint32_t height, std::vector<uint32_t> bgra) {
+void SetReplacement(uint32_t data, uint32_t guest_bytes, uint32_t width, uint32_t height, std::vector<uint32_t> bgra,
+                    bool movie) {
     if (!width || !height || bgra.size() != size_t(width) * height || !guest_bytes) return;
     auto r = std::make_shared<Replacement>();
     r->data = data;
@@ -477,6 +478,7 @@ void SetReplacement(uint32_t data, uint32_t guest_bytes, uint32_t width, uint32_
     r->width = width;
     r->height = height;
     r->bgra = std::move(bgra);
+    r->movie = movie;
     RegisterReplacement(std::move(r));
 }
 
@@ -511,7 +513,7 @@ bool ReplacementHolds(const Replacement& r) {
     if (it != g_replace.end() && it->second->version == r.version) {
         g_replace.erase(it);
         g_replace_count = g_replace.size();
-        LOGR("gpu: the picture for texture %08X dropped, the game's bytes there changed", r.data);
+        if (!r.movie) LOGR("gpu: the picture for texture %08X dropped, the game's bytes there changed", r.data);
     }
     return false;
 }
@@ -782,7 +784,7 @@ void Sharpen2D(const TextureDesc& d) {
 std::vector<std::vector<uint32_t>> ReplacementLevels(const Replacement& r) {
     std::vector<std::vector<uint32_t>> levels{r.bgra};
     uint32_t w = r.width, h = r.height;
-    while (w > 1 || h > 1) {
+    while (!r.movie && (w > 1 || h > 1)) {
         uint32_t nw = std::max(w / 2, 1u), nh = std::max(h / 2, 1u);
         const std::vector<uint32_t>& up = levels.back();
         std::vector<uint32_t> down(size_t(nw) * nh);

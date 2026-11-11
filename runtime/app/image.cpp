@@ -1,6 +1,9 @@
 // picture files through WIC on Windows, stb_image elsewhere (see image.h)
 #include "app/image.h"
 
+#include <algorithm>
+#include <cstring>
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -82,6 +85,42 @@ bool EncodePng(const std::filesystem::path& path, const std::vector<uint32_t>& b
     return SUCCEEDED(hr);
 }
 
+bool EncodeJpeg(const std::filesystem::path& path, const std::vector<uint32_t>& bgra, uint32_t width, uint32_t height,
+                int quality) {
+    if (bgra.size() < size_t(width) * height) return false;
+    std::vector<uint8_t> bgr(size_t(width) * height * 3);
+    for (size_t i = 0; i < size_t(width) * height; i++) std::memcpy(&bgr[i * 3], &bgra[i], 3);
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ComPtr<IWICImagingFactory> wic = Wic();
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> enc;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IPropertyBag2> props;
+    HRESULT hr = wic ? wic->CreateStream(&stream) : E_FAIL;
+    if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+    if (SUCCEEDED(hr)) hr = wic->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &enc);
+    if (SUCCEEDED(hr)) hr = enc->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+    if (SUCCEEDED(hr)) hr = enc->CreateNewFrame(&frame, &props);
+    if (SUCCEEDED(hr) && props) {
+        PROPBAG2 name{};
+        name.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+        VARIANT v;
+        VariantInit(&v);
+        v.vt = VT_R4;
+        v.fltVal = std::clamp(quality, 1, 100) / 100.0f;
+        props->Write(1, &name, &v);
+    }
+    if (SUCCEEDED(hr)) hr = frame->Initialize(props.Get());
+    if (SUCCEEDED(hr)) hr = frame->SetSize(width, height);
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;
+    if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&fmt);
+    if (SUCCEEDED(hr) && fmt != GUID_WICPixelFormat24bppBGR) hr = E_FAIL;
+    if (SUCCEEDED(hr)) hr = frame->WritePixels(height, width * 3, UINT(bgr.size()), bgr.data());
+    if (SUCCEEDED(hr)) hr = frame->Commit();
+    if (SUCCEEDED(hr)) hr = enc->Commit();
+    return SUCCEEDED(hr);
+}
+
 }  // namespace app
 
 #else
@@ -139,6 +178,17 @@ bool EncodePng(const std::filesystem::path& path, const std::vector<uint32_t>& b
         rgba[i * 4 + 3] = uint8_t(v >> 24);
     }
     return stbi_write_png(path.c_str(), int(width), int(height), 4, rgba.data(), int(width * 4)) != 0;
+}
+
+bool EncodeJpeg(const std::filesystem::path& path, const std::vector<uint32_t>& bgra, uint32_t width, uint32_t height,
+                int quality) {
+    if (bgra.size() < size_t(width) * height) return false;
+    std::vector<uint8_t> rgb(size_t(width) * height * 3);
+    for (size_t i = 0; i < size_t(width) * height; i++) {
+        uint32_t v = bgra[i];
+        rgb[i * 3] = uint8_t(v >> 16), rgb[i * 3 + 1] = uint8_t(v >> 8), rgb[i * 3 + 2] = uint8_t(v);
+    }
+    return stbi_write_jpg(path.c_str(), int(width), int(height), 3, rgb.data(), std::clamp(quality, 1, 100)) != 0;
 }
 
 }  // namespace app

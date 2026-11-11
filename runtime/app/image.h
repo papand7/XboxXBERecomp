@@ -14,5 +14,8 @@ bool DecodeImage(const std::filesystem::path& path, std::vector<uint32_t>& bgra,
                  bool premultiplied = false, uint32_t max_side = 0, uint32_t* error = nullptr);
 // 32 bit BGRA (straight alpha) to a PNG file
 bool EncodePng(const std::filesystem::path& path, const std::vector<uint32_t>& bgra, uint32_t width, uint32_t height);
+// 32 bit BGRA to a JPEG file (alpha dropped), quality 1 to 100: a movie's upscaled frames (hd_pack)
+bool EncodeJpeg(const std::filesystem::path& path, const std::vector<uint32_t>& bgra, uint32_t width, uint32_t height,
+                int quality = 90);
 
 }  // namespace app
