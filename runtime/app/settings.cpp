@@ -231,6 +231,8 @@ void Load() {
     s.sharpen = std::min<uint32_t>(t["sharpen"].value_or(s.sharpen), 100);
     s.color_style = std::min<uint32_t>(t["color_style"].value_or(s.color_style), 2);
     s.bloom = std::min<uint32_t>(t["bloom"].value_or(s.bloom), 100);
+    s.vignette = std::min<uint32_t>(t["vignette"].value_or(s.vignette), 100);
+    s.film_grain = std::min<uint32_t>(t["film_grain"].value_or(s.film_grain), 100);
     std::string renderer = t["renderer"].value_or(std::string(kRenderers[s.renderer % kRendererCount]));
     for (uint32_t i = 0; i < kRendererCount; i++)
         if (renderer == kRenderers[i]) s.renderer = i;
@@ -329,6 +331,8 @@ toml::table Table() {
                   {"sharpen", int64_t(s.sharpen)},
                   {"color_style", int64_t(s.color_style)},
                   {"bloom", int64_t(s.bloom)},
+                  {"vignette", int64_t(s.vignette)},
+                  {"film_grain", int64_t(s.film_grain)},
                   {"renderer", kRenderers[s.renderer % kRendererCount]},
                   {"wheel_range", int64_t(s.wheel_range)},
                   {"wheel_lock", int64_t(s.wheel_lock)},

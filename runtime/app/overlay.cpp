@@ -468,6 +468,16 @@ void Graphics(Settings& s) {
         Save();
     }
     const char* style_names[] = {"Original", "Retro", "Noir"};
+    int vignette = int(s.vignette);
+    if (RowSlider("Vignette", &vignette, 0, 100, 5, "%", "Darkens the edges of the finished frame.")) {
+        s.vignette = uint32_t(vignette);
+        Save();
+    }
+    int grain = int(s.film_grain);
+    if (RowSlider("Film grain", &grain, 0, 100, 5, "%", "Adds animated fine noise to the finished frame.")) {
+        s.film_grain = uint32_t(grain);
+        Save();
+    }
     if (RowChoice("Color style", &style, style_names, 3, "Applies a color grade to the finished frame; it does not add scene-aware outlines or lighting.")) {
         s.color_style = uint32_t(style);
         Save();

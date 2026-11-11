@@ -57,6 +57,8 @@ struct Settings {
     uint32_t sharpen = 0;            // percent, contrast adaptive sharpening of the finished frame
     uint32_t color_style = 0;        // 0 original, 1 retro color grade, 2 noir color grade
     uint32_t bloom = 0;              // percent, screen-space glow around bright pixels
+    uint32_t vignette = 0;           // percent, darkens the screen edges
+    uint32_t film_grain = 0;         // percent, animated screen-space noise
     uint32_t renderer = 0;           // Vulkan, at the next start
     uint32_t language = 1;           // the console's language (XC_LANGUAGE, GameInfo::languages), at the next start
     // a steering wheel and its kit (core/wheel.cpp), playing as controller 1: each control on any DirectInput device,

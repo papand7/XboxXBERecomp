@@ -243,8 +243,9 @@ float4 psmix(O i) : SV_Target {
     if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
     return float4(c.rgb, 1);
 }
-// the finished frame, the settings' passes in one (the plain blit without them): opts.y bit 0 for FXAA, bit 1 for the
-// sharp scaling filter, bits 2-3 the color style, bits 4-10 bloom strength; opts.z is sharpening from 0 to 1. The filter:
+// the finished frame, the settings' passes in one: opts.y bit 0 is FXAA, bit 1 is sharp scaling, bits 2-3 are the style,
+// bits 4-9 bloom, 10-15 vignette and 16-21 grain strength. opts.z is sharpening from 0 to 1; opts.w's fractional part
+// selects a grain phase, and its integer part is the exposure multiplier. The filter: Catmull-Rom up, area sampling down.
 // Catmull-Rom over source pixels going up; going down, the
 // output pixel's area (four taps, even at a ratio that is not whole) less a little of its neighbours. FXAA: where the luma of a pixel and its four neighbours differs enough to be an edge, the colour is
 // averaged along the edge's direction, found from the diagonal neighbours. Sharpening, contrast adaptive (as AMD's CAS):
@@ -321,8 +322,21 @@ float4 psfinal(O i) : SV_Target {
     float3 c = (mode & 2) != 0 ? scaled(i.uv, t, fwidth(i.uv)) : tap(i.uv);
     if ((mode & 1) != 0) c = fxaa(c, i.uv, t);
     if (opts.z > 0) c = sharpen(c, i.uv, px, opts.z);
-    int bloom_strength = (mode >> 4) & 127;
+    int bloom_strength = (mode >> 4) & 63;
     if (bloom_strength > 0) c = saturate(c + bloom(i.uv, t) * (float(bloom_strength) * 0.005));
+    int vignette_strength = (mode >> 10) & 63;
+    if (vignette_strength > 0) {
+        float2 centred = float2((i.uv.x - 0.5) * size.x / size.y, i.uv.y - 0.5);
+        float edge = smoothstep(0.22, 0.95, dot(centred, centred));
+        c *= 1 - edge * (float(vignette_strength) / 63) * 0.7;
+    }
+    int grain_strength = (mode >> 16) & 63;
+    if (grain_strength > 0) {
+        int seed = (int(frac(opts.w) * 256.0)) & 255;
+        float2 pixel = floor(i.uv * size) + float(seed) * float2(17, 31);
+        float noise = frac(sin(dot(pixel, float2(12.9898, 78.233))) * 43758.5453) - 0.5;
+        c = saturate(c + noise * (float(grain_strength) / 63) * 0.035);
+    }
     int style = (mode >> 2) & 3;
     if (style == 1) {
         float3 levels = float3(5, 6, 5);
@@ -335,7 +349,7 @@ float4 psfinal(O i) : SV_Target {
         float3 noir = lerp(mono, float3(y * 0.32, y * 0.015, y * 0.02), smoothstep(0.12, 0.48, y));
         c = lerp(noir, float3(y, y * 0.025, y * 0.015), red * 0.85);
     }
-    c *= opts.w;
+    c *= floor(opts.w);
     if (opts.x > 0) c = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
     return float4(c, 1);
 }
