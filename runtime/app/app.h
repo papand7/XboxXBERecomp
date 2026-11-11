@@ -92,6 +92,9 @@ struct Settings {
     // Online list: a host publishes its game to the master server (its address, map and players, every 30 s) when on
     bool publish_server = false;
     bool hurt_effects = true;  // the red pulse at low health (app/blood.cpp SetHealth)
+    // 3D sound (xdk/dsound.cpp): the game's 3D voices panned by their direction, duller behind, muffled through walls,
+    // and a room's reverb, as the title reports them (audio::SetRoom, SetOcclusion); off: the plain mix
+    bool audio_3d = true;
     // the crosshair (app/crosshair.cpp): 0 the game's own, 1 dot, 2 cross, 3 ring, 4 cross and dot; colour as RGBA
     // (IM_COL32 layout, red in the low byte), size and gap in pixels at 1080 lines, thickness too
     uint32_t crosshair_style = 0;

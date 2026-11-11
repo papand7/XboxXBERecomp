@@ -191,6 +191,8 @@ void Graphics(Settings& s) {
 void General(Settings& s) {
     if (ImGui::Checkbox("Pause when the window is not in front", &s.pause_unfocused)) Save();
     ImGui::TextDisabled("The game and its sound stop while another window is in front, and carry on when you return.");
+    if (ImGui::Checkbox("3D sound", &s.audio_3d)) Save();
+    ImGui::TextDisabled("Sounds placed by their direction (duller behind you), muffled through walls, and echoing indoors.");
     char host[64] = {};
     std::strncpy(host, s.join_ip.c_str(), sizeof(host) - 1);
     if (ImGui::InputText("Host address (network play)", host, sizeof(host))) {
