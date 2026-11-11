@@ -462,6 +462,11 @@ void Graphics(Settings& s) {
     if (RowCheck("HD texture pack", &s.texture_pack, "Loads matching PNGs from mods/textures beside the game executable. Texture packs are not included.")) Save();
     if (RowCheck("Dump textures", &s.dump_textures, "Writes original game textures to mods/textures/dump so you can build a pack.")) Save();
     int style = int(s.color_style);
+    int bloom = int(s.bloom);
+    if (RowSlider("Bloom", &bloom, 0, 100, 5, "%", "Adds a soft glow around bright pixels in the finished frame; this SDR effect does not use scene HDR.")) {
+        s.bloom = uint32_t(bloom);
+        Save();
+    }
     const char* style_names[] = {"Original", "Retro", "Noir"};
     if (RowChoice("Color style", &style, style_names, 3, "Applies a color grade to the finished frame; it does not add scene-aware outlines or lighting.")) {
         s.color_style = uint32_t(style);

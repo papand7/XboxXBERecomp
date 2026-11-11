@@ -2220,7 +2220,7 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
     uint64_t vh, ph;
     const app::Settings& st = app::Get();
     const bool fxaa = st.fxaa && !st.smaa;
-    const bool final = o.final && (fxaa || st.sharpen || st.color_style);
+    const bool final = o.final && (fxaa || st.sharpen || st.color_style || st.bloom || st.scale_filter);
     if (!Compile(kBlitHlsl, "vs", "vs_5_0", vh)) return;
     VkShaderModule ps = Compile(kBlitHlsl, final ? "psfinal" : "psmain", "ps_5_0", ph);
     bool use_final = final && ps;
@@ -2229,7 +2229,8 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
     float c[8] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3], o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f,
                   float(o.taps), 1.0f};
     if (use_final) {
-        const uint32_t mode = (fxaa ? 1u : 0u) | ((st.color_style & 3u) << 2);
+        const uint32_t mode = (fxaa ? 1u : 0u) | (st.scale_filter ? 2u : 0u) |
+                              ((st.color_style & 3u) << 2) | ((std::min<uint32_t>(st.bloom, 100) & 127u) << 4);
         c[5] = float(mode);
         c[6] = float(std::min<uint32_t>(st.sharpen, 100)) / 100.0f;
     }

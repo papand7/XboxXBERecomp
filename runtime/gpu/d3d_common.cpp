@@ -244,13 +244,27 @@ float4 psmix(O i) : SV_Target {
     return float4(c.rgb, 1);
 }
 // the finished frame, the settings' passes in one (the plain blit without them): opts.y bit 0 for FXAA, bit 1 for the
-// sharp scaling filter, opts.z the sharpening 0 to 1. The filter: Catmull-Rom over source pixels going up; going down, the
+// sharp scaling filter, bits 2-3 the color style, bits 4-10 bloom strength; opts.z is sharpening from 0 to 1. The filter:
+// Catmull-Rom over source pixels going up; going down, the
 // output pixel's area (four taps, even at a ratio that is not whole) less a little of its neighbours. FXAA: where the luma of a pixel and its four neighbours differs enough to be an edge, the colour is
 // averaged along the edge's direction, found from the diagonal neighbours. Sharpening, contrast adaptive (as AMD's CAS):
 // the pixel less its neighbours, weighted down where they already span much of the range, so strong edges get no halos;
 // a source pixel or an output pixel apart, whichever is larger, so it still shows on a frame rendered above the screen's
 float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 float3 tap(float2 uv) { return img.SampleLevel(ls, uv, 0).rgb; }
+float3 bright(float2 uv) {
+    float3 c = tap(uv);
+    return c * smoothstep(0.70, 0.92, luma(c));
+}
+float3 bloom(float2 uv, float2 t) {
+    float2 r = t * 4.5;
+    float3 c = bright(uv) * 4;
+    c += (bright(uv + float2(r.x, 0)) + bright(uv - float2(r.x, 0)) +
+          bright(uv + float2(0, r.y)) + bright(uv - float2(0, r.y))) * 2;
+    c += bright(uv + r * float2(1, 1)) + bright(uv + r * float2(-1, 1)) +
+         bright(uv + r * float2(1, -1)) + bright(uv + r * float2(-1, -1));
+    return c / 24;
+}
 float3 scaled(float2 uv, float2 t, float2 px) {
     float2 r = px / t;
     if (abs(r.x - 1) < 0.01 && abs(r.y - 1) < 0.01) return tap(uv);
@@ -307,6 +321,8 @@ float4 psfinal(O i) : SV_Target {
     float3 c = (mode & 2) != 0 ? scaled(i.uv, t, fwidth(i.uv)) : tap(i.uv);
     if ((mode & 1) != 0) c = fxaa(c, i.uv, t);
     if (opts.z > 0) c = sharpen(c, i.uv, px, opts.z);
+    int bloom_strength = (mode >> 4) & 127;
+    if (bloom_strength > 0) c = saturate(c + bloom(i.uv, t) * (float(bloom_strength) * 0.005));
     int style = (mode >> 2) & 3;
     if (style == 1) {
         float3 levels = float3(5, 6, 5);
