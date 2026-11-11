@@ -66,6 +66,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 pts;  // point sprites on, size min, size max, D3DRS_POINTSIZE
     float4 vattr[16];  // the v registers a draw gives no stream
     float4 zclip;  // the depth clip planes
+    float4 taa;    // temporal projection jitter in clip units
 };
 )";
 
@@ -248,6 +249,7 @@ const char* kVsEpilogue = R"(
     q.xyz *= p.w;
     q.w = p.w;
     o.pos = q;
+    o.pos.xy += taa.xy * o.pos.w;
     o.clipz = float2(q.z - zclip.x * q.w, zclip.y * q.w - q.z);
     o.d0 = saturate(oD0);
     o.d1 = saturate(oD1);
@@ -912,6 +914,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     if (surf.w == 0 && abs(sp.y - (surf.y - 0.5)) < 1e-3) cp.y = -cp.w;
     if (hud.w != 0) cp.z = min(cp.z, cp.w);  // W-buffered: nothing clipped past the far plane (the programs' epilogue)
     o.pos = cp;
+    o.pos.xy += taa.xy * o.pos.w;
     o.clipz = float2(cp.z - zclip.x * cp.w, zclip.y * cp.w - cp.z);
     o.d0 = saturate(oD0);
     o.d1 = saturate(oD1);

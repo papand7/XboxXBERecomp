@@ -222,6 +222,7 @@ void Load() {
         if (msaa == kMsaa[i]) s.msaa = i;
     s.fxaa = t["fxaa"].value_or(s.fxaa);
     s.smaa = t["smaa"].value_or(s.smaa);
+    s.temporal_aa = t["temporal_aa"].value_or(s.temporal_aa);
     s.scale_filter = t["scale_filter"].value_or(s.scale_filter);
     s.alpha_coverage = t["alpha_coverage"].value_or(s.alpha_coverage);
     s.world_textures = t["world_textures"].value_or(s.world_textures);
@@ -336,6 +337,7 @@ toml::table Table() {
                   {"msaa", kMsaa[s.msaa % kMsaaCount]},
                   {"fxaa", s.fxaa},
                   {"smaa", s.smaa},
+                  {"temporal_aa", s.temporal_aa},
                   {"scale_filter", int64_t(s.scale_filter)},
                   {"alpha_coverage", s.alpha_coverage},
                   {"world_textures", s.world_textures},

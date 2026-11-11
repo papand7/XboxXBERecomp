@@ -720,7 +720,8 @@ private:
     VkImageView AmbientOcclusion(Target& t, VkImageView source, VkImageView depth);
     VkImageView DepthOfField(Target& t, VkImageView source, VkImageView depth);
     VkImageView MotionBlur(Target& t, VkImageView source, VkImageView depth);
-    void RememberCamera(const State& s);
+    bool RememberCamera(const State& s);
+    VkImageView TemporalAA(Target& t, VkImageView source, VkImageView depth);
     void RenderUi();
     void ReleaseOldTextures();
     void CountFps();
@@ -875,6 +876,9 @@ private:
     Image bloom_down_[5], bloom_up_[4];
     Image shafts_field_[5], shafts_pick_, shafts_quarter_, shafts_scene_;
     uint32_t shafts_w_ = 0, shafts_h_ = 0;
+    Image taa_history_[2];
+    uint32_t taa_w_ = 0, taa_h_ = 0;
+    uint64_t taa_frame_ = 0;
     float camera_view_[16]{}, camera_projection_[16]{}, previous_view_[16]{}, previous_projection_[16]{};
     uint64_t camera_frame_ = 0, previous_camera_frame_ = 0;
     std::vector<Chunk> chunks_;  // stream chunks: [0] is being filled
@@ -1476,6 +1480,7 @@ VulkanBackend::~VulkanBackend() {
     DropImage(shafts_pick_);
     DropImage(shafts_quarter_);
     DropImage(shafts_scene_);
+    for (Image& im : taa_history_) DropImage(im);
     for (auto& [k, m] : movie_up_) DropImage(m.up), DropImage(m.out);
     movie_up_.clear();
     DropImage(lut_);
@@ -2730,31 +2735,49 @@ float4 dof(O i) : SV_Target {
     return dof_scene_.view;
 }
 
-void VulkanBackend::RememberCamera(const State& s) {
-    if (!app::Get().motion_blur || camera_frame_ == presents_ + 1 || draw_2d_ || !bound_rt_ || !bound_ds_ ||
+bool VulkanBackend::RememberCamera(const State& s) {
+    if ((!app::Get().motion_blur && !app::Get().temporal_aa) || draw_2d_ || !bound_rt_ || !bound_ds_ ||
         bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_ || bound_ds_->w != bound_rt_->w ||
         bound_ds_->h != bound_rt_->h || !s.rs[kRsZEnable])
-        return;
+        return false;
+    if (camera_frame_ == presents_ + 1) return true;
     const auto& view = s.transforms[2];
     GuestExtent size;
     SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
     size = DrawnExtent(s, size);
-    if (!size.w || !size.h) return;
+    if (!size.w || !size.h) return false;
     const auto& viewport = s.viewport;
     const float sx = float(viewport.w) / size.w, sy = float(viewport.h) / size.h;
     const float ox = (2.0f * viewport.x + viewport.w) / size.w - 1;
     const float oy = 1 - (2.0f * viewport.y + viewport.h) / size.h;
     const float vpm[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, viewport.max_z - viewport.min_z, 0,
                            ox, oy, viewport.min_z, 1};
+    float raw_projection[16];
+    std::memcpy(raw_projection, s.transforms[3].data(), sizeof(raw_projection));
+    if (app::Get().temporal_aa) {
+        auto halton = [](uint32_t i, uint32_t base) {
+            float f = 1, r = 0;
+            for (; i; i /= base) f /= float(base), r += f * float(i % base);
+            return r;
+        };
+        const uint32_t n = uint32_t(presents_ % 8) + 1;
+        const float jx = (halton(n, 2) - 0.5f) * 2.0f / float(bound_rt_->w);
+        const float jy = (halton(n, 3) - 0.5f) * 2.0f / float(bound_rt_->h);
+        for (int r = 0; r < 4; r++) {
+            raw_projection[r * 4] += jx * raw_projection[r * 4 + 3];
+            raw_projection[r * 4 + 1] += jy * raw_projection[r * 4 + 3];
+        }
+    }
     float projection[16]{};
     for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++)
-        for (int k = 0; k < 4; k++) projection[r * 4 + c] += s.transforms[3][size_t(r * 4 + k)] * vpm[k * 4 + c];
+        for (int k = 0; k < 4; k++) projection[r * 4 + c] += raw_projection[r * 4 + k] * vpm[k * 4 + c];
     if (!std::isfinite(projection[0]) || !std::isfinite(projection[5]) || !std::isfinite(projection[11]) ||
         std::abs(projection[0]) < 1e-5f || std::abs(projection[5]) < 1e-5f || std::abs(projection[11]) < 1e-5f)
-        return;
+        return false;
     std::memcpy(camera_view_, view.data(), sizeof(camera_view_));
     std::memcpy(camera_projection_, projection, sizeof(camera_projection_));
     camera_frame_ = presents_ + 1;
+    return true;
 }
 
 VkImageView VulkanBackend::MotionBlur(Target& t, VkImageView source, VkImageView depth) {
@@ -2898,6 +2921,164 @@ float4 blur(O i) : SV_Target {
     End();
     Barrier();
     return motion_scene_.view;
+}
+
+// Jittered temporal AA: reproject the depth-tested world, reject disocclusions by previous view depth, and clamp history in YCoCg.
+VkImageView VulkanBackend::TemporalAA(Target& t, VkImageView source, VkImageView depth) {
+    if (!source || !depth || camera_frame_ != presents_ + 1 || !app::Get().temporal_aa) return source;
+    static const std::string hlsl = R"(
+cbuffer P : register(b1) {
+    row_major float4x4 inverse_view;
+    row_major float4x4 inverse_projection;
+    row_major float4x4 previous_view_projection;
+    row_major float4x4 previous_view;
+    float4 p[2];
+};
+Texture2D scene : register(t0);
+Texture2D history : register(t1);
+Texture2D<float> depthtex : register(t2);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o; float2 q = float2((id << 1) & 2, id & 2);
+    o.pos = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = q; return o;
+}
+float3 view_at(float2 uv, float d) {
+    float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
+    float4 v;
+    if (p[0].x > 0.5) {
+        v = mul(float4(ndc, 1, 1), inverse_projection);
+        v.xyz /= max(abs(v.w), 1e-6) * sign(v.w);
+        float z = d * 4096.0;
+        v.xyz *= z / (max(abs(v.z), 1e-6) * sign(v.z));
+    } else {
+        v = mul(float4(ndc, d, 1), inverse_projection);
+        v.xyz /= max(abs(v.w), 1e-6) * sign(v.w);
+    }
+    return v.xyz;
+}
+float3 view_ray(float2 uv) {
+    float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
+    float4 v = mul(float4(ndc, 1, 1), inverse_projection);
+    return normalize(v.xyz);
+}
+float3 world_at(float3 v) {
+    float4 w = mul(float4(v, 1), inverse_view);
+    return w.xyz / (max(abs(w.w), 1e-6) * sign(w.w));
+}
+float2 old_uv(float2 uv, float d, bool sky, out float old_z) {
+    float4 old;
+    if (sky) {
+        float3 dir = mul(float4(view_ray(uv), 0), inverse_view).xyz;
+        old = mul(float4(dir, 0), previous_view_projection);
+        old_z = 4096;
+    } else {
+        float3 v = view_at(uv, d);
+        float3 world = world_at(v);
+        float4 pv = mul(float4(world, 1), previous_view);
+        old_z = abs(pv.z);
+        old = mul(float4(world, 1), previous_view_projection);
+    }
+    if (old.w <= 1e-5) return uv + 2;
+    return float2(old.x / old.w * 0.5 + 0.5, 0.5 - old.y / old.w * 0.5);
+}
+float3 to_ycocg(float3 c) { return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25))); }
+float3 from_ycocg(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+float4 taa(O i) : SV_Target {
+    float2 uv = i.uv, px = p[0].zw;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    float d = depthtex.SampleLevel(pt, uv, 0); bool sky = d >= 0.99999;
+    float z = 4096;
+    if (!sky) z = abs(view_at(uv, d).z);
+    if (p[0].y > 0.5) {
+        float old_z;
+        float2 prev = old_uv(uv, d, sky, old_z);
+        if (all(prev >= 0) && all(prev <= 1)) {
+            float4 h = history.SampleLevel(pt, prev, 0);
+            bool valid = sky || (h.a > 0 && abs(h.a - old_z) < max(0.05, old_z * 0.04));
+            if (valid) {
+                float3 m1 = 0, m2 = 0;
+                [unroll] for (int y = -1; y <= 1; y++) [unroll] for (int x = -1; x <= 1; x++) {
+                    float3 n = to_ycocg(scene.SampleLevel(pt, uv + float2(x, y) * px, 0).rgb);
+                    m1 += n; m2 += n * n;
+                }
+                m1 /= 9; m2 /= 9;
+                float3 sd = sqrt(max(m2 - m1 * m1, 0));
+                float3 lo = m1 - sd * 1.25, hi = m1 + sd * 1.25;
+                h.rgb = from_ycocg(clamp(to_ycocg(h.rgb), lo, hi));
+                c = lerp(c, h.rgb, p[1].x);
+            }
+        }
+    }
+    return float4(c, z);
+}
+)";
+    uint64_t vs_hash, ps_hash;
+    if (!Compile(hlsl, "vs", "vs_5_0", vs_hash) || !Compile(hlsl, "taa", "ps_5_0", ps_hash)) {
+        LOG_FIRST(1, "vulkan: temporal AA shaders did not compile; drawing without TAA");
+        return source;
+    }
+    VkPipeline pipeline = PassPipeline({vs_hash, ps_hash, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pipeline) return source;
+    if (taa_w_ != t.w || taa_h_ != t.h) {
+        for (Image& im : taa_history_) DropImage(im);
+        taa_w_ = t.w; taa_h_ = t.h; taa_frame_ = 0;
+    }
+    constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    for (Image& im : taa_history_)
+        if (!im.img && !MakeImage(im, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, t.w, t.h, 1, 1, 1, usage))
+            return source;
+    const bool history_valid = taa_frame_ == presents_ && previous_camera_frame_ == presents_;
+    float constants[72]{};
+    auto inverse = [](const float* in, float* out) {
+        double a[4][8]{};
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) a[r][c] = in[r * 4 + c];
+            a[r][r + 4] = 1;
+        }
+        for (int c = 0; c < 4; c++) {
+            int pivot = c;
+            for (int r = c + 1; r < 4; r++) if (std::abs(a[r][c]) > std::abs(a[pivot][c])) pivot = r;
+            if (std::abs(a[pivot][c]) < 1e-10) return false;
+            if (pivot != c) for (int k = 0; k < 8; k++) std::swap(a[c][k], a[pivot][k]);
+            const double scale = a[c][c];
+            for (int k = 0; k < 8; k++) a[c][k] /= scale;
+            for (int r = 0; r < 4; r++) if (r != c) {
+                const double f = a[r][c];
+                for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
+            }
+        }
+        for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) out[r * 4 + c] = float(a[r][c + 4]);
+        return true;
+    };
+    auto multiply = [](const float* a, const float* b, float* out) {
+        for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) {
+            out[r * 4 + c] = 0;
+            for (int k = 0; k < 4; k++) out[r * 4 + c] += a[r * 4 + k] * b[k * 4 + c];
+        }
+    };
+    if (!inverse(camera_view_, constants) || !inverse(camera_projection_, constants + 16)) return source;
+    float previous_vp[16];
+    multiply(previous_view_, previous_projection_, previous_vp);
+    std::memcpy(constants + 32, previous_vp, sizeof(previous_vp));
+    std::memcpy(constants + 48, previous_view_, sizeof(previous_view_));
+    const char* wbuf = std::getenv("XBE_WBUFFER");
+    constants[64] = !(wbuf && *wbuf == '0') ? 1.0f : 0.0f;
+    constants[65] = history_valid ? 1.0f : 0.0f;
+    constants[66] = 1.0f / t.w;
+    constants[67] = 1.0f / t.h;
+    constants[68] = 0.9f;
+    Image& out = taa_history_[presents_ & 1];
+    const Image& history = taa_history_[(presents_ + 1) & 1];
+    VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
+    VkRect2D sc{{0, 0}, {t.w, t.h}};
+    VkImageView views[3] = {source, history_valid ? history.view : dummy_.view, depth, VK_NULL_HANDLE};
+    FullScreen(pipeline, {out.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, constants, 72, views, 3);
+    End();
+    Barrier();
+    taa_frame_ = presents_ + 1;
+    return out.view;
 }
 
 VkImageView VulkanBackend::UpscaleMovie(Tex& tx, const TextureDesc& d) {
@@ -3893,7 +4074,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         return !(e && *e == '0');
     }();
     pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
-    RememberCamera(s);
+    const bool camera_ok = RememberCamera(s);
     sh.pkey = Hash(&pk, sizeof(pk));
     EnsurePixelShader(pk, sh);
     if (!sh.vs_code || !sh.ps_code) return;
@@ -3942,6 +4123,16 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (sh.fixed_transform) {
         FillTransformConstants(s, size, c);
         FillLightConstants(s, sh.fk, c);
+    }
+    if (camera_ok && app::Get().temporal_aa && !draw_2d_ && bound_rt_) {
+        auto halton = [](uint32_t i, uint32_t base) {
+            float f = 1, r = 0;
+            for (; i; i /= base) f /= float(base), r += f * float(i % base);
+            return r;
+        };
+        const uint32_t n = uint32_t(presents_ % 8) + 1;
+        c.taa[0] = (halton(n, 2) - 0.5f) * 2.0f / float(bound_rt_->w);
+        c.taa[1] = (halton(n, 3) - 0.5f) * 2.0f / float(bound_rt_->h);
     }
     // samplers
     VkSampler smp[4];
@@ -4475,6 +4666,9 @@ void VulkanBackend::Present(const Surface& front) {
         if (t && app::Get().depth_of_field && scene_depth_frame_ == presents_ + 1 &&
             scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
             frame_source = DepthOfField(*t, frame_source, scene_depth_view_);
+        if (t && app::Get().temporal_aa && scene_depth_frame_ == presents_ + 1 &&
+            scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
+            frame_source = TemporalAA(*t, frame_source, scene_depth_view_);
         if (t && app::Get().motion_blur && scene_depth_frame_ == presents_ + 1 &&
             scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
             frame_source = MotionBlur(*t, frame_source, scene_depth_view_);

@@ -452,6 +452,8 @@ void Graphics(Settings& s) {
         s.smaa = edge == 2;
         Save();
     }
+    if (RowCheck("Temporal AA", &s.temporal_aa,
+                 "Jitters 3D draws and reprojects depth-validated history. Fast-moving geometry and the weapon or HUD can ghost. Vulkan only.")) Save();
     int filter = int(s.scale_filter % 2);
     const char* filter_names[] = {"Bilinear", "Sharp"};
     if (RowChoice("Scaling filter", &filter, filter_names, 2, "How the frame reaches the screen's size when render scale is not 100%.")) {
