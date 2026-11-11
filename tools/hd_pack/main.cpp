@@ -15,7 +15,7 @@
 //   <key>_r.png, roughness (white rough, black polished) from its local contrast and brightness. Generated, so an
 //   approximation: the runtime reads roughness for reflections.
 // - Done pictures are skipped (--force does them again): play more of the game with the dump on, run it again.
-// - --movies (gpu/movie_pack.h), a run of its own: the frames a title collected in mods/movies/dump/ (<key>.png,
+// - --movies (gpu/movie_pack.h), a developer run, not in the launcher: about 4 hours on a GPU where only x4plus draws right: the frames a title collected in mods/movies/dump/ (<key>.png,
 //   <movie>.txt their order) upscaled 2x into mods/movies/<key>.jpg, a hundred at a time so the work folder stays
 //   small; each collected frame is removed once its picture is written (the orders are kept beside them). fast (the
 //   default): realesr-animevideov3, a 2x video model, several times quicker; quality: x4plus's 4x halved. Some GPUs

@@ -1,5 +1,6 @@
 #pragma once
-// Movie packs (movie_pack.cpp): a movie's frames each in a larger picture of its own, made on the player's PC (the
+// Movie packs (movie_pack.cpp), OFF unless NF_MOVIE_PACK=1 and not in the launcher (hd_pack --movies and
+// NF_COLLECT_MOVIES=1 are for developers): a movie's frames each in a larger picture of its own, made on the player's PC (the
 // HD texture pack: hd_pack upscales the frames a title collected). mods/movies/<key>.jpg beside the exe stands for the
 // game's frame whose bytes hash to key (TextureKey, as texture packs), read ahead on worker threads in the order each
 // movie plays them (mods/movies/<movie>.txt, a key a line) so it is in memory before it is shown; a frame not read

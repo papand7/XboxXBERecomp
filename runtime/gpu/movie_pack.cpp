@@ -4,6 +4,7 @@
 #include "gpu/movie_pack.h"
 
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <deque>
 #include <filesystem>
@@ -186,7 +187,9 @@ bool MovieCollect(uint32_t header, const char* movie) {
 }
 
 uint64_t MovieKey(uint32_t header) {
-    if (!Style().texture_pack) return 0;
+    // off unless NF_MOVIE_PACK=1: making the frames takes hours on some GPUs (see PROGRESS.md), so it is no feature yet
+    static const bool on = std::getenv("NF_MOVIE_PACK") != nullptr;
+    if (!on || !Style().texture_pack) return 0;
     {
         std::lock_guard lock(g_lock);
         Scan();
