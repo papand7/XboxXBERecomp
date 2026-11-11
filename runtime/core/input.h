@@ -43,6 +43,9 @@ Pad Poll(int port);
 // thread: held now wherever the focus is, mouse buttons VK_LBUTTON .. VK_XBUTTON2 the physical ones (Windows:
 // GetAsyncKeyState; elsewhere SDL's keyboard and mouse state, the codes mapped to scancodes)
 bool KeyDown(int vk);
+// a game's own tool using the arrow keys, PageUp/PageDown, Enter and Delete (src/game/aim.cpp's sight tuner): while on,
+// those keys do not reach the game's controls
+void HoldBackToolKeys(bool on);
 // the game window has the keyboard (Windows: it is the foreground window)
 bool GameFocused();
 // held while the game window has the keyboard

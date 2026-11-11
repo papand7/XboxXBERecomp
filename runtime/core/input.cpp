@@ -33,6 +33,14 @@
 #include "core/log.h"
 
 namespace input {
+namespace {
+std::atomic<bool> g_tool_keys{false};
+}  // namespace
+void HoldBackToolKeys(bool on) { g_tool_keys = on; }
+// a key the game's tool has while it is on (HoldBackToolKeys): the arrows, PageUp, PageDown, Enter, Delete, Home, End
+static bool ToolKey(uint16_t k) {
+    return g_tool_keys.load() && (k == 0x25 || k == 0x26 || k == 0x27 || k == 0x28 || k == 0x21 || k == 0x22 || k == 0x0D || k == 0x2E || k == 0x24 || k == 0x23);
+}
 
 namespace {
 
@@ -560,7 +568,7 @@ Pad Poll(int port) {
             for (int c = 0; c < kControls; c++) {
                 std::array<uint16_t, 2> keys = c < int(s.keys.size()) ? s.keys[c] : app::DefaultKeys(c);
                 for (uint16_t k : keys)
-                    if (k && KeyDown(PhysicalKey(k))) out[c] = 1.0f, key_used = true;
+                    if (k && !ToolKey(k) && KeyDown(PhysicalKey(k))) out[c] = 1.0f, key_used = true;
             }
         }
         if (pad_used) {
