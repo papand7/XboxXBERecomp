@@ -368,11 +368,19 @@ float4 psfinal(O i) : SV_Target {
             depthimg.GetDimensions(ds.x, ds.y);
             float2 dp = 1 / ds;
             float z = depthimg.SampleLevel(ps, i.uv, 0);
-            float dz = max(max(abs(z - depthimg.SampleLevel(ps, i.uv + float2(dp.x, 0), 0)),
-                               abs(z - depthimg.SampleLevel(ps, i.uv - float2(dp.x, 0), 0))),
-                           max(abs(z - depthimg.SampleLevel(ps, i.uv + float2(0, dp.y), 0)),
-                               abs(z - depthimg.SampleLevel(ps, i.uv - float2(0, dp.y), 0))));
+            float zL = depthimg.SampleLevel(ps, i.uv - float2(dp.x, 0), 0);
+            float zR = depthimg.SampleLevel(ps, i.uv + float2(dp.x, 0), 0);
+            float zU = depthimg.SampleLevel(ps, i.uv - float2(0, dp.y), 0);
+            float zD = depthimg.SampleLevel(ps, i.uv + float2(0, dp.y), 0);
+            float dz = max(max(abs(z - zR), abs(z - zL)), max(abs(z - zD), abs(z - zU)));
             edge = max(edge, saturate((dz - max(0.001, z * 0.004)) * 80));
+            // Compare depth-derived slopes on either side: creases can be visible even when the depth step is small.
+            float zsafe = max(abs(z), 1e-4);
+            float sxL = (z - zL) / zsafe, sxR = (zR - z) / zsafe;
+            float syU = (z - zU) / zsafe, syD = (zD - z) / zsafe;
+            float nx = 1 - dot(normalize(float2(1, sxL)), normalize(float2(1, sxR)));
+            float ny = 1 - dot(normalize(float2(1, syU)), normalize(float2(1, syD)));
+            edge = max(edge, saturate((max(nx, ny) - 0.002) * 24));
         }
         float bands = floor(saturate(y) * 5) / 4;
         c = saturate(c * (bands / max(y, 0.05)));
