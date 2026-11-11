@@ -48,6 +48,7 @@
 #include "gpu/d3d_common.h"
 #include "gpu/ext.h"
 #include "gpu/shaders.h"
+#include "gpu/smaa.h"
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
@@ -682,7 +683,7 @@ private:
     // Present's steps
     bool Acquire(uint32_t& index);
     void UploadGammaRamp();
-    void BlitFrame(Target& t, VkImageView view);
+    void BlitFrame(Target& t, VkImageView view, VkImageView source);
     void RenderUi();
     void ReleaseOldTextures();
     void CountFps();
@@ -712,6 +713,8 @@ private:
     VkShaderModule Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
     VkShaderModule Module(uint64_t hash);
     VkPipeline PassPipeline(const PassKey& k);
+    bool EnsureSmaa();
+    VkImageView SmaaFrame(Target& t);
     void FullScreen(VkPipeline p, const Attachments& a, const VkViewport& vp, const VkRect2D& sc, const float* cb,
                     uint32_t cb_floats, const VkImageView* views, uint32_t n_views);
     void Blit(VkImageView src, const Attachments& a, const VkViewport& vp, const VkRect2D& sc, const float uvrect[4],
@@ -802,6 +805,10 @@ private:
     VkSampler pass_samplers_[4] = {};  // linear, then point; all clamp
     Image lut_;
     Image dummy_;  // 1x1 white, for stages without a texture where null descriptors are missing
+    Image smaa_area_, smaa_search_, smaa_copy_, smaa_edges_, smaa_weights_, smaa_result_;
+    uint32_t smaa_w_ = 0, smaa_h_ = 0;
+    bool smaa_tried_ = false, smaa_ready_ = false;
+    uint64_t smaa_edge_vs_ = 0, smaa_edge_ps_ = 0, smaa_weight_vs_ = 0, smaa_weight_ps_ = 0;
     std::vector<Chunk> chunks_;  // stream chunks: [0] is being filled
     Buffer readback_;
     Dxc dxc_;
@@ -1352,6 +1359,7 @@ VulkanBackend::~VulkanBackend() {
     textures_.clear();
     DropImage(lut_);
     DropImage(dummy_);
+    for (Image* im : {&smaa_area_, &smaa_search_, &smaa_copy_, &smaa_edges_, &smaa_weights_, &smaa_result_}) DropImage(*im);
     for (Chunk& c : chunks_) DropBuffer(c.b);
     DropBuffer(readback_);
     for (auto& [k, l] : late_)
@@ -2210,7 +2218,8 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
                          const float uvrect[4], const BlitOptions& o, VkFormat fmt) {
     uint64_t vh, ph;
     const app::Settings& st = app::Get();
-    const bool final = o.final && (st.fxaa || st.sharpen);
+    const bool fxaa = st.fxaa && !st.smaa;
+    const bool final = o.final && (fxaa || st.sharpen);
     if (!Compile(kBlitHlsl, "vs", "vs_5_0", vh)) return;
     VkShaderModule ps = Compile(kBlitHlsl, final ? "psfinal" : "psmain", "ps_5_0", ph);
     bool use_final = final && ps;
@@ -2218,7 +2227,7 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
     if (!ps) return;
     float c[8] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3], o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f,
                   float(o.taps), 1.0f};
-    if (use_final) c[5] = st.fxaa ? 1.0f : 0.0f, c[6] = float(std::min<uint32_t>(st.sharpen, 100)) / 100.0f;
+    if (use_final) c[5] = fxaa ? 1.0f : 0.0f, c[6] = float(std::min<uint32_t>(st.sharpen, 100)) / 100.0f;
     VkPipeline p = PassPipeline({vh, ph, fmt, VK_FORMAT_UNDEFINED, o.over ? 1u : 0u, 0});
     VkImageView views[2] = {src, lut_.view};
     FullScreen(p, a, vp, sc, c, 8, views, 2);
@@ -2233,6 +2242,80 @@ void VulkanBackend::BlitWhole(VkImageView src, const Image& dst, const BlitOptio
     Blit(src, a, vp, sc, uv, o);
 }
 
+bool VulkanBackend::EnsureSmaa() {
+    if (smaa_tried_) return smaa_ready_;
+    smaa_tried_ = true;
+    if (!Compile(kSmaaHlsl, "vsedge", "vs_5_0", smaa_edge_vs_) ||
+        !Compile(kSmaaHlsl, "psedge", "ps_5_0", smaa_edge_ps_) ||
+        !Compile(kSmaaHlsl, "vsweight", "vs_5_0", smaa_weight_vs_) ||
+        !Compile(kSmaaHlsl, "psweight", "ps_5_0", smaa_weight_ps_) ||
+        !Compile(kSmaaHlsl, "vsblend", "vs_5_0", smaa_blend_vs_) ||
+        !Compile(kSmaaHlsl, "psblend", "ps_5_0", smaa_blend_ps_)) {
+        LOGR("vulkan: SMAA shaders could not be compiled; drawing without SMAA");
+        return false;
+    }
+    const VkImageUsageFlags sampled = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (!MakeImage(smaa_area_, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8_UNORM, kSmaaAreaWidth, kSmaaAreaHeight, 1, 1, 1, sampled) ||
+        !MakeImage(smaa_search_, VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM, kSmaaSearchWidth, kSmaaSearchHeight, 1, 1, 1, sampled)) {
+        DropImage(smaa_area_);
+        DropImage(smaa_search_);
+        LOGR("vulkan: SMAA lookup images could not be made; drawing without SMAA");
+        return false;
+    }
+    UploadLevel(smaa_area_, 0, 0, kSmaaAreaWidth, kSmaaAreaHeight, 1, kSmaaArea,
+                size_t(kSmaaAreaWidth) * kSmaaAreaHeight * 2);
+    UploadLevel(smaa_search_, 0, 0, kSmaaSearchWidth, kSmaaSearchHeight, 1, kSmaaSearch,
+                size_t(kSmaaSearchWidth) * kSmaaSearchHeight);
+    smaa_ready_ = true;
+    LOGR("vulkan: SMAA 1x ready");
+    return true;
+}
+
+VkImageView VulkanBackend::SmaaFrame(Target& t) {
+    if (!EnsureSmaa()) return t.res.view;
+    if (smaa_w_ != t.w || smaa_h_ != t.h) {
+        for (Image* im : {&smaa_copy_, &smaa_edges_, &smaa_weights_, &smaa_result_}) DropImage(*im);
+        const VkImageUsageFlags sampled = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        const VkImageUsageFlags render = sampled | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (!MakeImage(smaa_copy_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1, sampled) ||
+            !MakeImage(smaa_edges_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1, render) ||
+            !MakeImage(smaa_weights_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1, render) ||
+            !MakeImage(smaa_result_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1, render)) {
+            for (Image* im : {&smaa_copy_, &smaa_edges_, &smaa_weights_, &smaa_result_}) DropImage(*im);
+            smaa_w_ = smaa_h_ = 0;
+            LOG_FIRST(8, "vulkan: no SMAA targets at %ux%u; drawing without SMAA", t.w, t.h);
+            return t.res.view;
+        }
+        smaa_w_ = t.w;
+        smaa_h_ = t.h;
+    }
+    const VkPipeline edges = PassPipeline({smaa_edge_vs_, smaa_edge_ps_, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    const VkPipeline weights = PassPipeline({smaa_weight_vs_, smaa_weight_ps_, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    const VkPipeline blend = PassPipeline({smaa_blend_vs_, smaa_blend_ps_, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!edges || !weights || !blend) return t.res.view;
+
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {t.w, t.h, 1};
+    vkCmdCopyImage(Cmd(), t.res.img, VK_IMAGE_LAYOUT_GENERAL, smaa_copy_.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+
+    const float constants[8] = {0, 0, 1, 1, 1.0f / t.w, 1.0f / t.h, float(t.w), float(t.h)};
+    const VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
+    const VkRect2D sc{{0, 0}, {t.w, t.h}};
+    VkImageView edge_src = smaa_copy_.view;
+    FullScreen(edges, {smaa_edges_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, constants, 8, &edge_src, 1);
+    End();
+    const VkImageView weight_src[3] = {smaa_edges_.view, smaa_area_.view, smaa_search_.view};
+    FullScreen(weights, {smaa_weights_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, constants, 8, weight_src, 3);
+    End();
+    const VkImageView blend_src[2] = {smaa_copy_.view, smaa_weights_.view};
+    FullScreen(blend, {smaa_result_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, constants, 8, blend_src, 2);
+    End();
+    return smaa_result_.view;
+}
 // a depth buffer drawn as colour into another depth buffer's memory: copied as depth
 bool VulkanBackend::DepthCopy(const State& s) {
     TextureDesc d;
@@ -3075,7 +3158,7 @@ void VulkanBackend::UploadGammaRamp() {
 }
 
 // the frame at its shape (16:9 or 4:3, ultrawide the screen's), centred on black
-void VulkanBackend::BlitFrame(Target& t, VkImageView view) {
+void VulkanBackend::BlitFrame(Target& t, VkImageView view, VkImageView source) {
     float aspect = app::FrameAspect();
     float w = float(bb_w_), h = float(bb_h_);
     float vw = std::min(w, h * aspect);
@@ -3086,7 +3169,7 @@ void VulkanBackend::BlitFrame(Target& t, VkImageView view) {
     // the swap chain image's rendering instance is already open (Present)
     open_ = true;
     cur_ = {view, VK_NULL_HANDLE, bb_w_, bb_h_};
-    Blit(t.res.view, cur_, vp, sc, uv, {.gamma = gamma_, .final = true}, swap_fmt_);
+    Blit(source, cur_, vp, sc, uv, {.gamma = gamma_, .final = true}, swap_fmt_);
 }
 
 void VulkanBackend::RenderUi() {
@@ -3163,6 +3246,8 @@ void VulkanBackend::Present(const Surface& front) {
         PerfScope pa{perf_acquire_};
         acquired = Acquire(index);
     }
+    VkImageView frame_source = t ? t->res.view : VK_NULL_HANDLE;
+    if (acquired && t && app::Get().smaa) frame_source = SmaaFrame(*t);
     if (acquired) {
         End();
         VkCommandBuffer cb = Cmd();
@@ -3192,7 +3277,7 @@ void VulkanBackend::Present(const Surface& front) {
         ri.colorAttachmentCount = 1;
         ri.pColorAttachments = &color;
         vkCmdBeginRendering(cb, &ri);
-        if (t) BlitFrame(*t, swap_views_[index]);
+        if (t) BlitFrame(*t, swap_views_[index], frame_source);
         VkViewport vp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
         vkCmdSetViewport(cb, 0, 1, &vp);
         if (ui_) RenderUi();
