@@ -61,6 +61,9 @@ struct Settings {
     bool depth_of_field = false;     // depth-based foreground/background blur; Vulkan only
     uint32_t focus_distance = 10;    // depth of field focus distance in metres
     uint32_t dof_blur = 6;           // maximum circle of confusion in pixels
+    bool motion_blur = false;        // camera-motion blur from per-frame transforms; Vulkan only
+    uint32_t motion_blur_strength = 60;
+    uint32_t motion_blur_limit = 8;  // maximum blur in pixels
     uint32_t vignette = 0;           // percent, darkens the screen edges
     uint32_t film_grain = 0;         // percent, animated screen-space noise
     bool movie_upscale = true;       // upscale YUY2 movie frames before drawing

@@ -717,6 +717,8 @@ private:
     void BlitFrame(Target& t, VkImageView view, VkImageView source);
     VkImageView AmbientOcclusion(Target& t, VkImageView source, VkImageView depth);
     VkImageView DepthOfField(Target& t, VkImageView source, VkImageView depth);
+    VkImageView MotionBlur(Target& t, VkImageView source, VkImageView depth);
+    void RememberCamera(const State& s);
     void RenderUi();
     void ReleaseOldTextures();
     void CountFps();
@@ -866,6 +868,10 @@ private:
     uint32_t ao_w_ = 0, ao_h_ = 0;
     Image dof_scene_;
     uint32_t dof_w_ = 0, dof_h_ = 0;
+    Image motion_scene_;
+    uint32_t motion_w_ = 0, motion_h_ = 0;
+    float camera_view_[16]{}, camera_projection_[16]{}, previous_view_[16]{}, previous_projection_[16]{};
+    uint64_t camera_frame_ = 0, previous_camera_frame_ = 0;
     std::vector<Chunk> chunks_;  // stream chunks: [0] is being filled
     Buffer readback_;
     Dxc dxc_;
@@ -1458,6 +1464,7 @@ VulkanBackend::~VulkanBackend() {
     DropImage(ao_half_);
     DropImage(ao_scene_);
     DropImage(dof_scene_);
+    DropImage(motion_scene_);
     for (auto& [k, m] : movie_up_) DropImage(m.up), DropImage(m.out);
     movie_up_.clear();
     DropImage(lut_);
@@ -2711,6 +2718,176 @@ float4 dof(O i) : SV_Target {
     return dof_scene_.view;
 }
 
+void VulkanBackend::RememberCamera(const State& s) {
+    if (!app::Get().motion_blur || camera_frame_ == presents_ + 1 || draw_2d_ || !bound_rt_ || !bound_ds_ ||
+        bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_ || bound_ds_->w != bound_rt_->w ||
+        bound_ds_->h != bound_rt_->h || !s.rs[kRsZEnable])
+        return;
+    const auto& view = s.transforms[2];
+    GuestExtent size;
+    SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
+    size = DrawnExtent(s, size);
+    if (!size.w || !size.h) return;
+    const auto& viewport = s.viewport;
+    const float sx = float(viewport.w) / size.w, sy = float(viewport.h) / size.h;
+    const float ox = (2.0f * viewport.x + viewport.w) / size.w - 1;
+    const float oy = 1 - (2.0f * viewport.y + viewport.h) / size.h;
+    const float vpm[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, viewport.max_z - viewport.min_z, 0,
+                           ox, oy, viewport.min_z, 1};
+    float projection[16]{};
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++)
+        for (int k = 0; k < 4; k++) projection[r * 4 + c] += s.transforms[3][size_t(r * 4 + k)] * vpm[k * 4 + c];
+    if (!std::isfinite(projection[0]) || !std::isfinite(projection[5]) || !std::isfinite(projection[11]) ||
+        std::abs(projection[0]) < 1e-5f || std::abs(projection[5]) < 1e-5f || std::abs(projection[11]) < 1e-5f)
+        return;
+    std::memcpy(camera_view_, view.data(), sizeof(camera_view_));
+    std::memcpy(camera_projection_, projection, sizeof(camera_projection_));
+    camera_frame_ = presents_ + 1;
+}
+
+VkImageView VulkanBackend::MotionBlur(Target& t, VkImageView source, VkImageView depth) {
+    if (!source || !depth || camera_frame_ != presents_ + 1 || !previous_camera_frame_ ||
+        previous_camera_frame_ != presents_ || !app::Get().motion_blur || !app::Get().motion_blur_strength)
+        return source;
+    static const std::string hlsl = R"(
+cbuffer P : register(b1) {
+    row_major float4x4 inverse_view;
+    row_major float4x4 inverse_projection;
+    row_major float4x4 previous_view_projection;
+    float4 p[2];
+};
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o; float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o;
+}
+float3 world_at(float2 uv, float d) {
+    float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
+    float4 v;
+    if (p[0].x > 0.5) {
+        v = mul(float4(ndc, 1, 1), inverse_projection);
+        v.xyz /= max(abs(v.w), 1e-6) * sign(v.w);
+        float z = d * 4096.0;
+        v.xyz *= z / max(abs(v.z), 1e-6) * sign(v.z);
+        v.w = 1;
+    } else {
+        v = mul(float4(ndc, d, 1), inverse_projection);
+        v /= max(abs(v.w), 1e-6) * sign(v.w);
+    }
+    float4 w = mul(float4(v.xyz, 1), inverse_view);
+    return w.xyz / max(abs(w.w), 1e-6) * sign(w.w);
+}
+float2 previous_uv(float2 uv, float d) {
+    float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
+    float4 previous;
+    if (d >= 0.99999) {
+        float4 ray = mul(float4(ndc, 1, 1), inverse_projection);
+        ray.xyz /= max(abs(ray.w), 1e-6) * sign(ray.w);
+        float3 direction = mul(float4(normalize(ray.xyz), 0), inverse_view).xyz;
+        previous = mul(float4(direction, 0), previous_view_projection);
+    } else {
+        float3 world = world_at(uv, d);
+        previous = mul(float4(world, 1), previous_view_projection);
+    }
+    if (previous.w <= 1e-5) return uv + 1;
+    return float2(previous.x / previous.w * 0.5 + 0.5, 0.5 - previous.y / previous.w * 0.5);
+}
+float viewz(float d) { return p[0].x > 0.5 ? d * 4096.0 : rcp(max(1.0 - d, 1e-6)); }
+float4 blur(O i) : SV_Target {
+    float4 centre = scene.SampleLevel(pt, i.uv, 0);
+    float d = depthtex.SampleLevel(pt, i.uv, 0);
+    float2 old_uv = previous_uv(i.uv, d);
+    if (any(old_uv < 0) || any(old_uv > 1)) return centre;
+    float2 velocity = (i.uv - old_uv) * p[0].y;
+    float2 pixel_scale = float2(p[0].w, p[1].x);
+    float length_px = length(velocity / pixel_scale);
+    if (length_px < 0.5 || length_px > 0.25 * max(p[1].y, p[1].z)) return centre;
+    velocity *= min(1.0, p[0].z / length_px);
+    float z0 = viewz(d), noise = frac(sin(dot(i.pos.xy, float2(12.9898, 78.233))) * 43758.5453);
+    float3 sum = centre.rgb;
+    float weight = 1;
+    [unroll] for (int k = 0; k < 8; ++k) {
+        float2 q = i.uv + velocity * ((k + noise) / 8.0 - 0.5);
+        if (any(q < 0) || any(q > 1)) continue;
+        float z = viewz(depthtex.SampleLevel(pt, q, 0));
+        if (d < 0.99999 && abs(z - z0) > max(0.1, z0 * 0.12)) continue;
+        sum += scene.SampleLevel(ls, q, 0).rgb;
+        weight += 1;
+    }
+    return float4(sum / weight, centre.a);
+}
+)";
+    uint64_t vs_hash, ps_hash;
+    if (!Compile(hlsl, "vs", "vs_5_0", vs_hash) || !Compile(hlsl, "blur", "ps_5_0", ps_hash)) {
+        LOG_FIRST(1, "vulkan: motion-blur shader did not compile; drawing without motion blur");
+        return source;
+    }
+    if (motion_scene_.img && (motion_w_ != t.w || motion_h_ != t.h)) DropImage(motion_scene_);
+    if (!motion_scene_.img) {
+        if (!MakeImage(motion_scene_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+            LOG_FIRST(1, "vulkan: motion-blur target could not be made; drawing without motion blur");
+            return source;
+        }
+        motion_w_ = t.w;
+        motion_h_ = t.h;
+    }
+    VkPipeline pipeline = PassPipeline({vs_hash, ps_hash, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pipeline) return source;
+    auto inverse = [](const float* in, float* out) {
+        double a[4][8]{};
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) a[r][c] = in[r * 4 + c];
+            a[r][r + 4] = 1;
+        }
+        for (int c = 0; c < 4; c++) {
+            int pivot = c;
+            for (int r = c + 1; r < 4; r++) if (std::abs(a[r][c]) > std::abs(a[pivot][c])) pivot = r;
+            if (std::abs(a[pivot][c]) < 1e-10) return false;
+            if (pivot != c) for (int k = 0; k < 8; k++) std::swap(a[c][k], a[pivot][k]);
+            double scale = a[c][c];
+            for (int k = 0; k < 8; k++) a[c][k] /= scale;
+            for (int r = 0; r < 4; r++) if (r != c) {
+                double f = a[r][c];
+                for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
+            }
+        }
+        for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) out[r * 4 + c] = float(a[r][c + 4]);
+        return true;
+    };
+    auto multiply = [](const float* a, const float* b, float* out) {
+        for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) {
+            out[r * 4 + c] = 0;
+            for (int k = 0; k < 4; k++) out[r * 4 + c] += a[r * 4 + k] * b[k * 4 + c];
+        }
+    };
+    float constants[56]{};
+    if (!inverse(camera_view_, constants) || !inverse(camera_projection_, constants + 16)) return source;
+    float previous_view_projection[16];
+    multiply(previous_view_, previous_projection_, previous_view_projection);
+    std::memcpy(constants + 32, previous_view_projection, sizeof(previous_view_projection));
+    const app::Settings& st = app::Get();
+    const char* e = std::getenv("XBE_WBUFFER");
+    constants[48] = !(e && *e == '0') ? 1.0f : 0.0f;
+    constants[49] = float(st.motion_blur_strength) / 100.0f;
+    constants[50] = float(st.motion_blur_limit);
+    constants[51] = 1.0f / t.w;
+    constants[52] = 1.0f / t.h;
+    constants[53] = float(t.w);
+    constants[54] = float(t.h);
+    VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
+    VkRect2D sc{{0, 0}, {t.w, t.h}};
+    VkImageView views[4] = {source, depth, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    FullScreen(pipeline, {motion_scene_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, constants, 56, views, 2);
+    End();
+    Barrier();
+    return motion_scene_.view;
+}
+
 VkImageView VulkanBackend::UpscaleMovie(Tex& tx, const TextureDesc& d) {
     for (auto it = movie_up_.begin(); it != movie_up_.end();) {
         if (it->second.frame + 300 < presents_ + 1) {
@@ -3704,6 +3881,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         return !(e && *e == '0');
     }();
     pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
+    RememberCamera(s);
     sh.pkey = Hash(&pk, sizeof(pk));
     EnsurePixelShader(pk, sh);
     if (!sh.vs_code || !sh.ps_code) return;
@@ -4021,6 +4199,9 @@ void VulkanBackend::Present(const Surface& front) {
         if (t && app::Get().depth_of_field && scene_depth_frame_ == presents_ + 1 &&
             scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
             frame_source = DepthOfField(*t, frame_source, scene_depth_view_);
+        if (t && app::Get().motion_blur && scene_depth_frame_ == presents_ + 1 &&
+            scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
+            frame_source = MotionBlur(*t, frame_source, scene_depth_view_);
         cb = Cmd();
         VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
         ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -4071,6 +4252,11 @@ void VulkanBackend::Present(const Surface& front) {
         VkResult r = vkQueuePresentKHR(queue_, &pi);
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR)
             LOG_FIRST(8, "vulkan: vkQueuePresentKHR failed: %s", VkResultName(r));
+        if ((r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) && camera_frame_ == presents_ + 1) {
+            std::memcpy(previous_view_, camera_view_, sizeof(previous_view_));
+            std::memcpy(previous_projection_, camera_projection_, sizeof(previous_projection_));
+            previous_camera_frame_ = presents_ + 1;
+        }
         frame_serial_[frame_slot_] = serial_;
         frame_slot_ = (frame_slot_ + 1) % kFramesInFlight;
     } else {

@@ -235,6 +235,9 @@ void Load() {
     s.depth_of_field = t["depth_of_field"].value_or(s.depth_of_field);
     s.focus_distance = std::clamp<uint32_t>(t["focus_distance"].value_or(s.focus_distance), 1, 100);
     s.dof_blur = std::min<uint32_t>(t["dof_blur"].value_or(s.dof_blur), 12);
+    s.motion_blur = t["motion_blur"].value_or(s.motion_blur);
+    s.motion_blur_strength = std::min<uint32_t>(t["motion_blur_strength"].value_or(s.motion_blur_strength), 150);
+    s.motion_blur_limit = std::clamp<uint32_t>(t["motion_blur_limit"].value_or(s.motion_blur_limit), 1, 16);
     s.vignette = std::min<uint32_t>(t["vignette"].value_or(s.vignette), 100);
     s.film_grain = std::min<uint32_t>(t["film_grain"].value_or(s.film_grain), 100);
     s.movie_upscale = t["movie_upscale"].value_or(s.movie_upscale);
@@ -344,6 +347,9 @@ toml::table Table() {
                   {"depth_of_field", s.depth_of_field},
                   {"focus_distance", int64_t(s.focus_distance)},
                   {"dof_blur", int64_t(s.dof_blur)},
+                  {"motion_blur", s.motion_blur},
+                  {"motion_blur_strength", int64_t(s.motion_blur_strength)},
+                  {"motion_blur_limit", int64_t(s.motion_blur_limit)},
                   {"vignette", int64_t(s.vignette)},
                   {"film_grain", int64_t(s.film_grain)},
                   {"movie_upscale", s.movie_upscale},

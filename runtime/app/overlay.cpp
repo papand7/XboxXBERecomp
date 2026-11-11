@@ -504,6 +504,20 @@ void Graphics(Settings& s) {
             Save();
         }
     }
+    if (RowCheck("Motion blur", &s.motion_blur,
+                 "Blurs the scene along camera movement. First-person weapon blur is not separated yet. Vulkan only.")) Save();
+    if (s.motion_blur) {
+        int strength = int(s.motion_blur_strength);
+        if (RowSlider("Motion blur strength", &strength, 0, 150, 5, "%")) {
+            s.motion_blur_strength = uint32_t(strength);
+            Save();
+        }
+        int limit = int(s.motion_blur_limit);
+        if (RowSlider("Motion blur limit", &limit, 1, 16, 1, " px")) {
+            s.motion_blur_limit = uint32_t(limit);
+            Save();
+        }
+    }
     const char* style_names[] = {"Original", "Enhanced Color", "Toon (Screen)", "Retro", "Noir"};
     int vignette = int(s.vignette);
     if (RowSlider("Vignette", &vignette, 0, 100, 5, "%", "Darkens the edges of the finished frame.")) {
