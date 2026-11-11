@@ -2956,10 +2956,13 @@ float4 adapt_ps(O i) : SV_Target {
     [loop] for(int y=0;y<int(p[0].y);y++) [loop] for(int x=0;x<int(p[0].x);x++) {
         float2 uv=(float2(x,y)+0.5)/p[0].xy;
         float w=max(1.5-2*length((uv-0.5)*float2(1,0.8)),0.2);
-        sum+=meter.Load(int3(x,y,0))*w; weights+=w;
+        float m=meter.Load(int3(x,y,0));
+        if(m<-9.0) continue;  // near black (letterbox bars, the sky's void): metered, they brighten everything else
+        sum+=m*w; weights+=w;
     }
-    float mean=sum/max(weights,1e-4);
-    float want=clamp(0.18/exp2(mean),0.25,4.0);
+    float mean=weights>0 ? sum/weights : log2(0.18);
+    // an SDR frame the game already exposed: a gentle correction around mid grey, never a full re-exposure
+    float want=clamp(0.18/exp2(mean),0.85,1.5);
     float was=p[0].z>0.5 ? history.Load(int3(0,0,0)) : want;
     float e=exp(lerp(log(max(was,1e-3)),log(want),p[0].w));
     return float4(e,0,0,1);
@@ -2967,7 +2970,10 @@ float4 adapt_ps(O i) : SV_Target {
 float4 tone_ps(O i) : SV_Target {
     float3 c=pow(max(scene.SampleLevel(ls,i.uv,0).rgb,0),2.2);
     c*=history.Load(int3(0,0,0));
-    c=saturate((c*(2.51*c+0.03))/(c*(2.43*c+0.59)+0.14));
+    // tones below the knee stay as the game drew them; brighter ones roll off smoothly to white instead of clipping
+    const float k=0.75;
+    float3 over=max(c-k,0);
+    c=min(c,k)+(1-k)*(1-exp(-over/(1-k)));
     return float4(pow(c,1.0/2.2),1);
 }
 )";
