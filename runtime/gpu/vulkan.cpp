@@ -2233,8 +2233,8 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
         const uint32_t bloom = (std::min<uint32_t>(st.bloom, 100) * 63 + 50) / 100;
         const uint32_t vignette = (std::min<uint32_t>(st.vignette, 100) * 63 + 50) / 100;
         const uint32_t grain = (std::min<uint32_t>(st.film_grain, 100) * 63 + 50) / 100;
-        const uint32_t mode = (fxaa ? 1u : 0u) | (st.scale_filter ? 2u : 0u) | ((st.color_style & 3u) << 2) |
-                              ((bloom & 63u) << 4) | ((vignette & 63u) << 10) | ((grain & 63u) << 16);
+        const uint32_t mode = (fxaa ? 1u : 0u) | (st.scale_filter ? 2u : 0u) | ((st.color_style & 7u) << 2) |
+                              ((bloom & 63u) << 5) | ((vignette & 63u) << 11) | ((grain & 63u) << 17);
         c[5] = float(mode);
         c[6] = float(std::min<uint32_t>(st.sharpen, 100)) / 100.0f;
         c[7] = 1.0f + float(uint32_t(presents_ & 255u)) / 256.0f;

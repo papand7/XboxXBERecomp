@@ -467,7 +467,7 @@ void Graphics(Settings& s) {
         s.bloom = uint32_t(bloom);
         Save();
     }
-    const char* style_names[] = {"Original", "Retro", "Noir"};
+    const char* style_names[] = {"Original", "Enhanced Color", "Toon (Screen)", "Retro", "Noir"};
     int vignette = int(s.vignette);
     if (RowSlider("Vignette", &vignette, 0, 100, 5, "%", "Darkens the edges of the finished frame.")) {
         s.vignette = uint32_t(vignette);
@@ -478,7 +478,7 @@ void Graphics(Settings& s) {
         s.film_grain = uint32_t(grain);
         Save();
     }
-    if (RowChoice("Color style", &style, style_names, 3, "Applies a color grade to the finished frame; it does not add scene-aware outlines or lighting.")) {
+    if (RowChoice("Color style", &style, style_names, 5, "Screen-space styles only. Enhanced Color adjusts contrast and saturation; Toon uses color edges, not game geometry or ray tracing.")) {
         s.color_style = uint32_t(style);
         Save();
     }

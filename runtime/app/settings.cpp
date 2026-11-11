@@ -229,7 +229,7 @@ void Load() {
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.low_latency = t["low_latency"].value_or(s.low_latency);
     s.sharpen = std::min<uint32_t>(t["sharpen"].value_or(s.sharpen), 100);
-    s.color_style = std::min<uint32_t>(t["color_style"].value_or(s.color_style), 2);
+    s.color_style = std::min<uint32_t>(t["color_style"].value_or(s.color_style), 4);
     s.bloom = std::min<uint32_t>(t["bloom"].value_or(s.bloom), 100);
     s.vignette = std::min<uint32_t>(t["vignette"].value_or(s.vignette), 100);
     s.film_grain = std::min<uint32_t>(t["film_grain"].value_or(s.film_grain), 100);

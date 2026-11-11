@@ -243,8 +243,8 @@ float4 psmix(O i) : SV_Target {
     if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
     return float4(c.rgb, 1);
 }
-// the finished frame, the settings' passes in one: opts.y bit 0 is FXAA, bit 1 is sharp scaling, bits 2-3 are the style,
-// bits 4-9 bloom, 10-15 vignette and 16-21 grain strength. opts.z is sharpening from 0 to 1; opts.w's fractional part
+// the finished frame, the settings' passes in one: opts.y bit 0 is FXAA, bit 1 is sharp scaling, bits 2-4 are style,
+// bits 5-10 bloom, 11-16 vignette and 17-22 grain strength. opts.z is sharpening from 0 to 1; opts.w's fractional part
 // selects a grain phase, and its integer part is the exposure multiplier. The filter: Catmull-Rom up, area sampling down.
 // Catmull-Rom over source pixels going up; going down, the
 // output pixel's area (four taps, even at a ratio that is not whole) less a little of its neighbours. FXAA: where the luma of a pixel and its four neighbours differs enough to be an edge, the colour is
@@ -322,27 +322,39 @@ float4 psfinal(O i) : SV_Target {
     float3 c = (mode & 2) != 0 ? scaled(i.uv, t, fwidth(i.uv)) : tap(i.uv);
     if ((mode & 1) != 0) c = fxaa(c, i.uv, t);
     if (opts.z > 0) c = sharpen(c, i.uv, px, opts.z);
-    int bloom_strength = (mode >> 4) & 63;
+    int bloom_strength = (mode >> 5) & 63;
     if (bloom_strength > 0) c = saturate(c + bloom(i.uv, t) * (float(bloom_strength) * 0.005));
-    int vignette_strength = (mode >> 10) & 63;
+    int vignette_strength = (mode >> 11) & 63;
     if (vignette_strength > 0) {
         float2 centred = float2((i.uv.x - 0.5) * size.x / size.y, i.uv.y - 0.5);
         float edge = smoothstep(0.22, 0.95, dot(centred, centred));
         c *= 1 - edge * (float(vignette_strength) / 63) * 0.7;
     }
-    int grain_strength = (mode >> 16) & 63;
+    int grain_strength = (mode >> 17) & 63;
     if (grain_strength > 0) {
         int seed = (int(frac(opts.w) * 256.0)) & 255;
         float2 pixel = floor(i.uv * size) + float(seed) * float2(17, 31);
         float noise = frac(sin(dot(pixel, float2(12.9898, 78.233))) * 43758.5453) - 0.5;
         c = saturate(c + noise * (float(grain_strength) / 63) * 0.035);
     }
-    int style = (mode >> 2) & 3;
+    int style = (mode >> 2) & 7;
     if (style == 1) {
+        c = saturate((c - 0.5) * 1.12 + 0.5);
+        float grey = luma(c);
+        c = saturate(lerp(grey.xxx, c, 1.1));
+    } else if (style == 2) {
+        float y = luma(c);
+        float edge = max(
+            max(abs(y - luma(tap(i.uv + float2(t.x, 0)))), abs(y - luma(tap(i.uv - float2(t.x, 0))))),
+            max(abs(y - luma(tap(i.uv + float2(0, t.y)))), abs(y - luma(tap(i.uv - float2(0, t.y))))));
+        float bands = floor(saturate(y) * 5) / 4;
+        c = saturate(c * (bands / max(y, 0.05)));
+        c = lerp(c, float3(0.025, 0.03, 0.04), saturate((edge - 0.08) * 10) * 0.85);
+    } else if (style == 3) {
         float3 levels = float3(5, 6, 5);
         float dither = frac(dot(floor(i.uv * size), float2(0.06711056, 0.00583715)) * 52.9829189) - 0.5;
         c = floor(saturate(c * float3(1.05, 1.0, 0.88)) * levels + 0.5 + dither) / levels;
-    } else if (style == 2) {
+    } else if (style == 4) {
         float y = luma(c);
         float red = saturate((c.r - max(c.g, c.b) * 0.65 - 0.04) * 4);
         float3 mono = y.xxx;
