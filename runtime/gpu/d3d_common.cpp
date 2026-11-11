@@ -393,6 +393,60 @@ O vs(uint id : SV_VertexID) {
 float psmain(O i) : SV_Depth { return img.Load(int2(i.p.xy), 0); }
 )";
 
+// Lanczos 2 movie enlargement with neighbour clamping and RCAS-style sharpening.
+const char* kMovieHlsl = R"(
+cbuffer P : register(b1) { float4 p[2]; };
+Texture2D src : register(t0);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float lanczos2(float x) {
+    x = abs(x);
+    if (x < 1e-4) return 1;
+    if (x >= 2) return 0;
+    float a = 3.14159265 * x;
+    return 2 * sin(a) * sin(a * 0.5) / (a * a);
+}
+float4 up(O i) : SV_Target {
+    float2 pos = i.uv * p[0].zw - 0.5;
+    float2 base = floor(pos), f = pos - base;
+    float3 sum = 0, mn = 1e9, mx = -1e9;
+    float ws = 0, alpha = 1;
+    [unroll] for (int y = -1; y <= 2; y++) {
+        float wy = lanczos2(y - f.y);
+        [unroll] for (int x = -1; x <= 2; x++) {
+            float4 c = src.SampleLevel(pt, (base + float2(x, y) + 0.5) * p[0].xy, 0);
+            float w = lanczos2(x - f.x) * wy;
+            sum += c.rgb * w;
+            ws += w;
+            if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
+                mn = min(mn, c.rgb), mx = max(mx, c.rgb);
+                if (x == int(f.x + 0.5) && y == int(f.y + 0.5)) alpha = c.a;
+            }
+        }
+    }
+    return float4(clamp(sum / ws, mn, mx), alpha);
+}
+float4 sharp(O i) : SV_Target {
+    float2 d = p[1].xy;
+    float4 e = src.SampleLevel(pt, i.uv, 0);
+    float3 b = src.SampleLevel(pt, i.uv + float2(0, -d.y), 0).rgb, h = src.SampleLevel(pt, i.uv + float2(0, d.y), 0).rgb;
+    float3 l = src.SampleLevel(pt, i.uv + float2(-d.x, 0), 0).rgb, r = src.SampleLevel(pt, i.uv + float2(d.x, 0), 0).rgb;
+    float3 mn = min(min(b, h), min(l, r)), mx = max(max(b, h), max(l, r));
+    float3 hit_min = mn / (4 * mx + 1e-4);
+    float3 hit_max = (1 - mx) / (4 * mn - 4 - 1e-4);
+    float3 lobe3 = max(-hit_min, hit_max);
+    float lobe = max(-0.1875, min(max(lobe3.r, max(lobe3.g, lobe3.b)), 0)) * p[1].z;
+    return float4(saturate((lobe * (b + h + l + r) + e.rgb) / (4 * lobe + 1)), e.a);
+}
+)";
 float Bits(uint32_t v) {
     float f;
     std::memcpy(&f, &v, 4);

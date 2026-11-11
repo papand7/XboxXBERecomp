@@ -442,6 +442,10 @@ struct Tex {
     uint64_t faces = 0;    // a cube's frame its faces drawn on the GPU were last copied in
 };
 
+struct MovieUp {
+    Image up, out;
+    uint64_t sig = 0, frame = 0;
+};
 // a draw's four texture stages
 struct DrawTextures {
     TexInfo info[4];
@@ -715,6 +719,7 @@ private:
     VkShaderModule Module(uint64_t hash);
     VkPipeline PassPipeline(const PassKey& k);
     bool EnsureSmaa();
+    VkImageView UpscaleMovie(Tex& tx, const TextureDesc& d);
     VkImageView SmaaFrame(Target& t);
     void FullScreen(VkPipeline p, const Attachments& a, const VkViewport& vp, const VkRect2D& sc, const float* cb,
                     uint32_t cb_floats, const VkImageView* views, uint32_t n_views);
@@ -823,6 +828,7 @@ private:
     std::unordered_map<uint64_t, VkSampler> samplers_;
     std::unordered_map<uint64_t, Target> targets_;
     std::unordered_map<uint32_t, uint64_t> target_used_;  // target address to the frame it was last used
+    std::unordered_map<uint32_t, MovieUp> movie_up_;
     std::unordered_map<uint64_t, Tex> textures_;          // by data address, a P8 texture's with its palette's above
     std::unordered_map<uint32_t, uint32_t> reloads_;      // targets reloaded from guest memory, for the log
     std::unordered_map<uint32_t, Late> late_;
@@ -1358,6 +1364,8 @@ VulkanBackend::~VulkanBackend() {
     targets_.clear();
     for (auto& [k, t] : textures_) DropImage(t.img);
     textures_.clear();
+    for (auto& [k, m] : movie_up_) DropImage(m.up), DropImage(m.out);
+    movie_up_.clear();
     DropImage(lut_);
     DropImage(dummy_);
     for (Image* im : {&smaa_area_, &smaa_search_, &smaa_copy_, &smaa_edges_, &smaa_weights_, &smaa_result_}) DropImage(*im);
@@ -2327,6 +2335,59 @@ VkImageView VulkanBackend::SmaaFrame(Target& t) {
     End();
     return smaa_result_.view;
 }
+VkImageView VulkanBackend::UpscaleMovie(Tex& tx, const TextureDesc& d) {
+    for (auto it = movie_up_.begin(); it != movie_up_.end();) {
+        if (it->second.frame + 300 < presents_ + 1) {
+            DropImage(it->second.up);
+            DropImage(it->second.out);
+            it = movie_up_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    uint64_t vh, uh, sh;
+    if (!tx.img || !Compile(kMovieHlsl, "vs", "vs_5_0", vh) || !Compile(kMovieHlsl, "up", "ps_5_0", uh) ||
+        !Compile(kMovieHlsl, "sharp", "ps_5_0", sh)) {
+        LOG_FIRST(1, "vulkan: movie upscaling did not compile; drawing movies unchanged");
+        return VK_NULL_HANDLE;
+    }
+    VkPipeline pu = PassPipeline({vh, uh, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline ps = PassPipeline({vh, sh, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pu || !ps) return VK_NULL_HANDLE;
+    const float scale = std::clamp(float(bb_h_ ? bb_h_ : 1080) / float(d.height), 1.5f, 4.0f);
+    const uint32_t w = uint32_t(float(d.width) * scale + 0.5f);
+    const uint32_t h = uint32_t(float(d.height) * scale + 0.5f);
+    MovieUp& m = movie_up_[d.data];
+    m.frame = presents_ + 1;
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    for (Image* im : {&m.up, &m.out}) {
+        if (im->img && (im->w != w || im->h != h)) DropImage(*im), m.sig = 0;
+        if (!im->img && !MakeImage(*im, VK_IMAGE_TYPE_2D, kBgra, w, h, 1, 1, 1, usage)) {
+            DropImage(m.up);
+            DropImage(m.out);
+            movie_up_.erase(d.data);
+            return VK_NULL_HANDLE;
+        }
+    }
+    if (m.sig != tx.sig) {
+        m.sig = tx.sig;
+        End();
+        Barrier();
+        const float constants[8] = {1.0f / float(d.width), 1.0f / float(d.height), float(d.width), float(d.height),
+                                    1.0f / float(w), 1.0f / float(h), 0.8f, 0};
+        const VkViewport vp{0, 0, float(w), float(h), 0, 1};
+        const VkRect2D sc{{0, 0}, {w, h}};
+        VkImageView source = tx.img.view;
+        FullScreen(pu, {m.up.att, VK_NULL_HANDLE, w, h}, vp, sc, constants, 8, &source, 1);
+        End();
+        Barrier();
+        source = m.up.view;
+        FullScreen(ps, {m.out.att, VK_NULL_HANDLE, w, h}, vp, sc, constants, 8, &source, 1);
+        End();
+        Barrier();
+    }
+    return m.out.view;
+}
 // a depth buffer drawn as colour into another depth buffer's memory: copied as depth
 bool VulkanBackend::DepthCopy(const State& s) {
     TextureDesc d;
@@ -2650,6 +2711,13 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         }
     }
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
+    // YUY2 (Xbox format 0x24) has already been converted to BGRA by UploadTexture.
+    if (d.format == 0x24 && d.width >= 320 && d.height >= 200 && app::Get().movie_upscale && !palette.va) {
+        if (VkImageView v = UpscaleMovie(tx, d)) {
+            stages.levels[stage] = 1;
+            return v;
+        }
+    }
     stages.levels[stage] = tx.levels;
     if (fi.depth) stages.info[stage].shadow = ShadowDepthKind(d.format);
     return tx.img.view;

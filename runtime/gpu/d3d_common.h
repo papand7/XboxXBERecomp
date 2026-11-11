@@ -28,6 +28,7 @@ namespace gpu {
 // MSAA depth resolve (t0 depth)
 extern const char* kBlitHlsl;
 extern const char* kDepthHlsl;
+extern const char* kMovieHlsl;
 extern const char* kDepthResolveHlsl;
 
 float Bits(uint32_t v);
