@@ -73,6 +73,7 @@ namespace {
     X(vkDestroyInstance)                         \
     X(vkEnumeratePhysicalDevices)                \
     X(vkGetPhysicalDeviceProperties)             \
+    X(vkGetPhysicalDeviceProperties2)            \
     X(vkGetPhysicalDeviceFeatures2)              \
     X(vkGetPhysicalDeviceQueueFamilyProperties)  \
     X(vkGetPhysicalDeviceMemoryProperties)       \
@@ -773,6 +774,7 @@ private:
                          const Buffer* capture = nullptr);
     void CaptureGeometry(const State& s, const Assembled& a, const DrawShaders& sh, const PsoKey& key,
                          const Stretch& vsc, const Stretch& dc, const DrawTextures& stages, const VkSampler smp[4]);
+    bool BuildRtStructures();
     bool DrawGeometry(const Assembled& a);
     // visibility tests
     bool NewQuery(uint32_t& index);
@@ -830,9 +832,15 @@ private:
         Buffer vertices;
         uint32_t used = 0;
         std::vector<uint32_t> triangles;
+        Buffer indices, instance, blas_store, tlas_store, scratch;
+        VkAccelerationStructureKHR blas = VK_NULL_HANDLE, tlas = VK_NULL_HANDLE;
+        VkDeviceSize blas_size = 0, tlas_size = 0, scratch_size = 0;
+        uint32_t blas_primitives = 0;
+        bool built = false;
         uint64_t frame = 0;
     };
     RtCaptureSlot rt_capture_[kFramesInFlight]{};
+    VkDeviceSize rt_scratch_align_ = 0;
     bool null_descriptor_ = false;
     bool custom_border_ = false;
     bool mirror_once_ = false;
@@ -1445,7 +1453,16 @@ VulkanBackend::~VulkanBackend() {
     DropBuffer(readback_);
     for (auto& [k, l] : late_)
         for (Buffer& b : l.staging) DropBuffer(b);
-    for (RtCaptureSlot& slot : rt_capture_) DropBuffer(slot.vertices);
+    for (RtCaptureSlot& slot : rt_capture_) {
+        if (slot.blas) vkDestroyAccelerationStructureKHR(dev_, slot.blas, nullptr);
+        if (slot.tlas) vkDestroyAccelerationStructureKHR(dev_, slot.tlas, nullptr);
+        DropBuffer(slot.vertices);
+        DropBuffer(slot.indices);
+        DropBuffer(slot.instance);
+        DropBuffer(slot.blas_store);
+        DropBuffer(slot.tlas_store);
+        DropBuffer(slot.scratch);
+    }
     if (cmd_) Submit();
     vkDeviceWaitIdle(dev_);
     for (auto& [serial, f] : retire_) f();
@@ -3150,6 +3167,7 @@ void VulkanBackend::CaptureGeometry(const State& s, const Assembled& a, const Dr
         slot.frame = frame;
         slot.used = 0;
         slot.triangles.clear();
+        slot.built = false;
     }
     if (!slot.vertices.buf &&
         !MakeBuffer(slot.vertices, VkDeviceSize(kRtCaptureCapacity) * 16,
@@ -3246,6 +3264,155 @@ void VulkanBackend::CaptureGeometry(const State& s, const Assembled& a, const Dr
         for (uint32_t i = 0; i + 2 < n; i += 3) add_triangle(vertex(i), vertex(i + 1), vertex(i + 2));
     }
     slot.used += uint32_t(span);
+}
+bool VulkanBackend::BuildRtStructures() {
+    if (!rt_ok_) return false;
+    static const bool enabled = [] {
+        const char* e = std::getenv("XBE_RT_CAPTURE");
+        return e && *e == '1';
+    }();
+    RtCaptureSlot& slot = rt_capture_[frame_slot_];
+    if (!enabled || slot.frame != presents_ + 1 || !slot.used || slot.triangles.empty()) return false;
+    slot.built = false;
+
+    const VkDeviceSize index_bytes = VkDeviceSize(slot.triangles.size()) * sizeof(uint32_t);
+    const VkBufferUsageFlags input_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    if (!slot.indices.buf || slot.indices.size < index_bytes) {
+        DropBuffer(slot.indices);
+        if (!MakeBuffer(slot.indices, std::max<VkDeviceSize>(index_bytes, 4), input_usage, true)) return false;
+    }
+    if (!slot.indices.mem.map) return false;
+    std::memcpy(slot.indices.mem.map, slot.triangles.data(), size_t(index_bytes));
+
+    if (!rt_scratch_align_) {
+        VkPhysicalDeviceAccelerationStructurePropertiesKHR as_props{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &as_props};
+        vkGetPhysicalDeviceProperties2(pd_, &props);
+        rt_scratch_align_ = std::max<VkDeviceSize>(as_props.minAccelerationStructureScratchOffsetAlignment, 1);
+    }
+
+    VkAccelerationStructureGeometryTrianglesDataKHR tri{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR};
+    tri.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    tri.vertexData.deviceAddress = BufferAddress(slot.vertices);
+    tri.vertexStride = 16;
+    tri.maxVertex = slot.used - 1;
+    tri.indexType = VK_INDEX_TYPE_UINT32;
+    tri.indexData.deviceAddress = BufferAddress(slot.indices);
+    VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    geometry.geometry.triangles = tri;
+
+    const uint32_t primitive_count = uint32_t(slot.triangles.size() / 3);
+    VkAccelerationStructureBuildGeometryInfoKHR blas_info{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    blas_info.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    blas_info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    blas_info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    blas_info.geometryCount = 1;
+    blas_info.pGeometries = &geometry;
+    VkAccelerationStructureBuildSizesInfoKHR blas_sizes{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &blas_info,
+                                            &primitive_count, &blas_sizes);
+
+    auto ensure_as = [&](VkAccelerationStructureKHR& as, Buffer& storage, VkDeviceSize& capacity, VkDeviceSize need,
+                         VkAccelerationStructureTypeKHR type) {
+        if (as && capacity >= need) return true;
+        if (as) vkDestroyAccelerationStructureKHR(dev_, as, nullptr);
+        as = VK_NULL_HANDLE;
+        DropBuffer(storage);
+        if (!MakeBuffer(storage, need, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                        false))
+            return false;
+        VkAccelerationStructureCreateInfoKHR ci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+        ci.buffer = storage.buf;
+        ci.size = need;
+        ci.type = type;
+        if (vkCreateAccelerationStructureKHR(dev_, &ci, nullptr, &as) != VK_SUCCESS) return false;
+        capacity = need;
+        return true;
+    };
+    if (slot.blas && slot.blas_primitives < primitive_count) slot.blas_size = 0;
+    if (!ensure_as(slot.blas, slot.blas_store, slot.blas_size, blas_sizes.accelerationStructureSize,
+                   VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR))
+        return false;
+    slot.blas_primitives = std::max(slot.blas_primitives, primitive_count);
+
+    if (!slot.instance.buf && !MakeBuffer(slot.instance, sizeof(VkAccelerationStructureInstanceKHR), input_usage, true))
+        return false;
+    if (!slot.instance.mem.map) return false;
+    VkAccelerationStructureDeviceAddressInfoKHR blas_address_info{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+    blas_address_info.accelerationStructure = slot.blas;
+    VkAccelerationStructureInstanceKHR instance{};
+    instance.transform.matrix[0][0] = 1;
+    instance.transform.matrix[1][1] = 1;
+    instance.transform.matrix[2][2] = 1;
+    instance.mask = 0xFF;
+    instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    instance.accelerationStructureReference = vkGetAccelerationStructureDeviceAddressKHR(dev_, &blas_address_info);
+    if (!instance.accelerationStructureReference) return false;
+    std::memcpy(slot.instance.mem.map, &instance, sizeof(instance));
+
+    VkAccelerationStructureGeometryInstancesDataKHR instances{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR};
+    instances.arrayOfPointers = VK_FALSE;
+    instances.data.deviceAddress = BufferAddress(slot.instance);
+    VkAccelerationStructureGeometryKHR tlas_geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    tlas_geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlas_geometry.geometry.instances = instances;
+    VkAccelerationStructureBuildGeometryInfoKHR tlas_info{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    tlas_info.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tlas_info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    tlas_info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    tlas_info.geometryCount = 1;
+    tlas_info.pGeometries = &tlas_geometry;
+    const uint32_t instance_count = 1;
+    VkAccelerationStructureBuildSizesInfoKHR tlas_sizes{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tlas_info,
+                                            &instance_count, &tlas_sizes);
+    if (!ensure_as(slot.tlas, slot.tlas_store, slot.tlas_size, tlas_sizes.accelerationStructureSize,
+                   VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR))
+        return false;
+
+    const VkDeviceSize scratch_need = std::max(blas_sizes.buildScratchSize, tlas_sizes.buildScratchSize) +
+                                      rt_scratch_align_;
+    if (!slot.scratch.buf || slot.scratch_size < scratch_need) {
+        DropBuffer(slot.scratch);
+        if (!MakeBuffer(slot.scratch, scratch_need, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                        false))
+            return false;
+        slot.scratch_size = scratch_need;
+    }
+    VkDeviceAddress scratch = BufferAddress(slot.scratch);
+    scratch = (scratch + rt_scratch_align_ - 1) & ~(rt_scratch_align_ - 1);
+    if (!scratch) return false;
+
+    End();
+    Barrier();
+    blas_info.dstAccelerationStructure = slot.blas;
+    blas_info.scratchData.deviceAddress = scratch;
+    VkAccelerationStructureBuildRangeInfoKHR blas_range{primitive_count, 0, 0, 0};
+    const VkAccelerationStructureBuildRangeInfoKHR* blas_ranges = &blas_range;
+    vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &blas_info, &blas_ranges);
+    Barrier();
+
+    tlas_info.dstAccelerationStructure = slot.tlas;
+    tlas_info.scratchData.deviceAddress = scratch;
+    VkAccelerationStructureBuildRangeInfoKHR tlas_range{1, 0, 0, 0};
+    const VkAccelerationStructureBuildRangeInfoKHR* tlas_ranges = &tlas_range;
+    vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &tlas_info, &tlas_ranges);
+    Barrier();
+    slot.built = true;
+    return true;
 }
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     PerfScope ps{perf_draw_};
@@ -3591,6 +3758,7 @@ void VulkanBackend::Present(const Surface& front) {
     if (acquired && t && app::Get().smaa) frame_source = SmaaFrame(*t);
     if (acquired) {
         End();
+        BuildRtStructures();
         VkCommandBuffer cb = Cmd();
         if (dirty_) Barrier();
         VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
