@@ -303,15 +303,15 @@ public:
     }
     // linear: a buffer (kept out of image blocks, so bufferImageGranularity never matters)
     bool Alloc(const VkMemoryRequirements& r, VkMemoryPropertyFlags want, VkMemoryPropertyFlags prefer, bool linear,
-               Mem& out) {
+               Mem& out, bool device_address = false) {
         int type = Type(r.memoryTypeBits, want | prefer);
         if (type < 0) type = Type(r.memoryTypeBits, want);
         if (type < 0) return false;
         bool host = (props_.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
-        if (r.size > kBlockSize / 4) return Dedicated(r.size, uint32_t(type), host, out);
+        if (r.size > kBlockSize / 4) return Dedicated(r.size, uint32_t(type), host, out, device_address);
         for (size_t b = 0; b < blocks_.size(); b++) {
             Block& bl = blocks_[b];
-            if (bl.type != uint32_t(type) || bl.linear != linear) continue;
+            if (bl.type != uint32_t(type) || bl.linear != linear || bl.addressable != device_address) continue;
             if (Carve(bl, r.size, r.alignment, out)) {
                 out.block = int(b);
                 return true;
@@ -320,8 +320,13 @@ public:
         Block bl;
         bl.type = uint32_t(type);
         bl.linear = linear;
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, kBlockSize, uint32_t(type)};
-        if (vkAllocateMemory(dev_, &ai, nullptr, &bl.mem) != VK_SUCCESS) return Dedicated(r.size, uint32_t(type), host, out);
+        bl.addressable = device_address;
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, device_address ? &flags : nullptr,
+                                kBlockSize, uint32_t(type)};
+        if (vkAllocateMemory(dev_, &ai, nullptr, &bl.mem) != VK_SUCCESS)
+            return Dedicated(r.size, uint32_t(type), host, out, device_address);
         if (host) vkMapMemory(dev_, bl.mem, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&bl.map));
         bl.free[0] = kBlockSize;
         blocks_.push_back(std::move(bl));
@@ -358,6 +363,7 @@ private:
         uint8_t* map = nullptr;
         uint32_t type = 0;
         bool linear = false;
+        bool addressable = false;
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset to size
     };
     int Type(uint32_t bits, VkMemoryPropertyFlags want) const {
@@ -365,8 +371,10 @@ private:
             if ((bits >> i & 1) && (props_.memoryTypes[i].propertyFlags & want) == want) return int(i);
         return -1;
     }
-    bool Dedicated(VkDeviceSize size, uint32_t type, bool host, Mem& out) {
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, size, type};
+    bool Dedicated(VkDeviceSize size, uint32_t type, bool host, Mem& out, bool device_address) {
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, device_address ? &flags : nullptr, size, type};
         if (vkAllocateMemory(dev_, &ai, nullptr, &out.mem) != VK_SUCCESS) return false;
         out.off = 0;
         out.size = size;
@@ -1701,7 +1709,8 @@ bool VulkanBackend::MakeBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags 
     VkMemoryPropertyFlags prefer = host ? (usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT
                                                                                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
                                         : 0;
-    if (!alloc_.Alloc(req, want, prefer, true, b.mem) ||
+    const bool device_address = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
+    if (!alloc_.Alloc(req, want, prefer, true, b.mem, device_address) ||
         vkBindBufferMemory(dev_, b.buf, b.mem.mem, b.mem.off) != VK_SUCCESS) {
         vkDestroyBuffer(dev_, b.buf, nullptr);
         b.buf = VK_NULL_HANDLE;
