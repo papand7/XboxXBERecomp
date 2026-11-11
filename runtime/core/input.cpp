@@ -37,10 +37,12 @@ namespace {
 std::atomic<bool> g_tool_keys{false};
 }  // namespace
 void HoldBackToolKeys(bool on) { g_tool_keys = on; }
-// a key the game's tool has while it is on (HoldBackToolKeys): the arrows, Enter, Delete, Home, End, comma and full stop
+// a key the game's tool has while it is on (HoldBackToolKeys): the arrows, Enter, Delete, Home, End, comma, full stop,
+// the brackets, semicolon and quote, minus and equals
 static bool ToolKey(uint16_t k) {
     return g_tool_keys.load() && (k == 0x25 || k == 0x26 || k == 0x27 || k == 0x28 || k == 0x0D || k == 0x2E || k == 0x24 || k == 0x23 ||
-                                       k == 0xBC || k == 0xBE);
+                                       k == 0xBC || k == 0xBE || k == 0xDB || k == 0xDD || k == 0xBA || k == 0xDE ||
+                                       k == 0xBD || k == 0xBB);
 }
 
 namespace {
