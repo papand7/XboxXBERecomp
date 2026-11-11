@@ -3908,6 +3908,16 @@ private:
         VkViewport vp{};
         VkRect2D sc{};
         bool vp_ok = false;
+        // the descriptors last pushed (PushDescriptors): a draw with the same ones pushes none (a third of the scene's
+        // draws repeat the draw before's textures and constants)
+        struct Pushed {
+            VkBuffer vb, db;
+            VkDeviceSize vo, dof;
+            VkImageView view[4];
+            VkSampler smp[4];
+            uint64_t capture;  // all 8 bytes: no padding for the memcmp
+        } pushed{};
+        bool pushed_ok = false;
     } ds_;
     void ForgetDrawState() { ds_ = {}; }
 
@@ -4317,6 +4327,32 @@ private:
         double& acc;
         std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~PerfScope() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+    };
+    // XBE_PERF: a draw's CPU time by step (assembly, vertex shader, textures, pipeline, constants and samplers, state and
+    // descriptors, geometry)
+    static constexpr int kLaps = 7;
+    double perf_lap_[kLaps] = {};
+    // XBE_PERF: draws whose pipeline, textures, samplers and both constant buffers are the draw before's (could be one
+    // draw with it), and of those the ones whose vertex layout matches too
+    uint64_t perf_same_ = 0, perf_same_vb_ = 0, perf_pushes_skipped_ = 0;
+    struct LastDraw {
+        VkPipeline p;
+        VkImageView view[4];
+        VkSampler smp[4];
+        uint64_t vsc, dc;
+        uint32_t stride, topo;
+    } perf_last_{};
+    struct Laps {
+        double* acc;
+        bool on = diag::Perf();
+        int at = 0;
+        std::chrono::steady_clock::time_point t = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        void Lap(int i) {
+            if (!on) return;
+            const auto now = std::chrono::steady_clock::now();
+            acc[i] += std::chrono::duration<double, std::milli>(now - t).count();
+            t = now;
+        }
     };
     uint64_t perf_frames_ = 0, perf_submits_ = 0, perf_draws_ = 0;
     uint64_t perf_bytes_ = 0, perf_indexed_ = 0, perf_uniq_bytes_ = 0;  // streamed vertex/index bytes, indexed draws
@@ -6813,7 +6849,14 @@ void VulkanBackend::PushDescriptors(const Stretch& vsc, const Stretch& dc, const
     if (rt_capturing_)
         w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindCapture, 0, 1,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cap, nullptr};
+    DrawStateCache::Pushed now{vsc.buf, dc.buf, vsc.off, dc.off, {}, {}, rt_capturing_ ? 1ull : 0ull};
+    for (uint32_t i = 0; i < 4; i++) now.view[i] = ii[i].imageView, now.smp[i] = smp[i];
+    if (ds_.pushed_ok && !std::memcmp(&now, &ds_.pushed, sizeof(now))) {
+        perf_pushes_skipped_++;
+        return;
+    }
     vkCmdPushDescriptorSetKHR(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, n, w);
+    ds_.pushed = now, ds_.pushed_ok = true;
 }
 
 void VulkanBackend::DrawGeometry(const Assembled& a) {
@@ -7135,6 +7178,7 @@ bool VulkanBackend::Displace(const State& s, const DrawShaders& sh, uint32_t pri
 
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     PerfScope ps{perf_draw_};
+    Laps laps{perf_lap_};
     // the game's own snow (NightFire: draws of 4096 point sprites, its texture on stage 3, a vertex program, drawn
     // where it snows): left out under the weather's, which it tells where to fall
     if (WeatherWanted() && prim == 1 && count == 4096 && s.rs[kRsPointSpriteEnable] && !s.ps) {
@@ -7154,6 +7198,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     Assembled& a = asm_;
     if (!Assemble(s, prim, start, count, indices, a)) return;
     if (!BindTargets(s)) return;
+    laps.Lap(0);
 
     // vertex shader
     DrawShaders sh = ClassifyShaders(s, a, count);
@@ -7167,6 +7212,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     draw_2d_ = a.pretransformed || ScreenDraw(s);
     stage_seen_ = false;
     stage_movie_ = false;
+    laps.Lap(1);
     // the sky keeps the game's own pictures: a pack's are upscaled each apart, so a sky box's faces no longer meet
     // (a thin line at each edge of The Exchange's moon box)
     draw_seq_++;
@@ -7184,6 +7230,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (!BindTargets(s)) return;
     UpscaleTargets(s);
     if (!bound_rt_ && !bound_ds_) return;
+    laps.Lap(2);
     // the pixel shader made for the textures
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
@@ -7247,6 +7294,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         rt_capturing_ = false;
         return;
     }
+    laps.Lap(3);
 
     // constants
     GuestExtent size;
@@ -7426,6 +7474,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         smp[i] = Sampler(sd);
     }
     if (mat_slot >= 0) smp[mat_slot] = smp[0];  // the material repeats and filters as the picture it goes with
+    laps.Lap(4);
 
     // the rendering instance, then everything recorded inside it
     Begin(TargetAttachments(bound_rt_, bound_ds_));
@@ -7501,12 +7550,23 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     uint32_t q = 0;
     bool counting = s.simple[kMCountEnable >> 2] && queries_ && NewQuery(q);
     if (counting) vkCmdBeginQuery(cb, queries_, q, 0);
+    if (laps.on) {
+        LastDraw now{p, {}, {}, uint64_t(reinterpret_cast<uintptr_t>(last_vsc_.p)), uint64_t(reinterpret_cast<uintptr_t>(last_dc_.p)),
+                     a.buffer_count ? a.buffers[0].stride : 0, uint32_t(a.topology)};
+        for (int i = 0; i < 4; i++) now.view[i] = stages.view[i], now.smp[i] = smp[i];
+        const bool same = now.p == perf_last_.p && now.vsc == perf_last_.vsc && now.dc == perf_last_.dc &&
+                          !std::memcmp(now.view, perf_last_.view, sizeof(now.view)) && !std::memcmp(now.smp, perf_last_.smp, sizeof(now.smp));
+        perf_same_ += same, perf_same_vb_ += same && now.stride == perf_last_.stride && now.topo == perf_last_.topo;
+        perf_last_ = now;
+    }
+    laps.Lap(5);
     DrawGeometry(a);
+    laps.Lap(6);
     perf_draws_++;
     perf_bytes_ += a.index_count ? a.index_count * (a.index16 ? 2u : 4u) : 0;
     for (uint32_t i = 0; i < a.buffer_count; i++) perf_bytes_ += a.buffers[i].bytes;
     perf_indexed_ += a.index_count ? 1 : 0;
-    if (a.buffer_count) {
+    if (a.buffer_count && laps.on) {  // (only when logged: the set is emptied by LogPerf alone)
         const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(a.buffers[0].src)) ^ (uint64_t(a.buffers[0].bytes) << 40) ^ (uint64_t(a.index_count) << 52);
         if (perf_seen_.insert(key).second) perf_uniq_bytes_ += a.buffers[0].bytes, perf_frame_uniq_ += a.buffers[0].bytes, perf_uniq_count_++;
     }
@@ -11242,6 +11302,13 @@ void VulkanBackend::LogPerf() {
          perf_bytes_ / n / 1024.0, perf_indexed_ / n, perf_uniq_bytes_ / n / 1024.0, size_t(perf_uniq_count_ / n));
     LOGR("perf: vulkan draws a frame: %.0f 2D, %.0f vertex programs, %.0f fixed function (%.0f lit)",
          perf_2d_ / n, perf_prog_ / n, perf_fixed_ / n, perf_lit_ / n);
+    LOGR("perf: vulkan draw steps a frame (ms): assemble %.2f, vertex shader %.2f, textures %.2f, pipeline %.2f, constants "
+         "%.2f, state %.2f, geometry %.2f", perf_lap_[0] / n, perf_lap_[1] / n, perf_lap_[2] / n, perf_lap_[3] / n,
+         perf_lap_[4] / n, perf_lap_[5] / n, perf_lap_[6] / n);
+    LOGR("perf: vulkan draws a frame the same as the one before (pipeline, textures, constants): %.0f, with the same "
+         "vertex layout %.0f; descriptor pushes left out %.0f", perf_same_ / n, perf_same_vb_ / n, perf_pushes_skipped_ / n);
+    for (double& d : perf_lap_) d = 0;
+    perf_same_ = perf_same_vb_ = perf_pushes_skipped_ = 0;
     LOGR("perf: vulkan soft particles a frame: %.1f, material draws %.1f, glowing draws %.1f", perf_soft_ / n,
          perf_mat_ / n, perf_glow_ / n);
     LOGR("perf: vulkan ground detail a frame: %.1f tagged, %.1f not opaque, %.1f no free stage, %.1f drawn",
