@@ -669,7 +669,6 @@ int PadPressedControl() {
 namespace input {
 void WheelInit(void*) {}
 void WheelSetup() {}
-namespace {
 bool WheelRead(float*, bool* steers) {
     if (steers) *steers = false;
     return false;
