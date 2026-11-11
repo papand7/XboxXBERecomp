@@ -9548,6 +9548,27 @@ void VulkanBackend::ScenePass(Target& rt, Target* ds) {
                      blood_.end());
         if (blood_.size() > 64) blood_.erase(blood_.begin(), blood_.begin() + (blood_.size() - 64));
     }
+    // XBE_CAM_TRACE=1 (diagnostic): twice a second, the level camera the picture is drawn from (the drawn world's largest),
+    // its eye and the way it faces, to set beside the game's own camera (the shots start there and go that way)
+    if (static const bool cam_trace = std::getenv("XBE_CAM_TRACE") != nullptr; cam_trace && presents_ % 30 == 0 && !rt_cams_.empty()) {
+        const RtCam* big = nullptr;
+        for (const auto& [h2, c2] : rt_cams_)
+            if (!big || c2.tris > big->tris) big = &c2;
+        const float a0 = big->r[0][0], b0 = big->r[0][1], c0 = big->r[0][2], d0 = big->r[1][0], e0 = big->r[1][1], f0 = big->r[1][2],
+                    j0 = big->r[2][0], h0 = big->r[2][1], k0 = big->r[2][2];
+        const float det0 = a0 * (e0*k0-f0*h0) - b0 * (d0*k0-f0*j0) + c0 * (d0*h0-e0*j0);
+        if (std::abs(det0) > 1e-12f) {
+            const float inv0[3][3] = {{(e0*k0-f0*h0)/det0, (c0*h0-b0*k0)/det0, (b0*f0-c0*e0)/det0},
+                                      {(f0*j0-d0*k0)/det0, (a0*k0-c0*j0)/det0, (c0*d0-a0*f0)/det0},
+                                      {(d0*h0-e0*j0)/det0, (b0*j0-a0*h0)/det0, (a0*e0-b0*d0)/det0}};
+            float eye[3];
+            for (int r2 = 0; r2 < 3; r2++)
+                eye[r2] = -(inv0[r2][0] * big->r[0][3] + inv0[r2][1] * big->r[1][3] + inv0[r2][2] * big->r[2][3]);
+            const float unit0 = std::sqrt(j0*j0 + h0*h0 + k0*k0);
+            LOGR("camera trace: drawn from eye %.3f %.3f %.3f, facing %.4f %.4f %.4f (%zu cameras)", eye[0], eye[1], eye[2],
+                 j0 / unit0, h0 / unit0, k0 / unit0, rt_cams_.size());
+        }
+    }
     if (BloodWanted() && scene_wbuf_ && one_view && !rt_cams_.empty()) BloodPass(rt, ds), timed(24);
     if (WeatherWanted()) WeatherPass(rt, ds), timed(7);
     if (ParticlesWanted()) ParticlePass(rt, ds), timed(23);
