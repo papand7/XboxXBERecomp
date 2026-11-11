@@ -699,6 +699,7 @@ private:
                    uint32_t layers, VkImageUsageFlags usage, bool cube = false);
     void DropImage(Image& im);
     bool MakeBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage, bool host);
+    VkDeviceAddress BufferAddress(const Buffer& b) const;
     void DropBuffer(Buffer& b);
     Stretch Stream(VkDeviceSize bytes, VkDeviceSize align = 16);
     VkSampler Sampler(const D3D12_SAMPLER_DESC& d);
@@ -1718,7 +1719,19 @@ bool VulkanBackend::MakeBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags 
         return false;
     }
     b.size = size;
+    if (device_address && !BufferAddress(b)) {
+        vkDestroyBuffer(dev_, b.buf, nullptr);
+        alloc_.Free(b.mem);
+        b = Buffer{};
+        return false;
+    }
     return true;
+}
+
+VkDeviceAddress VulkanBackend::BufferAddress(const Buffer& b) const {
+    if (!rt_ok_ || !vkGetBufferDeviceAddress || !b.buf) return 0;
+    VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, b.buf};
+    return vkGetBufferDeviceAddress(dev_, &ai);
 }
 
 void VulkanBackend::DropBuffer(Buffer& b) {
