@@ -467,12 +467,6 @@ void Graphics(Settings& s) {
     if (RowCheck("Low latency", &s.low_latency, "Applies at the next start. Holds one finished frame instead of several: less input lag, but a slow frame costs more.")) Save();
     if (RowCheck("Show frames a second", &s.show_fps)) Save();
     if (kGame.sharpen_2d && RowCheck("Sharp text and HUD", &s.sharp_2d)) Save();
-    int renderer = int(s.renderer % 2);
-    const char* renderers[] = {"Direct3D 12", "Direct3D 11"};
-    if (RowChoice("Renderer", &renderer, renderers, 2, "Applies at the next start; Direct3D 11 for GPUs or drivers where 12 runs badly.")) {
-        s.renderer = uint32_t(renderer);
-        Save();
-    }
 }
 
 void General(Settings& s) {

@@ -1,7 +1,7 @@
 // The title's Direct3D 8 calls drawn with Vulkan 1.3 (renderer = "vulkan" in the settings file). The console path of
 // d3d11.cpp on Vulkan, with what does not depend on the API shared through d3d_common (its D3D12 enums translated
 // here). The shaders are d3d_common's and shaders.cpp's HLSL, compiled to SPIR-V by DXC (dxcompiler.dll beside the
-// exe). Vulkan is loaded at run time (vulkan-1.dll): without it Init fails and the fallback renderer takes over.
+// exe). Vulkan is loaded at run time (vulkan-1.dll): without it Init fails and the game closes cleanly.
 //
 // Synchronisation is kept simple and correct before fast: every image lives in VK_IMAGE_LAYOUT_GENERAL, one dynamic
 // rendering instance is open at a time, and each end of one and each transfer is followed by a full memory barrier.
@@ -13,7 +13,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <d3dcompiler.h>
 #include <wrl/client.h>
 
 #define VK_NO_PROTOTYPES
@@ -2085,7 +2084,8 @@ VkShaderModule VulkanBackend::Compile(const std::string& source, const char* ent
         std::memcpy(code.data(), obj->GetBufferPointer(), code.size() * 4);
         g_shaders_compiled.fetch_add(1, std::memory_order_relaxed);
         ComPtr<ID3DBlob> keep;
-        if (SUCCEEDED(D3DCreateBlob(code.size() * 4, &keep))) {
+        keep.Attach(NewShaderBlob(code.size() * 4));
+        if (keep.Get()) {
             std::memcpy(keep->GetBufferPointer(), code.data(), code.size() * 4);
             KeepShader(hash, keep.Get());
         }
@@ -3326,5 +3326,7 @@ void VulkanBackend::RescaleTargets() {
 }  // namespace
 
 std::unique_ptr<Backend> CreateVulkanBackend() { return std::make_unique<VulkanBackend>(); }
+
+std::unique_ptr<Backend> CreateBackend() { return CreateVulkanBackend(); }
 
 }  // namespace gpu

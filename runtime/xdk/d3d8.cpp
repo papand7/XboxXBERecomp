@@ -584,17 +584,11 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
 
     if (!g_backend) {
         g_backend = gpu::CreateBackend();
-        if (!g_backend->Init(w, h)) {
-            // the failed one goes first: it may hold the window's swap chain
+        if (!g_backend || !g_backend->Init(w, h)) {
+            LOGE("d3d: Vulkan renderer init failed");
             g_backend.reset();
-            g_backend = gpu::CreateFallbackBackend();
-            if (g_backend && g_backend->Init(w, h)) {
-                LOGR("d3d: the chosen renderer could not start, running on the fallback (%s)",
-                     app::Get().renderer == 2 ? "Direct3D 12" : "Direct3D 11");
-            } else {
-                LOGE("d3d: renderer init failed");
-                if (!g_backend) g_backend = gpu::CreateBackend();
-            }
+            app::Quit();
+            return 0;
         }
         if (RenderThread()) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
         if (app::kGame.step_interpolation) g_backend = gpu::CreateInterpolating(std::move(g_backend));

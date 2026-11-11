@@ -32,8 +32,8 @@ const char* kAspects[] = {"auto", "4:3", "16:9", "screen"};
 constexpr uint32_t kAspectCount = 4;
 const char* kMsaa[] = {"off", "msaa2", "msaa4", "msaa8"};
 constexpr uint32_t kMsaaCount = 4;
-const char* kRenderers[] = {"d3d12", "d3d11", "vulkan"};
-constexpr uint32_t kRendererCount = 3;
+const char* kRenderers[] = {"vulkan"};
+constexpr uint32_t kRendererCount = 1;
 
 // the displays in Windows' order
 std::vector<HMONITOR> MonitorList() {

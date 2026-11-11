@@ -1,8 +1,8 @@
-// What the Direct3D 12 and Direct3D 11 renderers share (d3d_common.h)
+// Xbox render-state conversion and shader/pipeline cache helpers.
 #include "gpu/d3d_common.h"
 
-#include <d3dcompiler.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +11,8 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <new>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -20,6 +22,32 @@
 #include "kernel/kernel.h"
 
 namespace gpu {
+
+namespace {
+class ShaderBlob final : public ID3DBlob {
+public:
+    explicit ShaderBlob(std::size_t bytes) : bytes_(bytes) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown) && iid != __uuidof(ID3DBlob)) return E_NOINTERFACE;
+        *out = static_cast<ID3DBlob*>(this);
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return refs_.fetch_add(1, std::memory_order_relaxed) + 1; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG refs = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (!refs) delete this;
+        return refs;
+    }
+    LPVOID STDMETHODCALLTYPE GetBufferPointer() override { return bytes_.data(); }
+    SIZE_T STDMETHODCALLTYPE GetBufferSize() override { return bytes_.size(); }
+private:
+    std::atomic<ULONG> refs_{1};
+    std::vector<uint8_t> bytes_;
+};
+}  // namespace
 
 // ---- the shader cache: "XBESHC1" and a zero byte, then records of hash (8 bytes), size (4) and the blob
 namespace {
@@ -71,13 +99,18 @@ void LoadShaderCache(ShaderCache& c) {
 }
 }  // namespace
 
+ID3DBlob* NewShaderBlob(std::size_t bytes) {
+    try { return new ShaderBlob(bytes); } catch (...) { return nullptr; }
+}
+
 bool CachedShader(uint64_t hash, ID3DBlob** out) {
     ShaderCache& c = Shaders();
     std::lock_guard lock(c.m);
     if (!c.loaded) LoadShaderCache(c);
     auto it = c.blobs.find(hash);
     if (it == c.blobs.end() || it->second.empty()) return false;
-    if (FAILED(D3DCreateBlob(it->second.size(), out))) return false;
+    *out = NewShaderBlob(it->second.size());
+    if (!*out) return false;
     std::memcpy((*out)->GetBufferPointer(), it->second.data(), it->second.size());
     return true;
 }
