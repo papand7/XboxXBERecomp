@@ -54,6 +54,8 @@ struct Settings {
     uint32_t monitor = 0;            // 0 the primary display, n the nth display Windows lists
     bool pause_unfocused = false;    // the game stands still, silent, while its window is not in front
     bool show_fps = false;           // frames a second in a corner
+    // aim-down-sights tuning, millimetres (settings.toml): + x moves the gun left, + y up
+    int aim_sight_x_mm = 0, aim_sight_y_mm = 0;
     bool damage_numbers = false;     // the damage a hit did, a number floating up from the mark
     uint32_t hit_feedback = 2;       // a player's shot hitting (HitMarker): 0 nothing, 1 a mark, 2 a mark and a tick
     bool sharp_2d = true;            // GameInfo::sharpen_2d: the HUD's, menus' and text's pictures enlarged sharp
