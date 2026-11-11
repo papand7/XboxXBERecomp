@@ -514,9 +514,17 @@ Mode Desktop() {
     mi.cbSize = sizeof(mi);
     DEVMODEW dm{};
     dm.dmSize = sizeof(dm);
-    if (GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &dm))
+    // the registry's mode, else the current one, else the monitor's size: over Remote Desktop the registry's reads
+    // 0 x 0 (a window of no size, and Vulkan with no surface to draw on)
+    const bool info = GetMonitorInfoW(mon, &mi) != 0;
+    if (info && EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &dm) && dm.dmPelsWidth && dm.dmPelsHeight)
         return {dm.dmPelsWidth, dm.dmPelsHeight};
-    return {uint32_t(GetSystemMetrics(SM_CXSCREEN)), uint32_t(GetSystemMetrics(SM_CYSCREEN))};
+    if (info && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth && dm.dmPelsHeight)
+        return {dm.dmPelsWidth, dm.dmPelsHeight};
+    if (info && mi.rcMonitor.right > mi.rcMonitor.left && mi.rcMonitor.bottom > mi.rcMonitor.top)
+        return {uint32_t(mi.rcMonitor.right - mi.rcMonitor.left), uint32_t(mi.rcMonitor.bottom - mi.rcMonitor.top)};
+    const int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+    return w > 0 && h > 0 ? Mode{uint32_t(w), uint32_t(h)} : Mode{1920, 1080};
 }
 #endif
 
