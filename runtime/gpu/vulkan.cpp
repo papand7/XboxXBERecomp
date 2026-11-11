@@ -714,7 +714,8 @@ private:
     // Present's steps
     bool Acquire(uint32_t& index);
     void UploadGammaRamp();
-    void BlitFrame(Target& t, VkImageView view, VkImageView source);
+    void BlitFrame(Target& t, VkImageView view, VkImageView source, VkImageView bloom);
+    VkImageView Bloom(Target& t, VkImageView source);
     VkImageView AmbientOcclusion(Target& t, VkImageView source, VkImageView depth);
     VkImageView DepthOfField(Target& t, VkImageView source, VkImageView depth);
     VkImageView MotionBlur(Target& t, VkImageView source, VkImageView depth);
@@ -755,7 +756,7 @@ private:
                     uint32_t cb_floats, const VkImageView* views, uint32_t n_views,
                     VkAccelerationStructureKHR tlas = VK_NULL_HANDLE);
     void Blit(VkImageView src, const Attachments& a, const VkViewport& vp, const VkRect2D& sc, const float uvrect[4],
-              const BlitOptions& o, VkFormat fmt = kBgra);
+              const BlitOptions& o, VkFormat fmt = kBgra, VkImageView bloom = VK_NULL_HANDLE);
     void BlitWhole(VkImageView src, const Image& dst, const BlitOptions& o);
     bool DepthCopy(const State& s);
     void ClearRects(Target& t, const std::vector<VkRect2D>& rs, uint32_t flags, const float colour[4], float z,
@@ -870,6 +871,7 @@ private:
     uint32_t dof_w_ = 0, dof_h_ = 0;
     Image motion_scene_;
     uint32_t motion_w_ = 0, motion_h_ = 0;
+    Image bloom_down_[5], bloom_up_[4];
     float camera_view_[16]{}, camera_projection_[16]{}, previous_view_[16]{}, previous_projection_[16]{};
     uint64_t camera_frame_ = 0, previous_camera_frame_ = 0;
     std::vector<Chunk> chunks_;  // stream chunks: [0] is being filled
@@ -1465,6 +1467,8 @@ VulkanBackend::~VulkanBackend() {
     DropImage(ao_scene_);
     DropImage(dof_scene_);
     DropImage(motion_scene_);
+    for (Image& im : bloom_down_) DropImage(im);
+    for (Image& im : bloom_up_) DropImage(im);
     for (auto& [k, m] : movie_up_) DropImage(m.up), DropImage(m.out);
     movie_up_.clear();
     DropImage(lut_);
@@ -2367,7 +2371,7 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
 
 // src over the viewport and scissor given
 void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport& vp, const VkRect2D& sc,
-                         const float uvrect[4], const BlitOptions& o, VkFormat fmt) {
+                         const float uvrect[4], const BlitOptions& o, VkFormat fmt, VkImageView bloom_view) {
     uint64_t vh, ph;
     const app::Settings& st = app::Get();
     const bool fxaa = st.fxaa && !st.smaa;
@@ -2389,6 +2393,7 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
                               ((bloom & 63u) << 5) | ((vignette & 63u) << 11) | ((grain & 63u) << 17);
         if (o.depth) mode |= 1u << 23;
         c[5] = float(mode);
+        c[4] = float((o.gamma ? 1u : 0u) | (bloom_view ? 2u : 0u));
         const uint32_t sharp = std::min<uint32_t>(st.sharpen, 100) / 5;
         const uint32_t contrast = (std::clamp<uint32_t>(st.contrast, 50, 150) - 50) / 5;
         const uint32_t saturation = std::min<uint32_t>(st.saturation, 200) / 5;
@@ -2398,7 +2403,7 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
         c[7] = float(std::clamp<uint32_t>(st.exposure, 50, 150)) + float(uint32_t(presents_ & 255u)) / 256.0f;
     }
     VkPipeline p = PassPipeline({vh, ph, fmt, VK_FORMAT_UNDEFINED, o.over ? 1u : 0u, 0});
-    VkImageView views[4] = {src, lut_.view, VK_NULL_HANDLE, o.depth};
+    VkImageView views[4] = {src, lut_.view, bloom_view, o.depth};
     FullScreen(p, a, vp, sc, c, 8, views, 4);
 }
 
@@ -4094,7 +4099,7 @@ void VulkanBackend::UploadGammaRamp() {
 }
 
 // the frame at its shape (16:9 or 4:3, ultrawide the screen's), centred on black
-void VulkanBackend::BlitFrame(Target& t, VkImageView view, VkImageView source) {
+void VulkanBackend::BlitFrame(Target& t, VkImageView view, VkImageView source, VkImageView bloom) {
     float aspect = app::FrameAspect();
     float w = float(bb_w_), h = float(bb_h_);
     float vw = std::min(w, h * aspect);
@@ -4109,7 +4114,97 @@ void VulkanBackend::BlitFrame(Target& t, VkImageView view, VkImageView source) {
     // the swap chain image's rendering instance is already open (Present)
     open_ = true;
     cur_ = {view, VK_NULL_HANDLE, bb_w_, bb_h_};
-    Blit(source, cur_, vp, sc, uv, {.gamma = gamma_, .final = true, .depth = depth}, swap_fmt_);
+    Blit(source, cur_, vp, sc, uv, {.gamma = gamma_, .final = true, .depth = depth}, swap_fmt_, bloom);
+}
+
+// Five thresholded downsample levels and a tent-filtered upsample make the existing SDR glow broad and multi-scale.
+// This deliberately uses the 8-bit game frame; it is not Nightfire's HDR bloom, which starts from a float scene.
+VkImageView VulkanBackend::Bloom(Target& t, VkImageView source) {
+    if (!source || !app::Get().bloom) return VK_NULL_HANDLE;
+    static const std::string hlsl = R"(
+cbuffer P : register(b1) { float4 p[2]; };
+Texture2D src : register(t0);
+Texture2D own : register(t1);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o; float2 q = float2((id << 1) & 2, id & 2);
+    o.pos = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = q; return o;
+}
+float lum(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float4 down0(O i) : SV_Target {
+    float2 d = p[0].xy * 0.5;
+    float3 c = src.SampleLevel(pt, i.uv + d * float2(-1, -1), 0).rgb;
+    c += src.SampleLevel(pt, i.uv + d * float2(1, -1), 0).rgb;
+    c += src.SampleLevel(pt, i.uv + d * float2(-1, 1), 0).rgb;
+    c += src.SampleLevel(pt, i.uv + d * float2(1, 1), 0).rgb;
+    c *= 0.25;
+    return float4(c * smoothstep(0.70, 0.92, lum(c)), 1);
+}
+float4 down(O i) : SV_Target {
+    float2 d = p[0].xy * 0.5;
+    float3 c = src.SampleLevel(ls, i.uv + d * float2(-1, -1), 0).rgb;
+    c += src.SampleLevel(ls, i.uv + d * float2(1, -1), 0).rgb;
+    c += src.SampleLevel(ls, i.uv + d * float2(-1, 1), 0).rgb;
+    c += src.SampleLevel(ls, i.uv + d * float2(1, 1), 0).rgb;
+    return float4(c * 0.25, 1);
+}
+float4 up(O i) : SV_Target {
+    float2 d = p[0].xy;
+    float3 c = src.SampleLevel(ls, i.uv, 0).rgb * 4;
+    c += (src.SampleLevel(ls, i.uv + float2(d.x, 0), 0).rgb +
+          src.SampleLevel(ls, i.uv - float2(d.x, 0), 0).rgb +
+          src.SampleLevel(ls, i.uv + float2(0, d.y), 0).rgb +
+          src.SampleLevel(ls, i.uv - float2(0, d.y), 0).rgb) * 2;
+    c += src.SampleLevel(ls, i.uv + d, 0).rgb + src.SampleLevel(ls, i.uv - d, 0).rgb +
+         src.SampleLevel(ls, i.uv + d * float2(1, -1), 0).rgb +
+         src.SampleLevel(ls, i.uv + d * float2(-1, 1), 0).rgb;
+    c /= 16;
+    return float4(saturate(own.SampleLevel(pt, i.uv, 0).rgb * 0.55 + c * 0.45), 1);
+}
+)";
+    uint64_t vs_hash, down0_hash, down_hash, up_hash;
+    if (!Compile(hlsl, "vs", "vs_5_0", vs_hash) || !Compile(hlsl, "down0", "ps_5_0", down0_hash) ||
+        !Compile(hlsl, "down", "ps_5_0", down_hash) || !Compile(hlsl, "up", "ps_5_0", up_hash)) {
+        LOG_FIRST(1, "vulkan: bloom pyramid shaders did not compile; drawing without multilevel bloom");
+        return VK_NULL_HANDLE;
+    }
+    const uint32_t w[5] = {std::max(1u, t.w / 2), std::max(1u, t.w / 4), std::max(1u, t.w / 8),
+                           std::max(1u, t.w / 16), std::max(1u, t.w / 32)};
+    const uint32_t h[5] = {std::max(1u, t.h / 2), std::max(1u, t.h / 4), std::max(1u, t.h / 8),
+                           std::max(1u, t.h / 16), std::max(1u, t.h / 32)};
+    constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    for (int i = 0; i < 5; i++) {
+        if (bloom_down_[i].img && (bloom_down_[i].w != w[i] || bloom_down_[i].h != h[i])) DropImage(bloom_down_[i]);
+        if (!bloom_down_[i].img && !MakeImage(bloom_down_[i], VK_IMAGE_TYPE_2D, kBgra, w[i], h[i], 1, 1, 1, usage))
+            return VK_NULL_HANDLE;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (bloom_up_[i].img && (bloom_up_[i].w != w[i] || bloom_up_[i].h != h[i])) DropImage(bloom_up_[i]);
+        if (!bloom_up_[i].img && !MakeImage(bloom_up_[i], VK_IMAGE_TYPE_2D, kBgra, w[i], h[i], 1, 1, 1, usage))
+            return VK_NULL_HANDLE;
+    }
+    auto pass = [&](VkPipeline pipeline, Image& dst, VkImageView a, VkImageView b, uint32_t sw, uint32_t sh) {
+        float constants[8] = {1.0f / sw, 1.0f / sh, 0, 0, 0, 0, 0, 0};
+        VkViewport vp{0, 0, float(dst.w), float(dst.h), 0, 1};
+        VkRect2D sc{{0, 0}, {dst.w, dst.h}};
+        VkImageView views[2] = {a, b};
+        FullScreen(pipeline, {dst.att, VK_NULL_HANDLE, dst.w, dst.h}, vp, sc, constants, 8, views, 2);
+        End();
+        Barrier();
+    };
+    VkPipeline pdown0 = PassPipeline({vs_hash, down0_hash, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pdown = PassPipeline({vs_hash, down_hash, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pup = PassPipeline({vs_hash, up_hash, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pdown0 || !pdown || !pup) return VK_NULL_HANDLE;
+    pass(pdown0, bloom_down_[0], source, dummy_.view, t.w, t.h);
+    for (int i = 1; i < 5; i++) pass(pdown, bloom_down_[i], bloom_down_[i - 1].view, dummy_.view, w[i - 1], h[i - 1]);
+    for (int i = 3; i >= 0; i--) {
+        VkImageView low = i == 3 ? bloom_down_[4].view : bloom_up_[i + 1].view;
+        pass(pup, bloom_up_[i], low, bloom_down_[i].view, w[i + 1], h[i + 1]);
+    }
+    return bloom_up_[0].view;
 }
 
 void VulkanBackend::RenderUi() {
@@ -4202,6 +4297,7 @@ void VulkanBackend::Present(const Surface& front) {
         if (t && app::Get().motion_blur && scene_depth_frame_ == presents_ + 1 &&
             scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
             frame_source = MotionBlur(*t, frame_source, scene_depth_view_);
+        VkImageView bloom = t && app::Get().bloom ? Bloom(*t, frame_source) : VK_NULL_HANDLE;
         cb = Cmd();
         VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
         ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -4228,7 +4324,7 @@ void VulkanBackend::Present(const Surface& front) {
         ri.colorAttachmentCount = 1;
         ri.pColorAttachments = &color;
         vkCmdBeginRendering(cb, &ri);
-        if (t) BlitFrame(*t, swap_views_[index], frame_source);
+        if (t) BlitFrame(*t, swap_views_[index], frame_source, bloom);
         VkViewport vp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
         vkCmdSetViewport(cb, 0, 1, &vp);
         if (ui_) RenderUi();
