@@ -253,6 +253,7 @@ void Load() {
     s.pause_unfocused = t["pause_unfocused"].value_or(s.pause_unfocused);
     s.show_fps = t["show_fps"].value_or(s.show_fps);
     s.hit_feedback = std::min<uint32_t>(t["hit_feedback"].value_or(s.hit_feedback), 2);
+    s.damage_numbers = t["damage_numbers"].value_or(s.damage_numbers);
     s.sharp_2d = t["sharp_2d"].value_or(s.sharp_2d);
     s.menu_colors = std::min<uint32_t>(t["menu_colors"].value_or(s.menu_colors), 1);
     // only a language the title has (GameInfo::languages): the console's setting goes to the guest as it is
@@ -370,6 +371,7 @@ toml::table Table() {
                   {"pause_unfocused", s.pause_unfocused},
                   {"show_fps", s.show_fps},
                   {"hit_feedback", int64_t(s.hit_feedback)},
+                  {"damage_numbers", s.damage_numbers},
                   {"sharp_2d", s.sharp_2d},
                   {"menu_colors", int64_t(s.menu_colors)},
                   {"language", int64_t(s.language)},

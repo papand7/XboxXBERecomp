@@ -54,6 +54,7 @@ struct Settings {
     uint32_t monitor = 0;            // 0 the primary display, n the nth display Windows lists
     bool pause_unfocused = false;    // the game stands still, silent, while its window is not in front
     bool show_fps = false;           // frames a second in a corner
+    bool damage_numbers = false;     // the damage a hit did, a number floating up from the mark
     uint32_t hit_feedback = 2;       // a player's shot hitting (HitMarker): 0 nothing, 1 a mark, 2 a mark and a tick
     bool sharp_2d = true;            // GameInfo::sharpen_2d: the HUD's, menus' and text's pictures enlarged sharp
     uint32_t menu_colors = 0;        // the title's menus recoloured (its own texture_bound): 0 as drawn, 1 blue and silver
@@ -156,7 +157,7 @@ bool OverlaysHidden();
 void SetPresence(const std::string& details, const std::string& state, int64_t start);
 // hit feedback (hit_marker.cpp): a game's hook when a local player's shot hits a character, at that player's
 // crosshair (x, y the shown frame's fractions); kind 0 a hit, 1 the head, 2 a kill
-void HitMarker(float x, float y, int kind);
+void HitMarker(float x, float y, int kind, float damage = 0);  // damage > 0: a number shows (damage_numbers)
 void DrawHitMarkers();                          // inside the ImGui frame, from DrawHud
 void MixHitSound(float* out, uint32_t frames);  // the ticks into the mixer's stereo output
 // blood (gpu::GraphicsStyle::blood, blood.cpp): a game's hooks, a spray where a player's shot hit a character (x, y
