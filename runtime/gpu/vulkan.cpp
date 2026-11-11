@@ -716,6 +716,7 @@ private:
     void UploadGammaRamp();
     void BlitFrame(Target& t, VkImageView view, VkImageView source, VkImageView bloom);
     VkImageView Bloom(Target& t, VkImageView source);
+    VkImageView LightShafts(Target& t, VkImageView source, VkImageView depth);
     VkImageView AmbientOcclusion(Target& t, VkImageView source, VkImageView depth);
     VkImageView DepthOfField(Target& t, VkImageView source, VkImageView depth);
     VkImageView MotionBlur(Target& t, VkImageView source, VkImageView depth);
@@ -872,6 +873,8 @@ private:
     Image motion_scene_;
     uint32_t motion_w_ = 0, motion_h_ = 0;
     Image bloom_down_[5], bloom_up_[4];
+    Image shafts_field_[5], shafts_pick_, shafts_quarter_, shafts_scene_;
+    uint32_t shafts_w_ = 0, shafts_h_ = 0;
     float camera_view_[16]{}, camera_projection_[16]{}, previous_view_[16]{}, previous_projection_[16]{};
     uint64_t camera_frame_ = 0, previous_camera_frame_ = 0;
     std::vector<Chunk> chunks_;  // stream chunks: [0] is being filled
@@ -1469,6 +1472,10 @@ VulkanBackend::~VulkanBackend() {
     DropImage(motion_scene_);
     for (Image& im : bloom_down_) DropImage(im);
     for (Image& im : bloom_up_) DropImage(im);
+    for (Image& im : shafts_field_) DropImage(im);
+    DropImage(shafts_pick_);
+    DropImage(shafts_quarter_);
+    DropImage(shafts_scene_);
     for (auto& [k, m] : movie_up_) DropImage(m.up), DropImage(m.out);
     movie_up_.clear();
     DropImage(lut_);
@@ -4207,6 +4214,180 @@ float4 up(O i) : SV_Target {
     return bloom_up_[0].view;
 }
 
+// Screen-space shafts use bright, locally contrasting regions as sources and depth to keep them from bleeding across surfaces.
+VkImageView VulkanBackend::LightShafts(Target& t, VkImageView source, VkImageView depth) {
+    const float strength = float(app::Get().light_shafts) / 100.0f;
+    const float fog_strength = float(app::Get().atmospheric_fog) / 100.0f;
+    if (!source || !depth || (strength <= 0 && fog_strength <= 0)) return source;
+    static const std::string hlsl = R"(
+cbuffer P : register(b1) { float4 p[4]; };
+Texture2D t0 : register(t0);
+Texture2D<float> depthtex : register(t1);
+Texture2D scene : register(t2);
+Texture2D field : register(t3);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o; float2 q = float2((id << 1) & 2, id & 2);
+    o.pos = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = q; return o;
+}
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float viewz(float d) { return p[0].w != 0 ? d * 4096.0 : rcp(max(1.0 - d, 1e-6)); }
+float noise(float2 v) { return frac(sin(dot(v, float2(12.9898, 78.233))) * 43758.5453); }
+float4 sources(O i) : SV_Target {
+    float2 px = p[0].xy; float4 acc = 0;
+    [unroll] for (int k = 0; k < 4; k++) {
+        float2 uv = i.uv + (float2(k & 1, k >> 1) - 0.5) * 2 * px;
+        float3 c = t0.SampleLevel(ls, uv, 0).rgb;
+        float d = depthtex.SampleLevel(pt, uv, 0), y = luma(c), surround = 0;
+        [unroll] for (int n = 0; n < 4; n++) {
+            float2 off = n == 0 ? float2(12, 0) : n == 1 ? float2(-12, 0) : n == 2 ? float2(0, 12) : float2(0, -12);
+            surround += luma(t0.SampleLevel(ls, uv + off * px, 0).rgb);
+        }
+        float local = smoothstep(0.08, 0.3, y - surround * 0.25);
+        float w = d >= 0.99999 ? smoothstep(p[2].y + 0.1, p[2].y + 0.6, y) : 0.5 * smoothstep(0.85, 1.05, y) * local;
+        acc += float4(c * w, w);
+    }
+    return acc * 0.25;
+}
+float4 down(O i) : SV_Target {
+    float2 px = p[0].xy;
+    float4 s = 0;
+    [unroll] for (int k = 0; k < 4; k++) s += t0.SampleLevel(ls, i.uv + (float2(k & 1, k >> 1) - 0.5) * px, 0);
+    return s * 0.25;
+}
+float4 pick(O i) : SV_Target {
+    int k = int(i.pos.x);
+    uint fw = uint(1 / p[1].x + 0.5), fh = uint(1 / p[1].y + 0.5);
+    float4 acc = 0, skyacc = 0, all = 0;
+    float2 best = 0.5; float most = 0;
+    for (uint y = 0; y < fh; y++) for (uint x = 0; x < fw; x++) {
+        float2 uv = (float2(x, y) + 0.5) * p[1].xy;
+        if (k == 4) {
+            float3 c = scene.SampleLevel(ls, uv, 0).rgb; all += float4(c, 1);
+            if (depthtex.SampleLevel(pt, uv, 0) >= 0.99999) skyacc += float4(c, 1);
+            continue;
+        }
+        if (uint(uv.x >= 0.5) != uint(k & 1) || uint(uv.y >= 0.5) != uint(k >> 1)) continue;
+        float4 s = t0.Load(int3(x, y, 0)); acc += s;
+        if (s.a > most) most = s.a, best = uv;
+    }
+    if (k == 4) return float4(skyacc.a > all.a * 0.02 ? skyacc.rgb / skyacc.a : all.rgb / max(all.a, 1), skyacc.a / max(all.a, 1));
+    float2 centre = 0; float weight = 0;
+    for (uint y = 0; y < fh; y++) for (uint x = 0; x < fw; x++) {
+        float2 uv = (float2(x, y) + 0.5) * p[1].xy;
+        float2 delta = (uv - best) * float2(p[2].w, 1);
+        float w = pow(saturate(t0.Load(int3(x, y, 0)).a / max(most, 1e-4)), 4) * saturate(1 - dot(delta, delta) / 0.0225);
+        centre += uv * w; weight += w;
+    }
+    return float4(weight > 0 ? centre / weight : best, most, 0);
+}
+float4 shafts(O i) : SV_Target {
+    float2 uv = i.uv; float3 sh = 0;
+    float j = noise(floor(i.pos.xy)) * 0.5;
+    [unroll] for (int k = 0; k < 4; k++) {
+        float4 L = field.Load(int3(k, 0, 0));
+        if (L.z < 0.025) continue;
+        float2 distance = (uv - L.xy) * float2(p[2].w, 1);
+        float reach = saturate(1 - length(distance) / p[2].z);
+        if (reach <= 0) continue;
+        float2 delta = (uv - L.xy) * (0.85 / 24), q = uv - delta * j;
+        float3 acc = 0; float decay = 1, weight = 0;
+        [loop] for (int n = 0; n < 24; n++) {
+            q -= delta; acc += scene.SampleLevel(ls, q, 0).rgb * decay;
+            weight += decay; decay *= 0.94;
+        }
+        sh += acc / max(weight, 1e-4) * smoothstep(0.025, 0.15, L.z) * reach * reach;
+    }
+    return float4(sh * p[0].z * 0.8, depthtex.SampleLevel(pt, uv, 0));
+}
+float4 depthonly(O i) : SV_Target { return float4(0, 0, 0, depthtex.SampleLevel(pt, i.uv, 0)); }
+float4 comp(O i) : SV_Target {
+    float2 uv = i.uv; float3 c = t0.SampleLevel(pt, uv, 0).rgb;
+    float d = depthtex.SampleLevel(pt, uv, 0); bool sky = d >= 0.99999;
+    float3 skyc = field.Load(int3(4, 0, 0)).rgb;
+    float3 sh = 0;
+    float2 size = p[3].zw, pixel = uv * size - 0.5;
+    int2 base = int2(floor(pixel)); float2 f = frac(pixel); float weights = 0;
+    [unroll] for (int y = 0; y < 2; y++) [unroll] for (int x = 0; x < 2; x++) {
+        int2 at = clamp(base + int2(x, y), int2(0, 0), int2(size) - 1);
+        float4 v = scene.Load(int3(at, 0)); bool sampleSky = v.a >= 0.99999;
+        float w = (x ? f.x : 1 - f.x) * (y ? f.y : 1 - f.y);
+        w *= sampleSky == sky ? exp(-abs(viewz(v.a) - viewz(d)) / max(viewz(d) * 0.1, 0.05)) : 0;
+        sh += v.rgb * w; weights += w;
+    }
+    sh = weights > 1e-4 ? sh / weights : 0;
+    float z = sky ? 0 : viewz(d);
+    float fog = sky || p[0].w == 0 ? 0 : (1 - exp(-z * p[2].x)) * p[0].w;
+    c = lerp(c, skyc, saturate(fog));
+    c += sh * (sky ? 0.35 : 1.0) * (1 - saturate(luma(c)) * 0.8);
+    return float4(max(c, 0), 1);
+}
+)";
+    uint64_t vs_hash, src_hash, down_hash, pick_hash, shafts_hash, depth_hash, comp_hash;
+    if (!Compile(hlsl, "vs", "vs_5_0", vs_hash) || !Compile(hlsl, "sources", "ps_5_0", src_hash) ||
+        !Compile(hlsl, "down", "ps_5_0", down_hash) || !Compile(hlsl, "pick", "ps_5_0", pick_hash) ||
+        !Compile(hlsl, "shafts", "ps_5_0", shafts_hash) || !Compile(hlsl, "depthonly", "ps_5_0", depth_hash) ||
+        !Compile(hlsl, "comp", "ps_5_0", comp_hash)) {
+        LOG_FIRST(1, "vulkan: light-shafts shaders did not compile; drawing without shafts");
+        return source;
+    }
+    const uint32_t qw = std::max(1u, t.w >> 2), qh = std::max(1u, t.h >> 2);
+    uint32_t fw = qw, fh = qh;
+    for (int i = 0; i < 4; i++) fw = std::max(1u, fw >> 1), fh = std::max(1u, fh >> 1);
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    for (int i = 0; i < 5; i++) {
+        uint32_t w = std::max(1u, t.w >> (2 + i)), h = std::max(1u, t.h >> (2 + i));
+        if (shafts_field_[i].img && (shafts_field_[i].w != w || shafts_field_[i].h != h)) DropImage(shafts_field_[i]);
+        if (!shafts_field_[i].img && !MakeImage(shafts_field_[i], VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                                w, h, 1, 1, 1, usage)) return source;
+    }
+    if (!shafts_pick_.img && !MakeImage(shafts_pick_, VK_IMAGE_TYPE_2D, VK_FORMAT_R32G32B32A32_SFLOAT,
+                                        5, 1, 1, 1, 1, usage)) return source;
+    if (shafts_quarter_.img && (shafts_quarter_.w != qw || shafts_quarter_.h != qh)) DropImage(shafts_quarter_);
+    if (!shafts_quarter_.img && !MakeImage(shafts_quarter_, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                           qw, qh, 1, 1, 1, usage)) return source;
+    if (shafts_scene_.img && (shafts_scene_.w != t.w || shafts_scene_.h != t.h)) DropImage(shafts_scene_);
+    if (!shafts_scene_.img && !MakeImage(shafts_scene_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1, usage)) return source;
+    VkPipeline ps = PassPipeline({vs_hash, src_hash, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pd = PassPipeline({vs_hash, down_hash, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pk = PassPipeline({vs_hash, pick_hash, VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pr = PassPipeline({vs_hash, shafts_hash, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pdepth = PassPipeline({vs_hash, depth_hash, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pc = PassPipeline({vs_hash, comp_hash, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!ps || !pd || !pk || (strength > 0 && !pr) || (strength <= 0 && !pdepth) || !pc) return source;
+    const char* wbuf = std::getenv("XBE_WBUFFER");
+    float c[16] = {1.0f / t.w, 1.0f / t.h, strength, fog_strength, !(wbuf && *wbuf == '0') ? 1.0f : 0.0f,
+                   0, 1.0f / fw, 1.0f / fh, 0.006f, 0.35f, 0.55f, float(t.w) / t.h,
+                   0, 0, 1.0f / qw, 1.0f / qh};
+    auto pass = [&](VkPipeline pipeline, Image& dst, const VkImageView* views, uint32_t n, float* constants) {
+        VkViewport vp{0, 0, float(dst.w), float(dst.h), 0, 1};
+        VkRect2D sc{{0, 0}, {dst.w, dst.h}};
+        FullScreen(pipeline, {dst.att, VK_NULL_HANDLE, dst.w, dst.h}, vp, sc, constants, 16, views, n);
+        End();
+        Barrier();
+    };
+    c[0] = 1.0f / t.w; c[1] = 1.0f / t.h;
+    VkImageView sv[2] = {source, depth};
+    pass(ps, shafts_field_[0], sv, 2, c);
+    for (int i = 1; i < 5; i++) {
+        c[0] = 1.0f / shafts_field_[i - 1].w; c[1] = 1.0f / shafts_field_[i - 1].h;
+        pass(pd, shafts_field_[i], &shafts_field_[i - 1].view, 1, c);
+    }
+    c[4] = 1.0f / fw; c[5] = 1.0f / fh;
+    VkImageView kv[3] = {shafts_field_[4].view, depth, source};
+    pass(pk, shafts_pick_, kv, 3, c);
+    c[0] = 1.0f / t.w; c[1] = 1.0f / t.h;
+    VkImageView rv[4] = {source, depth, source, shafts_pick_.view};
+    if (strength > 0) pass(pr, shafts_quarter_, rv, 4, c);
+    else pass(pdepth, shafts_quarter_, rv, 4, c);
+    c[0] = 1.0f / t.w; c[1] = 1.0f / t.h;
+    VkImageView cv[4] = {source, depth, shafts_quarter_.view, shafts_pick_.view};
+    pass(pc, shafts_scene_, cv, 4, c);
+    return shafts_scene_.view;
+}
+
 void VulkanBackend::RenderUi() {
     std::lock_guard lock(app::UiLock());
     app::FeedPad();
@@ -4297,6 +4478,9 @@ void VulkanBackend::Present(const Surface& front) {
         if (t && app::Get().motion_blur && scene_depth_frame_ == presents_ + 1 &&
             scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
             frame_source = MotionBlur(*t, frame_source, scene_depth_view_);
+        if (t && (app::Get().light_shafts || app::Get().atmospheric_fog) && scene_depth_frame_ == presents_ + 1 &&
+            scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
+            frame_source = LightShafts(*t, frame_source, scene_depth_view_);
         VkImageView bloom = t && app::Get().bloom ? Bloom(*t, frame_source) : VK_NULL_HANDLE;
         cb = Cmd();
         VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};

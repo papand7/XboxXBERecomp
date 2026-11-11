@@ -231,6 +231,8 @@ void Load() {
     s.sharpen = std::min<uint32_t>(t["sharpen"].value_or(s.sharpen), 100);
     s.color_style = std::min<uint32_t>(t["color_style"].value_or(s.color_style), 4);
     s.bloom = std::min<uint32_t>(t["bloom"].value_or(s.bloom), 100);
+    s.light_shafts = std::min<uint32_t>(t["light_shafts"].value_or(s.light_shafts), 100);
+    s.atmospheric_fog = std::min<uint32_t>(t["atmospheric_fog"].value_or(s.atmospheric_fog), 100);
     s.ambient_occlusion = t["ambient_occlusion"].value_or(s.ambient_occlusion);
     s.depth_of_field = t["depth_of_field"].value_or(s.depth_of_field);
     s.focus_distance = std::clamp<uint32_t>(t["focus_distance"].value_or(s.focus_distance), 1, 100);
@@ -343,6 +345,8 @@ toml::table Table() {
                   {"sharpen", int64_t(s.sharpen)},
                   {"color_style", int64_t(s.color_style)},
                   {"bloom", int64_t(s.bloom)},
+                  {"light_shafts", int64_t(s.light_shafts)},
+                  {"atmospheric_fog", int64_t(s.atmospheric_fog)},
                   {"ambient_occlusion", s.ambient_occlusion},
                   {"depth_of_field", s.depth_of_field},
                   {"focus_distance", int64_t(s.focus_distance)},

@@ -488,6 +488,16 @@ void Graphics(Settings& s) {
         s.bloom = uint32_t(bloom);
         Save();
     }
+    int shafts = int(s.light_shafts);
+    if (RowSlider("Light shafts", &shafts, 0, 100, 5, "%", "Adds screen-space rays from bright scene regions. Uses scene depth to reduce rays across surfaces. Vulkan only.")) {
+        s.light_shafts = uint32_t(shafts);
+        Save();
+    }
+    int atmo_fog = int(s.atmospheric_fog);
+    if (RowSlider("Atmospheric fog", &atmo_fog, 0, 100, 5, "%", "Adds distance fog tinted by the sampled scene sky. Game-authored fog remains active. Vulkan only.")) {
+        s.atmospheric_fog = uint32_t(atmo_fog);
+        Save();
+    }
     if (RowCheck("Ambient occlusion", &s.ambient_occlusion,
                  "Darkens corners and nearby surfaces. Uses ray queries when supported, with screen-space depth AO as a fallback. Vulkan only.")) Save();
     if (RowCheck("Depth of field", &s.depth_of_field,

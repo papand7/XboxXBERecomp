@@ -57,6 +57,8 @@ struct Settings {
     uint32_t sharpen = 0;            // percent, contrast adaptive sharpening of the finished frame
     uint32_t color_style = 0;        // 0 original, 1 Enhanced Color, 2 Toon Screen, 3 Retro, 4 Noir
     uint32_t bloom = 0;              // percent, screen-space glow around bright pixels
+    uint32_t light_shafts = 0;       // screen-space rays from bright scene regions; Vulkan only
+    uint32_t atmospheric_fog = 0;    // optional depth fog tinted by the visible sky; Vulkan only
     bool ambient_occlusion = false;  // screen-space AO, upgraded to ray queries when available; Vulkan only
     bool depth_of_field = false;     // depth-based foreground/background blur; Vulkan only
     uint32_t focus_distance = 10;    // depth of field focus distance in metres
