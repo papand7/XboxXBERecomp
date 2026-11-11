@@ -244,8 +244,8 @@ float4 psmix(O i) : SV_Target {
     return float4(c.rgb, 1);
 }
 // the finished frame, the settings' passes in one: opts.y bit 0 is FXAA, bit 1 is sharp scaling, bits 2-4 are style,
-// bits 5-10 bloom, 11-16 vignette and 17-22 grain strength. opts.z is sharpening from 0 to 1; opts.w's fractional part
-// selects a grain phase, and its integer part is the exposure multiplier. The filter: Catmull-Rom up, area sampling down.
+// bits 5-10 bloom, 11-16 vignette and 17-22 grain. opts.z packs sharpness (5 bits), contrast (5), saturation (6)
+// and temperature (6); opts.w holds exposure percent and an 8-bit grain phase. The filter: Catmull-Rom up, area sampling down.
 // Catmull-Rom over source pixels going up; going down, the
 // output pixel's area (four taps, even at a ratio that is not whole) less a little of its neighbours. FXAA: where the luma of a pixel and its four neighbours differs enough to be an edge, the colour is
 // averaged along the edge's direction, found from the diagonal neighbours. Sharpening, contrast adaptive (as AMD's CAS):
@@ -253,17 +253,17 @@ float4 psmix(O i) : SV_Target {
 // a source pixel or an output pixel apart, whichever is larger, so it still shows on a frame rendered above the screen's
 float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 float3 tap(float2 uv) { return img.SampleLevel(ls, uv, 0).rgb; }
-float3 bright(float2 uv) {
-    float3 c = tap(uv);
+float3 bright(float2 uv, float exposure) {
+    float3 c = tap(uv) * exposure;
     return c * smoothstep(0.70, 0.92, luma(c));
 }
-float3 bloom(float2 uv, float2 t) {
+float3 bloom(float2 uv, float2 t, float exposure) {
     float2 r = t * 4.5;
-    float3 c = bright(uv) * 4;
-    c += (bright(uv + float2(r.x, 0)) + bright(uv - float2(r.x, 0)) +
-          bright(uv + float2(0, r.y)) + bright(uv - float2(0, r.y))) * 2;
-    c += bright(uv + r * float2(1, 1)) + bright(uv + r * float2(-1, 1)) +
-         bright(uv + r * float2(1, -1)) + bright(uv + r * float2(-1, -1));
+    float3 c = bright(uv, exposure) * 4;
+    c += (bright(uv + float2(r.x, 0), exposure) + bright(uv - float2(r.x, 0), exposure) +
+          bright(uv + float2(0, r.y), exposure) + bright(uv - float2(0, r.y), exposure)) * 2;
+    c += bright(uv + r * float2(1, 1), exposure) + bright(uv + r * float2(-1, 1), exposure) +
+         bright(uv + r * float2(1, -1), exposure) + bright(uv + r * float2(-1, -1), exposure);
     return c / 24;
 }
 float3 scaled(float2 uv, float2 t, float2 px) {
@@ -321,9 +321,13 @@ float4 psfinal(O i) : SV_Target {
     int mode = (int)opts.y;
     float3 c = (mode & 2) != 0 ? scaled(i.uv, t, fwidth(i.uv)) : tap(i.uv);
     if ((mode & 1) != 0) c = fxaa(c, i.uv, t);
-    if (opts.z > 0) c = sharpen(c, i.uv, px, opts.z);
+    int adjustment = (int)opts.z;
+    int sharp_q = adjustment & 31;
+    if (sharp_q > 0) c = sharpen(c, i.uv, px, float(sharp_q) / 20.0);
+    float exposure = floor(opts.w) / 100.0;
+    c *= exposure;
     int bloom_strength = (mode >> 5) & 63;
-    if (bloom_strength > 0) c = saturate(c + bloom(i.uv, t) * (float(bloom_strength) * 0.005));
+    if (bloom_strength > 0) c = saturate(c + bloom(i.uv, t, exposure) * (float(bloom_strength) * 0.005));
     int vignette_strength = (mode >> 11) & 63;
     if (vignette_strength > 0) {
         float2 centred = float2((i.uv.x - 0.5) * size.x / size.y, i.uv.y - 0.5);
@@ -337,6 +341,17 @@ float4 psfinal(O i) : SV_Target {
         float noise = frac(sin(dot(pixel, float2(12.9898, 78.233))) * 43758.5453) - 0.5;
         c = saturate(c + noise * (float(grain_strength) / 63) * 0.035);
     }
+    int contrast_q = (adjustment >> 5) & 31;
+    float contrast = 0.5 + float(contrast_q) * 0.05;
+    c = saturate((c - 0.5) * contrast + 0.5);
+    int saturation_q = (adjustment >> 10) & 63;
+    float saturation = float(saturation_q) * 0.05;
+    float grey = luma(c);
+    c = saturate(lerp(grey.xxx, c, saturation));
+    int temperature_q = (adjustment >> 16) & 63;
+    float temperature = (float(temperature_q) - 20.0) / 20.0;
+    c.r = saturate(c.r + temperature * 0.04);
+    c.b = saturate(c.b - temperature * 0.04);
     int style = (mode >> 2) & 7;
     if (style == 1) {
         c = saturate((c - 0.5) * 1.12 + 0.5);
@@ -361,7 +376,7 @@ float4 psfinal(O i) : SV_Target {
         float3 noir = lerp(mono, float3(y * 0.32, y * 0.015, y * 0.02), smoothstep(0.12, 0.48, y));
         c = lerp(noir, float3(y, y * 0.025, y * 0.015), red * 0.85);
     }
-    c *= floor(opts.w);
+
     if (opts.x > 0) c = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
     return float4(c, 1);
 }

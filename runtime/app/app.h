@@ -55,11 +55,15 @@ struct Settings {
     bool dump_textures = false;     // dump originals to mods/textures/dump
     bool low_latency = false;        // a waitable swap chain holding one frame, at the next start
     uint32_t sharpen = 0;            // percent, contrast adaptive sharpening of the finished frame
-    uint32_t color_style = 0;        // 0 original, 1 retro color grade, 2 noir color grade
+    uint32_t color_style = 0;        // 0 original, 1 Enhanced Color, 2 Toon Screen, 3 Retro, 4 Noir
     uint32_t bloom = 0;              // percent, screen-space glow around bright pixels
     uint32_t vignette = 0;           // percent, darkens the screen edges
     uint32_t film_grain = 0;         // percent, animated screen-space noise
     bool movie_upscale = true;       // upscale YUY2 movie frames before drawing
+    uint32_t exposure = 100;         // screen brightness in percent
+    uint32_t contrast = 100;         // screen contrast in percent
+    uint32_t saturation = 100;       // colour saturation in percent
+    int32_t temperature = 0;         // colour temperature, -100 cool to 100 warm
     uint32_t renderer = 0;           // Vulkan, at the next start
     uint32_t language = 1;           // the console's language (XC_LANGUAGE, GameInfo::languages), at the next start
     // a steering wheel and its kit (core/wheel.cpp), playing as controller 1: each control on any DirectInput device,

@@ -234,6 +234,10 @@ void Load() {
     s.vignette = std::min<uint32_t>(t["vignette"].value_or(s.vignette), 100);
     s.film_grain = std::min<uint32_t>(t["film_grain"].value_or(s.film_grain), 100);
     s.movie_upscale = t["movie_upscale"].value_or(s.movie_upscale);
+    s.exposure = std::clamp<uint32_t>(t["exposure"].value_or(s.exposure), 50, 150);
+    s.contrast = std::clamp<uint32_t>(t["contrast"].value_or(s.contrast), 50, 150);
+    s.saturation = std::min<uint32_t>(t["saturation"].value_or(s.saturation), 200);
+    s.temperature = int32_t(std::clamp<int64_t>(t["temperature"].value_or(int64_t(s.temperature)), -100, 100));
     std::string renderer = t["renderer"].value_or(std::string(kRenderers[s.renderer % kRendererCount]));
     for (uint32_t i = 0; i < kRendererCount; i++)
         if (renderer == kRenderers[i]) s.renderer = i;
@@ -335,6 +339,10 @@ toml::table Table() {
                   {"vignette", int64_t(s.vignette)},
                   {"film_grain", int64_t(s.film_grain)},
                   {"movie_upscale", s.movie_upscale},
+                  {"exposure", int64_t(s.exposure)},
+                  {"contrast", int64_t(s.contrast)},
+                  {"saturation", int64_t(s.saturation)},
+                  {"temperature", int64_t(s.temperature)},
                   {"renderer", kRenderers[s.renderer % kRendererCount]},
                   {"wheel_range", int64_t(s.wheel_range)},
                   {"wheel_lock", int64_t(s.wheel_lock)},

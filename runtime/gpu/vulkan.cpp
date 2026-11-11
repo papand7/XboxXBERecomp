@@ -2228,8 +2228,9 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
     uint64_t vh, ph;
     const app::Settings& st = app::Get();
     const bool fxaa = st.fxaa && !st.smaa;
-    const bool final = o.final && (fxaa || st.sharpen || st.color_style || st.bloom || st.vignette || st.film_grain ||\
-                              st.scale_filter);
+    const bool final = o.final && (fxaa || st.sharpen || st.color_style || st.bloom || st.vignette || st.film_grain ||
+                              st.scale_filter || st.exposure != 100 || st.contrast != 100 ||
+                              st.saturation != 100 || st.temperature != 0);
     if (!Compile(kBlitHlsl, "vs", "vs_5_0", vh)) return;
     VkShaderModule ps = Compile(kBlitHlsl, final ? "psfinal" : "psmain", "ps_5_0", ph);
     bool use_final = final && ps;
@@ -2244,8 +2245,13 @@ void VulkanBackend::Blit(VkImageView src, const Attachments& a, const VkViewport
         const uint32_t mode = (fxaa ? 1u : 0u) | (st.scale_filter ? 2u : 0u) | ((st.color_style & 7u) << 2) |
                               ((bloom & 63u) << 5) | ((vignette & 63u) << 11) | ((grain & 63u) << 17);
         c[5] = float(mode);
-        c[6] = float(std::min<uint32_t>(st.sharpen, 100)) / 100.0f;
-        c[7] = 1.0f + float(uint32_t(presents_ & 255u)) / 256.0f;
+        const uint32_t sharp = std::min<uint32_t>(st.sharpen, 100) / 5;
+        const uint32_t contrast = (std::clamp<uint32_t>(st.contrast, 50, 150) - 50) / 5;
+        const uint32_t saturation = std::min<uint32_t>(st.saturation, 200) / 5;
+        const uint32_t temperature = uint32_t(std::clamp<int32_t>(st.temperature, -100, 100) + 100) / 5;
+        c[6] = float((sharp & 31u) | ((contrast & 31u) << 5) | ((saturation & 63u) << 10) |
+                     ((temperature & 63u) << 16));
+        c[7] = float(std::clamp<uint32_t>(st.exposure, 50, 150)) + float(uint32_t(presents_ & 255u)) / 256.0f;
     }
     VkPipeline p = PassPipeline({vh, ph, fmt, VK_FORMAT_UNDEFINED, o.over ? 1u : 0u, 0});
     VkImageView views[2] = {src, lut_.view};
