@@ -868,6 +868,7 @@ private:
     uint32_t smaa_w_ = 0, smaa_h_ = 0;
     bool smaa_tried_ = false, smaa_ready_ = false;
     uint64_t smaa_edge_vs_ = 0, smaa_edge_ps_ = 0, smaa_weight_vs_ = 0, smaa_weight_ps_ = 0;
+    uint64_t smaa_blend_vs_ = 0, smaa_blend_ps_ = 0;
     Image ao_half_, ao_scene_;
     uint32_t ao_w_ = 0, ao_h_ = 0;
     Image dof_scene_;
@@ -3161,7 +3162,7 @@ float4 taa(O i) : SV_Target {
     const Image& history = taa_history_[(presents_ + 1) & 1];
     VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
     VkRect2D sc{{0, 0}, {t.w, t.h}};
-    VkImageView views[3] = {source, history_valid ? history.view : dummy_.view, depth, VK_NULL_HANDLE};
+    VkImageView views[3] = {source, history_valid ? history.view : dummy_.view, depth};
     FullScreen(pipeline, {out.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, constants, 72, views, 3);
     End();
     Barrier();
@@ -3853,7 +3854,7 @@ void VulkanBackend::CaptureGeometry(const State& s, const Assembled& a, const Dr
     if (!enabled || !rt_ok_ || draw_2d_ || !bound_rt_ || !bound_ds_ || bound_rt_->gw != guest_w_ ||
         bound_rt_->gh != guest_h_ || bound_ds_->w != bound_rt_->w || bound_ds_->h != bound_rt_->h || !key.zen ||
         !key.zwrite || key.blend || a.topology != Topology::Triangles || a.pretransformed || sh.quad ||
-        s.rs[kRsAlphaTestEnable])
+        SimpleState(s, kMAlphaTestEnable))
         return;
 
     const uint32_t n = a.index_count ? a.index_count : a.draw_count;
@@ -3953,7 +3954,7 @@ void VulkanBackend::CaptureGeometry(const State& s, const Assembled& a, const Dr
     wbuf = wbuf && wbuffer_enabled;
     if (slot.triangles.size() + size_t(n) > (6u << 20)) return;
     const uint32_t base = slot.used;
-    const uint32_t push[4] = {base, uint32_t(span), int32_t(vmin), wbuf};
+    const uint32_t push[4] = {base, uint32_t(span), uint32_t(int32_t(vmin)), wbuf};
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ds_.pipeline = pipeline);
     PushDescriptors(vsc, dc, stages, smp, &slot.vertices);
     vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), push);
