@@ -187,8 +187,8 @@ constexpr VkDeviceSize kBlockSize = 64u << 20;    // device memory blocks images
 constexpr int kLateSlots = 3;                   // copies in flight per surface locked without a wait
 constexpr uint32_t kQueries = 4096;             // occlusion queries
 constexpr VkFormat kBgra = VK_FORMAT_B8G8R8A8_UNORM;
-// descriptor bindings, set 0, as DXC's register shifts lay them out: b0 b1, t0-t3, s0-s3
-constexpr uint32_t kBindVsc = 0, kBindDc = 1, kBindTex = 2, kBindSmp = 6, kBindings = 10;
+// descriptor bindings: set 0 has b0-b1, t0-t3, s0-s3 and optional u0 capture storage
+constexpr uint32_t kBindVsc = 0, kBindDc = 1, kBindTex = 2, kBindSmp = 6, kBindCapture = 10, kBindings = 11;
 
 const char* VkResultName(VkResult r) {
     switch (r) {
@@ -1276,24 +1276,28 @@ bool VulkanBackend::CreateFixed() {
     VkSemaphoreCreateInfo bci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (auto& s : acquire_sem_) vkCreateSemaphore(dev_, &bci, nullptr, &s);
 
-    // one layout for every draw and pass: two constant buffers, four textures, four samplers, pushed per draw
+    // one layout for every draw and pass: two constants, four textures, four samplers, and a capture buffer
     VkDescriptorSetLayoutBinding b[kBindings]{};
     for (uint32_t i = 0; i < kBindings; i++) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
-        b[i].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+        b[i].stageFlags = i == kBindCapture ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_ALL_GRAPHICS;
         b[i].descriptorType = i < kBindTex ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
                               : i < kBindSmp ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
-                                             : VK_DESCRIPTOR_TYPE_SAMPLER;
+                              : i < kBindCapture ? VK_DESCRIPTOR_TYPE_SAMPLER
+                                                 : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     dl.bindingCount = kBindings;
     dl.pBindings = b;
     if (vkCreateDescriptorSetLayout(dev_, &dl, nullptr, &set_layout_) != VK_SUCCESS) return false;
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 16};  // per-draw geometry-capture range
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &set_layout_;
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(dev_, &pl, nullptr, &layout_) != VK_SUCCESS) return false;
 
     // the pipeline cache kept beside the exe
