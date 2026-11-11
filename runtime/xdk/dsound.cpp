@@ -555,6 +555,7 @@ void Render(float* out, uint32_t frames) {
             v.pos += step;
         }
     }
+    app::MixHitSound(out, frames);
     for (uint32_t i = 0; i < frames * 2; i++) out[i] = std::clamp(out[i], -1.0f, 1.0f);
 }
 

@@ -561,6 +561,14 @@ void General(Settings& s) {
     if (RowCheck("Pause when the window is not in front", &s.pause_unfocused,
                  "The game and its sound stop while another window is in front, and carry on when you return."))
         Save();
+    if (kGame.hit_feedback) {
+        static const char* const kHit[] = {"Off", "Marker", "Marker and sound"};
+        int hit = int(s.hit_feedback % 3);
+        if (RowChoice("Hit feedback", &hit, kHit, 3, "A mark at the crosshair when your shot hits: white a hit, red a kill.")) {
+            s.hit_feedback = uint32_t(hit);
+            Save();
+        }
+    }
 }
 
 void Language(Settings& s) {
@@ -924,6 +932,7 @@ void Achievements() {
 void DrawHud(double fps) {
     Scale();
     DrawUnlock();
+    DrawHitMarkers();
     ImGuiViewport* vp = ImGui::GetMainViewport();
     if (ScreenshotJustSaved()) {
         ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + 8), 0, ImVec2(0.5f, 0));

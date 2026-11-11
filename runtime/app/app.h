@@ -57,6 +57,7 @@ struct Settings {
     bool dump_textures = false;     // dump originals to mods/textures/dump
     bool low_latency = false;        // a waitable swap chain holding one frame, at the next start
     uint32_t sharpen = 0;            // percent, contrast adaptive sharpening of the finished frame
+    uint32_t hit_feedback = 2;       // a player's shot hitting (HitMarker): 0 nothing, 1 a mark, 2 a mark and a tick
     uint32_t color_style = 0;        // 0 original, 1 Enhanced Color, 2 Toon Screen, 3 Retro, 4 Noir
     uint32_t bloom = 0;              // percent, screen-space glow around bright pixels
     uint32_t light_shafts = 0;       // screen-space rays from bright scene regions; Vulkan only
@@ -134,6 +135,11 @@ bool TakeScreenshotRequest();
 void SaveScreenshot(std::vector<uint8_t> bgra, uint32_t w, uint32_t h);
 bool ScreenshotJustSaved();  // for a few seconds after one is written
 void DrawHud(double fps);         // the frame counter, inside the ImGui frame (overlay.cpp)
+// hit feedback (hit_marker.cpp): a game's hook when a local player's shot hits a character, at that player's
+// crosshair (x, y the shown frame's fractions); kind 0 a hit, 1 the head, 2 a kill
+void HitMarker(float x, float y, int kind, float damage = 0);
+void DrawHitMarkers();                          // inside the ImGui frame, from DrawHud
+void MixHitSound(float* out, uint32_t frames);  // the ticks into the mixer's stereo output
 void FeedPad();                   // controllers to the settings window's navigation, before each ImGui frame
 Mode Output();
 float RenderScale(uint32_t guest_height);
@@ -238,6 +244,8 @@ struct GameInfo {
     // with sharp edges (gpu::Sharpen2D, a background thread) and drawn so: text and HUD pictures stay crisp at high
     // resolutions (Settings::sharp_2d turns it off)
     bool sharpen_2d = false;
+    // the title's hooks call HitMarker (a shooter's): the settings window offers Settings::hit_feedback
+    bool hit_feedback = false;
     // the languages a title has on its disc, as the console's setting numbers them (1 English, 2 Japanese, 3 German,
     // 4 French, 5 Spanish, 6 Italian, 7 Korean, 8 Chinese, 9 Portuguese): the settings window offers them; none, English
     std::vector<uint32_t> languages;

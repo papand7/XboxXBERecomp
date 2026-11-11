@@ -231,6 +231,7 @@ void Load() {
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.low_latency = t["low_latency"].value_or(s.low_latency);
     s.sharpen = std::min<uint32_t>(t["sharpen"].value_or(s.sharpen), 100);
+    s.hit_feedback = std::min<uint32_t>(t["hit_feedback"].value_or(s.hit_feedback), 2);
     s.color_style = std::min<uint32_t>(t["color_style"].value_or(s.color_style), 4);
     s.bloom = std::min<uint32_t>(t["bloom"].value_or(s.bloom), 100);
     s.light_shafts = std::min<uint32_t>(t["light_shafts"].value_or(s.light_shafts), 100);
@@ -347,6 +348,7 @@ toml::table Table() {
                   {"dump_textures", s.dump_textures},
                   {"low_latency", s.low_latency},
                   {"sharpen", int64_t(s.sharpen)},
+                  {"hit_feedback", int64_t(s.hit_feedback)},
                   {"color_style", int64_t(s.color_style)},
                   {"bloom", int64_t(s.bloom)},
                   {"light_shafts", int64_t(s.light_shafts)},
