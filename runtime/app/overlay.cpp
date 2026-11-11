@@ -489,7 +489,7 @@ void Graphics(Settings& s) {
         Save();
     }
     if (RowCheck("Ambient occlusion", &s.ambient_occlusion,
-                 "Darkens corners and nearby surfaces using scene depth. Vulkan only; works best with the default W-buffer.")) Save();
+                 "Darkens corners and nearby surfaces. Uses ray queries when supported, with screen-space depth AO as a fallback. Vulkan only.")) Save();
     const char* style_names[] = {"Original", "Enhanced Color", "Toon (Screen)", "Retro", "Noir"};
     int vignette = int(s.vignette);
     if (RowSlider("Vignette", &vignette, 0, 100, 5, "%", "Darkens the edges of the finished frame.")) {

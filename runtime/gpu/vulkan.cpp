@@ -190,8 +190,9 @@ constexpr VkDeviceSize kBlockSize = 64u << 20;    // device memory blocks images
 constexpr int kLateSlots = 3;                   // copies in flight per surface locked without a wait
 constexpr uint32_t kQueries = 4096;             // occlusion queries
 constexpr VkFormat kBgra = VK_FORMAT_B8G8R8A8_UNORM;
-// descriptor bindings: set 0 has b0-b1, t0-t3, s0-s3 and optional u0 capture storage
-constexpr uint32_t kBindVsc = 0, kBindDc = 1, kBindTex = 2, kBindSmp = 6, kBindCapture = 10, kBindings = 11;
+// set 0 has b0-b1, t0-t3, s0-s3, u0 capture storage and t9 ray-query scene
+constexpr uint32_t kBindVsc = 0, kBindDc = 1, kBindTex = 2, kBindSmp = 6, kBindCapture = 10,
+                   kBindTlas = 11, kBindings = 12;
 constexpr uint32_t kRtCaptureCapacity = 1u << 20;
 constexpr uint64_t kRtCaptureShaderSalt = 0xD1B54A32D192ED03ull;
 
@@ -748,7 +749,8 @@ private:
     VkImageView UpscaleMovie(Tex& tx, const TextureDesc& d);
     VkImageView SmaaFrame(Target& t);
     void FullScreen(VkPipeline p, const Attachments& a, const VkViewport& vp, const VkRect2D& sc, const float* cb,
-                    uint32_t cb_floats, const VkImageView* views, uint32_t n_views);
+                    uint32_t cb_floats, const VkImageView* views, uint32_t n_views,
+                    VkAccelerationStructureKHR tlas = VK_NULL_HANDLE);
     void Blit(VkImageView src, const Attachments& a, const VkViewport& vp, const VkRect2D& sc, const float uvrect[4],
               const BlitOptions& o, VkFormat fmt = kBgra);
     void BlitWhole(VkImageView src, const Image& dst, const BlitOptions& o);
@@ -1316,20 +1318,23 @@ bool VulkanBackend::CreateFixed() {
     VkSemaphoreCreateInfo bci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (auto& s : acquire_sem_) vkCreateSemaphore(dev_, &bci, nullptr, &s);
 
-    // one layout for every draw and pass: two constants, four textures, four samplers, and a capture buffer
+    // one layout for every draw and pass: two constants, four textures, four samplers, a capture buffer and a TLAS
     VkDescriptorSetLayoutBinding b[kBindings]{};
-    for (uint32_t i = 0; i < kBindings; i++) {
+    const uint32_t binding_count = rt_ok_ ? kBindings : kBindings - 1;
+    for (uint32_t i = 0; i < binding_count; i++) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
-        b[i].stageFlags = i == kBindCapture ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_ALL_GRAPHICS;
+        b[i].stageFlags = i == kBindCapture ? VK_SHADER_STAGE_VERTEX_BIT :
+                          i == kBindTlas ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_ALL_GRAPHICS;
         b[i].descriptorType = i < kBindTex ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
                               : i < kBindSmp ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
                               : i < kBindCapture ? VK_DESCRIPTOR_TYPE_SAMPLER
-                                                 : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                              : i == kBindTlas ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+                                               : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-    dl.bindingCount = kBindings;
+    dl.bindingCount = binding_count;
     dl.pBindings = b;
     if (vkCreateDescriptorSetLayout(dev_, &dl, nullptr, &set_layout_) != VK_SUCCESS) return false;
     VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 16};  // per-draw geometry-capture range
@@ -2193,9 +2198,12 @@ VkShaderModule VulkanBackend::Compile(const std::string& source, const char* ent
     } else {
         if (!dxc_.Load()) return modules_[hash] = VK_NULL_HANDLE;
         std::wstring wentry(entry, entry + std::strlen(entry));
-        std::wstring target = std::wstring(1, wchar_t(profile[0])) + L"s_6_0";
+        const bool sm65 = std::strstr(profile, "6_5") != nullptr;
+        std::wstring target = sm65 ? std::wstring(profile, profile + std::strlen(profile))
+                                   : std::wstring(1, wchar_t(profile[0])) + L"s_6_0";
+        const wchar_t* spirv_env = sm65 ? L"-fspv-target-env=vulkan1.2" : L"-fspv-target-env=vulkan1.1";
         std::vector<const wchar_t*> args = {L"-E", wentry.c_str(), L"-T", target.c_str(), L"-spirv", L"-HV", L"2018",
-                                            L"-fspv-target-env=vulkan1.1", L"-fvk-use-dx-layout", L"-O1",
+                                            spirv_env, L"-fvk-use-dx-layout", L"-O1",
                                             L"-fvk-b-shift", L"0", L"0", L"-fvk-t-shift", L"2", L"0",
                                             L"-fvk-s-shift", L"6", L"0", L"-fvk-u-shift", L"10", L"0", L"-fspv-entrypoint-name=main"};
         if (profile[0] == 'p') args.push_back(L"-fvk-use-dx-position-w");
@@ -2302,7 +2310,8 @@ VkPipeline VulkanBackend::PassPipeline(const PassKey& k) {
 
 // the full screen triangle with cb at b1, views from t0, the pass samplers
 void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewport& vp, const VkRect2D& sc,
-                               const float* cb, uint32_t cb_floats, const VkImageView* views, uint32_t n_views) {
+                               const float* cb, uint32_t cb_floats, const VkImageView* views, uint32_t n_views,
+                               VkAccelerationStructureKHR tlas) {
     if (!p) return;
     Begin(a);
     VkCommandBuffer c = cmd_;
@@ -2312,9 +2321,10 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
     v.height = -vp.height;
     vkCmdSetViewport(c, 0, 1, &v);
     vkCmdSetScissor(c, 0, 1, &sc);
-    VkWriteDescriptorSet w[1 + 4 + 4]{};
+    VkWriteDescriptorSet w[1 + 4 + 4 + 1]{};
     VkDescriptorBufferInfo bi{};
     VkDescriptorImageInfo ii[4]{}, si[4]{};
+    VkWriteDescriptorSetAccelerationStructureKHR wa{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
     uint32_t n = 0;
     float zero[4] = {};
     Stretch s = Stream(std::max<uint32_t>(cb_floats, 4) * sizeof(float));
@@ -2332,6 +2342,12 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
         si[i] = {pass_samplers_[i], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
         w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindSmp + i, 0, 1,
                   VK_DESCRIPTOR_TYPE_SAMPLER, &si[i], nullptr, nullptr};
+    }
+    if (tlas) {
+        wa.accelerationStructureCount = 1;
+        wa.pAccelerationStructures = &tlas;
+        w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &wa, VK_NULL_HANDLE, kBindTlas, 0, 1,
+                  VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr};
     }
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, n, w);
     vkCmdDraw(c, 3, 1, 0, 0);
@@ -2513,6 +2529,55 @@ float4 composite(O i) : SV_Target {
     return c;
 }
 )";
+    static const std::string rt_hlsl = R"(
+cbuffer P : register(b1) { float4 p[2]; };
+Texture2D<float> depthtex : register(t1);
+RaytracingAccelerationStructure scene : register(t9);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o; float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o;
+}
+float z_at(float2 uv) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    return p[1].x > 0.5 ? d * 4096.0 : rcp(max(1.0 - d, 1e-5));
+}
+float3 pos_at(float2 uv) {
+    float z = z_at(uv);
+    return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z);
+}
+float4 trace(O i) : SV_Target {
+    float d = depthtex.SampleLevel(pt, i.uv, 0);
+    if (d >= 0.99999) return float4(1, 1, 1, 1);
+    float3 P = pos_at(i.uv);
+    float3 dx = pos_at(i.uv + float2(p[0].x, 0)) - pos_at(i.uv - float2(p[0].x, 0));
+    float3 dy = pos_at(i.uv + float2(0, p[0].y)) - pos_at(i.uv - float2(0, p[0].y));
+    float3 N = normalize(cross(dx, dy));
+    if (dot(N, P) > 0) N = -N;
+    float3 up = abs(N.y) < 0.95 ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 T = normalize(cross(up, N)), B = cross(N, T);
+    float occ = 0;
+    float noise = frac(sin(dot(i.pos.xy, float2(12.9898, 78.233))) * 43758.5453);
+    [unroll] for (int k = 0; k < 4; ++k) {
+        float a = (k + noise) * 1.570796327;
+        float r = sqrt((k + 0.5) * 0.25);
+        float3 dir = normalize(N + r * (T * cos(a) + B * sin(a)));
+        RayDesc ray;
+        ray.Origin = P + N * 0.025;
+        ray.Direction = dir;
+        ray.TMin = 0.001;
+        ray.TMax = p[1].y;
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+        q.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
+        while (q.Proceed()) {}
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+            occ += 1.0 - q.CommittedRayT() / p[1].y;
+    }
+    float visibility = saturate(1.0 - p[1].z * occ * 0.25);
+    return float4(visibility, visibility, visibility, 1);
+}
+)";
     uint64_t vs_hash, ao_hash, comp_hash;
     if (!Compile(hlsl, "vs", "vs_5_0", vs_hash) || !Compile(hlsl, "ao", "ps_5_0", ao_hash) ||
         !Compile(hlsl, "composite", "ps_5_0", comp_hash)) {
@@ -2542,10 +2607,21 @@ float4 composite(O i) : SV_Target {
     }();
     float constants[8] = {1.0f / t.w, 1.0f / t.h, 0.5774f, float(t.w) / float(t.h),
                           wbuffer ? 1.0f : 0.0f, 0.75f, 0.85f, 0.0f};
+    VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
+    if (rt_ok_ && rt_capture_[frame_slot_].built) {
+        uint64_t rv, rp;
+        if (Compile(rt_hlsl, "vs", "vs_6_5", rv) && Compile(rt_hlsl, "trace", "ps_6_5", rp)) {
+            VkPipeline rt_pipeline = PassPipeline({rv, rp, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+            if (rt_pipeline) {
+                pao = rt_pipeline;
+                tlas = rt_capture_[frame_slot_].tlas;
+            }
+        }
+    }
     VkViewport avp{0, 0, float(aw), float(ah), 0, 1};
     VkRect2D asc{{0, 0}, {aw, ah}};
     VkImageView av[4] = {VK_NULL_HANDLE, depth, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    FullScreen(pao, {ao_half_.att, VK_NULL_HANDLE, aw, ah}, avp, asc, constants, 8, av, 2);
+    FullScreen(pao, {ao_half_.att, VK_NULL_HANDLE, aw, ah}, avp, asc, constants, 8, av, 2, tlas);
     End();
     Barrier();
     VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
@@ -3236,10 +3312,8 @@ bool VulkanBackend::DrawGeometry(const Assembled& a) {
 void VulkanBackend::CaptureGeometry(const State& s, const Assembled& a, const DrawShaders& sh, const PsoKey& key,
                                     const Stretch& vsc, const Stretch& dc, const DrawTextures& stages,
                                     const VkSampler smp[4]) {
-    static const bool enabled = [] {
-        const char* e = std::getenv("XBE_RT_CAPTURE");
-        return e && *e == '1';
-    }();
+    const char* capture_env = std::getenv("XBE_RT_CAPTURE");
+    const bool enabled = app::Get().ambient_occlusion || (capture_env && *capture_env == '1');
     if (!enabled || !rt_ok_ || draw_2d_ || !bound_rt_ || !bound_ds_ || bound_rt_->gw != guest_w_ ||
         bound_rt_->gh != guest_h_ || bound_ds_->w != bound_rt_->w || bound_ds_->h != bound_rt_->h || !key.zen ||
         !key.zwrite || key.blend || a.topology != Topology::Triangles || a.pretransformed || sh.quad ||
@@ -3371,13 +3445,11 @@ void VulkanBackend::CaptureGeometry(const State& s, const Assembled& a, const Dr
 }
 bool VulkanBackend::BuildRtStructures() {
     if (!rt_ok_) return false;
-    static const bool enabled = [] {
-        const char* e = std::getenv("XBE_RT_CAPTURE");
-        return e && *e == '1';
-    }();
+    const char* capture_env = std::getenv("XBE_RT_CAPTURE");
+    const bool enabled = app::Get().ambient_occlusion || (capture_env && *capture_env == '1');
     RtCaptureSlot& slot = rt_capture_[frame_slot_];
-    if (!enabled || slot.frame != presents_ + 1 || !slot.used || slot.triangles.empty()) return false;
     slot.built = false;
+    if (!enabled || slot.frame != presents_ + 1 || !slot.used || slot.triangles.empty()) return false;
 
     const VkDeviceSize index_bytes = VkDeviceSize(slot.triangles.size()) * sizeof(uint32_t);
     const VkBufferUsageFlags input_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |

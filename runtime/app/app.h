@@ -57,7 +57,7 @@ struct Settings {
     uint32_t sharpen = 0;            // percent, contrast adaptive sharpening of the finished frame
     uint32_t color_style = 0;        // 0 original, 1 Enhanced Color, 2 Toon Screen, 3 Retro, 4 Noir
     uint32_t bloom = 0;              // percent, screen-space glow around bright pixels
-    bool ambient_occlusion = false;  // screen-space occlusion from the matched scene depth, Vulkan only
+    bool ambient_occlusion = false;  // screen-space AO, upgraded to ray queries when available; Vulkan only
     uint32_t vignette = 0;           // percent, darkens the screen edges
     uint32_t film_grain = 0;         // percent, animated screen-space noise
     bool movie_upscale = true;       // upscale YUY2 movie frames before drawing
