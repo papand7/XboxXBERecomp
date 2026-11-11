@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -156,6 +157,7 @@ namespace {
     X(vkCmdSetStencilReference)     \
     X(vkCmdSetPrimitiveTopology)    \
     X(vkCmdPushDescriptorSetKHR)    \
+    X(vkCmdPushConstants)           \
     X(vkCmdCopyBufferToImage)       \
     X(vkCmdCopyImageToBuffer)       \
     X(vkCmdCopyImage)               \
@@ -189,6 +191,8 @@ constexpr uint32_t kQueries = 4096;             // occlusion queries
 constexpr VkFormat kBgra = VK_FORMAT_B8G8R8A8_UNORM;
 // descriptor bindings: set 0 has b0-b1, t0-t3, s0-s3 and optional u0 capture storage
 constexpr uint32_t kBindVsc = 0, kBindDc = 1, kBindTex = 2, kBindSmp = 6, kBindCapture = 10, kBindings = 11;
+constexpr uint32_t kRtCaptureCapacity = 1u << 20;
+constexpr uint64_t kRtCaptureShaderSalt = 0xD1B54A32D192ED03ull;
 
 const char* VkResultName(VkResult r) {
     switch (r) {
@@ -765,8 +769,11 @@ private:
     void CopyCubeTargets(Tex& tx, const TextureDesc& d);
     void EnsurePixelShader(const PixelKey& pk, DrawShaders& sh);
     VkPipeline EnsurePipeline(const PsoKey& k);
-    void PushDescriptors(const Stretch& vsc, const Stretch& dc, const DrawTextures& stages, const VkSampler smp[4]);
-    void DrawGeometry(const Assembled& a);
+    void PushDescriptors(const Stretch& vsc, const Stretch& dc, const DrawTextures& stages, const VkSampler smp[4],
+                         const Buffer* capture = nullptr);
+    void CaptureGeometry(const State& s, const Assembled& a, const DrawShaders& sh, const PsoKey& key,
+                         const Stretch& vsc, const Stretch& dc, const DrawTextures& stages, const VkSampler smp[4]);
+    bool DrawGeometry(const Assembled& a);
     // visibility tests
     bool NewQuery(uint32_t& index);
     float SamplesPerPixel() const;
@@ -819,6 +826,13 @@ private:
     VkQueryPool queries_ = VK_NULL_HANDLE;
     VkFormat depth_fmt_ = VK_FORMAT_D24_UNORM_S8_UINT;
     bool rt_ok_ = false;  // ray-query Vulkan prerequisites are available
+    struct RtCaptureSlot {
+        Buffer vertices;
+        uint32_t used = 0;
+        std::vector<uint32_t> triangles;
+        uint64_t frame = 0;
+    };
+    RtCaptureSlot rt_capture_[kFramesInFlight]{};
     bool null_descriptor_ = false;
     bool custom_border_ = false;
     bool mirror_once_ = false;
@@ -1431,6 +1445,7 @@ VulkanBackend::~VulkanBackend() {
     DropBuffer(readback_);
     for (auto& [k, l] : late_)
         for (Buffer& b : l.staging) DropBuffer(b);
+    for (RtCaptureSlot& slot : rt_capture_) DropBuffer(slot.vertices);
     if (cmd_) Submit();
     vkDeviceWaitIdle(dev_);
     for (auto& [serial, f] : retire_) f();
@@ -2160,7 +2175,7 @@ VkShaderModule VulkanBackend::Compile(const std::string& source, const char* ent
         std::vector<const wchar_t*> args = {L"-E", wentry.c_str(), L"-T", target.c_str(), L"-spirv", L"-HV", L"2018",
                                             L"-fspv-target-env=vulkan1.1", L"-fvk-use-dx-layout", L"-O1",
                                             L"-fvk-b-shift", L"0", L"0", L"-fvk-t-shift", L"2", L"0",
-                                            L"-fvk-s-shift", L"6", L"0", L"-fspv-entrypoint-name=main"};
+                                            L"-fvk-s-shift", L"6", L"0", L"-fvk-u-shift", L"10", L"0", L"-fspv-entrypoint-name=main"};
         if (profile[0] == 'p') args.push_back(L"-fvk-use-dx-position-w");
         DxcBuffer buf{src.data(), src.size(), DXC_CP_UTF8};
         ComPtr<IDxcResult> res;
@@ -3044,9 +3059,11 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k) {
     return pipelines_[h] = p;
 }
 
-void VulkanBackend::PushDescriptors(const Stretch& vsc, const Stretch& dc, const DrawTextures& stages, const VkSampler smp[4]) {
+void VulkanBackend::PushDescriptors(const Stretch& vsc, const Stretch& dc, const DrawTextures& stages, const VkSampler smp[4],
+                                     const Buffer* capture) {
     VkWriteDescriptorSet w[kBindings]{};
     VkDescriptorBufferInfo bi[2] = {{vsc.buf, vsc.off, sizeof(State::vsc)}, {dc.buf, dc.off, sizeof(DrawConstants)}};
+    VkDescriptorBufferInfo cap_bi{capture ? capture->buf : VK_NULL_HANDLE, 0, capture ? capture->size : 0};
     VkDescriptorImageInfo ii[4]{}, si[4]{};
     uint32_t n = 0;
     for (uint32_t b = 0; b < 2; b++)
@@ -3062,16 +3079,18 @@ void VulkanBackend::PushDescriptors(const Stretch& vsc, const Stretch& dc, const
         w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindSmp + i, 0, 1,
                   VK_DESCRIPTOR_TYPE_SAMPLER, &si[i], nullptr, nullptr};
     }
+    if (capture) w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindCapture, 0, 1,
+                             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cap_bi, nullptr};
     vkCmdPushDescriptorSetKHR(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, n, w);
 }
 
-void VulkanBackend::DrawGeometry(const Assembled& a) {
+bool VulkanBackend::DrawGeometry(const Assembled& a) {
     VkBuffer bufs[16];
     VkDeviceSize offsets[16], strides[16];
     for (uint32_t i = 0; i < a.buffer_count; i++) {
         const VertexBuffer& b = a.buffers[i];
         Stretch s = Stream(std::max<uint32_t>(b.bytes, 4));
-        if (!s.p) return;
+        if (!s.p) return false;
         std::memcpy(s.p, b.src, b.bytes);
         bufs[i] = s.buf;
         offsets[i] = s.off;
@@ -3083,15 +3102,151 @@ void VulkanBackend::DrawGeometry(const Assembled& a) {
     if (a.index_count) {
         uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
         Stretch s = Stream(ibytes);
-        if (!s.p) return;
+        if (!s.p) return false;
         std::memcpy(s.p, a.index_src, ibytes);
         vkCmdBindIndexBuffer(cmd_, s.buf, s.off, a.index16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd_, a.index_count, 1, 0, a.base_vertex, 0);
     } else {
         vkCmdDraw(cmd_, a.draw_count, 1, 0, 0);
     }
+    return true;
 }
 
+void VulkanBackend::CaptureGeometry(const State& s, const Assembled& a, const DrawShaders& sh, const PsoKey& key,
+                                    const Stretch& vsc, const Stretch& dc, const DrawTextures& stages,
+                                    const VkSampler smp[4]) {
+    static const bool enabled = [] {
+        const char* e = std::getenv("XBE_RT_CAPTURE");
+        return e && *e == '1';
+    }();
+    if (!enabled || !rt_ok_ || draw_2d_ || !bound_rt_ || !bound_ds_ || bound_rt_->gw != guest_w_ ||
+        bound_rt_->gh != guest_h_ || bound_ds_->w != bound_rt_->w || bound_ds_->h != bound_rt_->h || !key.zen ||
+        !key.zwrite || key.blend || a.topology != Topology::Triangles || a.pretransformed || sh.quad ||
+        s.rs[kRsAlphaTestEnable])
+        return;
+
+    const uint32_t n = a.index_count ? a.index_count : a.draw_count;
+    if (n < 3) return;
+    int64_t vmin = 0, vmax = int64_t(n) - 1;
+    if (a.index_count) {
+        vmin = INT64_MAX;
+        vmax = INT64_MIN;
+        for (uint32_t i = 0; i < n; i++) {
+            int64_t v = int64_t(a.index16 ? static_cast<const uint16_t*>(a.index_src)[i]
+                                          : static_cast<const uint32_t*>(a.index_src)[i]) + a.base_vertex;
+            vmin = std::min(vmin, v);
+            vmax = std::max(vmax, v);
+        }
+    }
+    if (vmin < 0 || vmax < vmin || vmax > INT32_MAX) return;
+    const uint64_t span = uint64_t(vmax - vmin + 1);
+    if (span > kRtCaptureCapacity) return;
+
+    RtCaptureSlot& slot = rt_capture_[frame_slot_];
+    const uint64_t frame = presents_ + 1;
+    if (slot.frame != frame) {
+        // Present waits too late for mapped/frame-owned resources; wait before recording the first capture write.
+        Wait(frame_serial_[frame_slot_]);
+        slot.frame = frame;
+        slot.used = 0;
+        slot.triangles.clear();
+    }
+    if (!slot.vertices.buf &&
+        !MakeBuffer(slot.vertices, VkDeviceSize(kRtCaptureCapacity) * 16,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                    false)) {
+        LOG_FIRST(1, "vulkan: RT capture buffer allocation failed; scene capture is disabled");
+        return;
+    }
+    if (uint64_t(slot.used) + span > kRtCaptureCapacity) {
+        LOG_FIRST(1, "vulkan: RT capture reached its per-frame %u-vertex limit", kRtCaptureCapacity);
+        return;
+    }
+
+    const uint64_t shader_key = sh.vkey ^ kRtCaptureShaderSalt;
+    uint64_t capture_vs = 0;
+    if (auto it = shader_src_.find(shader_key); it != shader_src_.end()) {
+        capture_vs = it->second;
+    } else {
+        std::string source = VertexHlsl(s, a, sh);
+        const size_t at = source.find("VOut main(");
+        const size_t close = at == std::string::npos ? at : source.find(')', at);
+        if (close == std::string::npos) return;
+        const std::string params = source.substr(at + 10, close - at - 10);
+        const size_t last_space = params.find_last_of(' ');
+        if (last_space == std::string::npos) return;
+        const std::string arg = params.substr(last_space + 1);
+        source.replace(at, 10, "VOut game_main(");
+        char tail[2048];
+        std::snprintf(tail, sizeof(tail),
+                      "\nRWByteAddressBuffer rt_cap : register(u0);\n"
+                      "struct RtCapturePC { uint base; uint count; int vmin; uint wbuf; };\n"
+                      "[[vk::push_constant]] RtCapturePC rt_pc;\n"
+                      "VOut main(%s, uint rt_vid : SV_VertexID) {\n"
+                      "    VOut o = game_main(%s);\n"
+                      "    int slot = int(rt_vid) - rt_pc.vmin;\n"
+                      "    if (slot >= 0 && uint(slot) < rt_pc.count) {\n"
+                      "        float w = abs(o.pos.w) > 1e-8 ? o.pos.w : 1e-8;\n"
+                      "        float3 p;\n"
+                      "        if (rt_pc.wbuf != 0) p = float3(o.pos.xy / w * o.wlin, o.wlin);\n"
+                      "        else { float z = 1 / max(1 - o.pos.z / w, 1e-6); p = float3(o.pos.xy / w * z, z); }\n"
+                      "        rt_cap.Store4((rt_pc.base + uint(slot)) * 16, asuint(float4(p, 1)));\n"
+                      "    }\n"
+                      "    return o;\n"
+                      "}\n",
+                      params.c_str(), arg.c_str());
+        source += tail;
+        if (!Compile(source, "main", "vs_5_0", capture_vs)) capture_vs = 0;
+        shader_src_[shader_key] = capture_vs;
+    }
+    if (!capture_vs) return;
+
+    PsoKey capture_key = key;
+    capture_key.vs = capture_vs;
+    capture_key.blend = 0;
+    capture_key.wmask = 0;
+    capture_key.zen = 0;
+    capture_key.zwrite = 0;
+    capture_key.sten = 0;
+    capture_key.fill = 0;
+    VkPipeline pipeline = EnsurePipeline(capture_key);
+    if (!pipeline) return;
+
+    uint32_t wbuf = s.rs[kRsZEnable] == 2;
+    static const bool wbuffer_enabled = [] {
+        const char* e = std::getenv("XBE_WBUFFER");
+        return !(e && *e == '0');
+    }();
+    wbuf = wbuf && wbuffer_enabled;
+    if (slot.triangles.size() + size_t(n) > (6u << 20)) return;
+    const uint32_t base = slot.used;
+    const uint32_t push[4] = {base, uint32_t(span), int32_t(vmin), wbuf};
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ds_.pipeline = pipeline);
+    PushDescriptors(vsc, dc, stages, smp, &slot.vertices);
+    vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), push);
+    if (!DrawGeometry(a)) return;
+    auto vertex = [&](uint32_t i) -> uint32_t {
+        const int64_t raw = a.index_count
+                                ? int64_t(a.index16 ? static_cast<const uint16_t*>(a.index_src)[i]
+                                                    : static_cast<const uint32_t*>(a.index_src)[i]) + a.base_vertex
+                                : int64_t(i);
+        return base + uint32_t(raw - vmin);
+    };
+    auto add_triangle = [&](uint32_t i0, uint32_t i1, uint32_t i2) {
+        if (i0 != i1 && i1 != i2 && i0 != i2) slot.triangles.insert(slot.triangles.end(), {i0, i1, i2});
+    };
+    if (a.strip) {
+        for (uint32_t i = 0; i + 2 < n; i++) {
+            uint32_t i0 = vertex(i), i1 = vertex(i + 1), i2 = vertex(i + 2);
+            if (i & 1) std::swap(i0, i1);
+            add_triangle(i0, i1, i2);
+        }
+    } else {
+        for (uint32_t i = 0; i + 2 < n; i += 3) add_triangle(vertex(i), vertex(i + 1), vertex(i + 2));
+    }
+    slot.used += uint32_t(span);
+}
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     PerfScope ps{perf_draw_};
     if (const State* sprites = PointSpriteStages(s, prim)) return Draw(*sprites, prim, start, count, indices);
@@ -3265,6 +3420,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         vkCmdEndQuery(cb, queries_, q);
         counted_.push_back({q, serial_ + 1, SamplesPerPixel()});
     }
+    CaptureGeometry(s, a, sh, k, last_vsc_, last_dc_, stages, smp);
 }
 
 // ---- visibility tests
@@ -3490,6 +3646,7 @@ void VulkanBackend::Present(const Surface& front) {
         frame_slot_ = (frame_slot_ + 1) % kFramesInFlight;
     } else {
         Submit();
+        frame_serial_[frame_slot_] = serial_;
     }
     Unbind();
     DeliverReports(false);
