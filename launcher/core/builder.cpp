@@ -903,6 +903,36 @@ bool Builder::ImportMusic(const fs::path& folder, std::string& summary, std::str
     return true;
 }
 
+bool Builder::StartOver(std::string& error) {
+    std::error_code ec;
+    // "built" is whether the exe is in the play folder: only what a build or a package puts there goes (the exes, a
+    // prebuilt package's code and its stamp)
+    for (const std::string& x : game_.exes) {
+        for (const std::string& f : {x + platform_.ExeSuffix(), x + ".dll"}) {
+            fs::remove(PlayDir() / f, ec);
+            if (ec) {
+                error = "Could not remove " + f + " (" + ec.message() + "): close the game and try again.";
+                return false;
+            }
+        }
+    }
+    fs::remove(PlayDir() / "package.stamp", ec);
+    ec.clear();
+    fs::remove_all(root_ / "source", ec);
+    if (ec) {
+        error = "Could not remove the downloaded source (" + ec.message() + "): close the game and try again.";
+        return false;
+    }
+    Remember("built", "");
+    Log("start over: the installed game, the source and its build removed");
+    return true;
+}
+
+bool Builder::InstallRequirements(std::string& error) {
+    error = "Nothing to install: this game builds with the tools the launcher downloads.";
+    return false;
+}
+
 bool Builder::RemoveBuildFiles(std::string& error) {
     std::error_code ec;
     if (Prebuilt()) {  // the compiled pieces: the compiler stays for updates, which then build everything again

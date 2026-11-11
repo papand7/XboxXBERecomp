@@ -79,6 +79,13 @@ public:
     bool Launch(std::string& error);
     uint64_t BuildFilesBytes() const;  // source\out, removable once built
     bool RemoveBuildFiles(std::string& error);
+    // the installed game and the downloaded source with its build removed, so the next install starts clean; the
+    // player's saves, settings, HD pack and game copy kept
+    bool StartOver(std::string& error);
+    // Linux build packages for a launcher that installs them (service.cpp); this launcher builds on Windows only, so
+    // nothing is ever missing and install_command stays empty
+    bool InstallRequirements(std::string& error);
+    std::string install_command;
 
     // the game's Xbox custom soundtracks (GameConfig::music) from a folder of the player's music: each file converted
     // to WMA with ffmpeg (fetched the first time), ST.DB written, the folder remembered; summary: what was done
