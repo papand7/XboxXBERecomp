@@ -722,6 +722,7 @@ private:
     VkImageView MotionBlur(Target& t, VkImageView source, VkImageView depth);
     bool RememberCamera(const State& s);
     VkImageView TemporalAA(Target& t, VkImageView source, VkImageView depth);
+    VkImageView AutoExposure(Target& t, VkImageView source);
     void RenderUi();
     void ReleaseOldTextures();
     void CountFps();
@@ -879,6 +880,10 @@ private:
     Image taa_history_[2];
     uint32_t taa_w_ = 0, taa_h_ = 0;
     uint64_t taa_frame_ = 0;
+    Image exposure_meter_, exposure_history_[2], exposure_scene_;
+    uint32_t exposure_w_ = 0, exposure_h_ = 0;
+    uint64_t exposure_frame_ = 0;
+    std::chrono::steady_clock::time_point exposure_time_{};
     float camera_view_[16]{}, camera_projection_[16]{}, previous_view_[16]{}, previous_projection_[16]{};
     uint64_t camera_frame_ = 0, previous_camera_frame_ = 0;
     std::vector<Chunk> chunks_;  // stream chunks: [0] is being filled
@@ -1481,6 +1486,9 @@ VulkanBackend::~VulkanBackend() {
     DropImage(shafts_quarter_);
     DropImage(shafts_scene_);
     for (Image& im : taa_history_) DropImage(im);
+    DropImage(exposure_meter_);
+    for (Image& im : exposure_history_) DropImage(im);
+    DropImage(exposure_scene_);
     for (auto& [k, m] : movie_up_) DropImage(m.up), DropImage(m.out);
     movie_up_.clear();
     DropImage(lut_);
@@ -2921,6 +2929,86 @@ float4 blur(O i) : SV_Target {
     End();
     Barrier();
     return motion_scene_.view;
+}
+
+// Meter the SDR frame, adapt exposure from the previous presentation, then tone map before the final blit.
+VkImageView VulkanBackend::AutoExposure(Target& t, VkImageView source) {
+    if (!source || !app::Get().auto_exposure) return source;
+    static const std::string hlsl = R"(
+cbuffer P : register(b1) { float4 p[2]; };
+Texture2D scene : register(t0);
+Texture2D<float> meter : register(t1);
+Texture2D<float> history : register(t2);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o; float2 q=float2((id<<1)&2,id&2); o.pos=float4(q*float2(2,-2)+float2(-1,1),0,1); o.uv=q; return o;
+}
+float luma(float3 c) { return dot(c,float3(0.2126,0.7152,0.0722)); }
+float4 meter_ps(O i) : SV_Target {
+    float3 c=scene.SampleLevel(pt,i.uv,0).rgb;
+    return float4(log2(max(luma(pow(max(c,0),2.2)),1e-4)),0,0,1);
+}
+float4 adapt_ps(O i) : SV_Target {
+    float sum=0, weights=0;
+    [loop] for(int y=0;y<int(p[0].y);y++) [loop] for(int x=0;x<int(p[0].x);x++) {
+        float2 uv=(float2(x,y)+0.5)/p[0].xy;
+        float w=max(1.5-2*length((uv-0.5)*float2(1,0.8)),0.2);
+        sum+=meter.Load(int3(x,y,0))*w; weights+=w;
+    }
+    float mean=sum/max(weights,1e-4);
+    float want=clamp(0.18/exp2(mean),0.25,4.0);
+    float was=p[0].z>0.5 ? history.Load(int3(0,0,0)) : want;
+    float e=exp(lerp(log(max(was,1e-3)),log(want),p[0].w));
+    return float4(e,0,0,1);
+}
+float4 tone_ps(O i) : SV_Target {
+    float3 c=pow(max(scene.SampleLevel(ls,i.uv,0).rgb,0),2.2);
+    c*=history.Load(int3(0,0,0));
+    c=saturate((c*(2.51*c+0.03))/(c*(2.43*c+0.59)+0.14));
+    return float4(pow(c,1.0/2.2),1);
+}
+)";
+    uint64_t vs_hash, meter_hash, adapt_hash, tone_hash;
+    if (!Compile(hlsl,"vs","vs_5_0",vs_hash) || !Compile(hlsl,"meter_ps","ps_5_0",meter_hash) ||
+        !Compile(hlsl,"adapt_ps","ps_5_0",adapt_hash) || !Compile(hlsl,"tone_ps","ps_5_0",tone_hash)) {
+        LOG_FIRST(1,"vulkan: automatic-exposure shaders did not compile; drawing without exposure adaptation");
+        return source;
+    }
+    constexpr uint32_t mw=32,mh=18;
+    constexpr VkFormat mf=VK_FORMAT_R16G16B16A16_SFLOAT, ef=VK_FORMAT_R32G32B32A32_SFLOAT;
+    const VkImageUsageFlags usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (exposure_w_!=t.w || exposure_h_!=t.h) {
+        DropImage(exposure_meter_); for(Image& im:exposure_history_) DropImage(im); DropImage(exposure_scene_);
+        exposure_w_=t.w; exposure_h_=t.h; exposure_frame_=0;
+    }
+    if (!exposure_meter_.img && !MakeImage(exposure_meter_,VK_IMAGE_TYPE_2D,mf,mw,mh,1,1,1,usage)) return source;
+    for(Image& im:exposure_history_) if(!im.img && !MakeImage(im,VK_IMAGE_TYPE_2D,ef,1,1,1,1,1,usage)) return source;
+    if(!exposure_scene_.img && !MakeImage(exposure_scene_,VK_IMAGE_TYPE_2D,kBgra,t.w,t.h,1,1,1,usage)) return source;
+    VkPipeline pm=PassPipeline({vs_hash,meter_hash,mf,VK_FORMAT_UNDEFINED,0,0});
+    VkPipeline pa=PassPipeline({vs_hash,adapt_hash,ef,VK_FORMAT_UNDEFINED,0,0});
+    VkPipeline pt=PassPipeline({vs_hash,tone_hash,kBgra,VK_FORMAT_UNDEFINED,0,0});
+    if(!pm||!pa||!pt) return source;
+    const bool valid=exposure_frame_==presents_;
+    Image& now=exposure_history_[presents_&1];
+    const Image& was=exposure_history_[(presents_+1)&1];
+    float mc[4]={1.0f/t.w,1.0f/t.h,0,0};
+    VkViewport mvp{0,0,float(mw),float(mh),0,1}; VkRect2D msc{{0,0},{mw,mh}};
+    VkImageView mv[1]={source}; FullScreen(pm,{exposure_meter_.att,VK_NULL_HANDLE,mw,mh},mvp,msc,mc,4,mv,1); End(); Barrier();
+    const auto now_time=std::chrono::steady_clock::now();
+    const float dt=exposure_time_.time_since_epoch().count()==0 ? 0.0f :
+        std::clamp(std::chrono::duration<float>(now_time-exposure_time_).count(),0.0f,0.25f);
+    exposure_time_=now_time;
+    float ac[8]={float(mw),float(mh),valid?1.0f:0.0f,1.0f-std::exp(-dt*1.5f),0,0,0,0};
+    VkViewport one{0,0,1,1,0,1}; VkRect2D one_sc{{0,0},{1,1}};
+    VkImageView av[3]={dummy_.view,exposure_meter_.view,valid?was.view:dummy_.view};
+    FullScreen(pa,{now.att,VK_NULL_HANDLE,1,1},one,one_sc,ac,8,av,3); End(); Barrier();
+    float tc[4]={0,0,0,0}; VkViewport vp{0,0,float(t.w),float(t.h),0,1}; VkRect2D sc{{0,0},{t.w,t.h}};
+    VkImageView tv[3]={source,dummy_.view,now.view};
+    FullScreen(pt,{exposure_scene_.att,VK_NULL_HANDLE,t.w,t.h},vp,sc,tc,4,tv,3); End(); Barrier();
+    exposure_frame_=presents_+1;
+    return exposure_scene_.view;
 }
 
 // Jittered temporal AA: reproject the depth-tested world, reject disocclusions by previous view depth, and clamp history in YCoCg.
@@ -4675,6 +4763,7 @@ void VulkanBackend::Present(const Surface& front) {
         if (t && (app::Get().light_shafts || app::Get().atmospheric_fog) && scene_depth_frame_ == presents_ + 1 &&
             scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
             frame_source = LightShafts(*t, frame_source, scene_depth_view_);
+        if (t && app::Get().auto_exposure) frame_source = AutoExposure(*t, frame_source);
         VkImageView bloom = t && app::Get().bloom ? Bloom(*t, frame_source) : VK_NULL_HANDLE;
         cb = Cmd();
         VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};

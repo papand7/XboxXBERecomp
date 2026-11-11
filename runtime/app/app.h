@@ -49,6 +49,7 @@ struct Settings {
     bool fxaa = false;               // FXAA on the finished frame
     bool smaa = false;               // SMAA on the finished frame, in place of FXAA
     bool temporal_aa = false;        // jittered Vulkan temporal antialiasing; weapon/UI can ghost
+    bool auto_exposure = false;      // metered SDR exposure and tone mapping; Vulkan only
     uint32_t scale_filter = 0;       // the frame to the screen's size: 0 bilinear, 1 sharp (Catmull-Rom)
     bool alpha_coverage = false;     // with MSAA, alpha tested edges (fences, leaves) get partial coverage
     bool world_textures = false;     // the 3D scene's colour textures enlarged twice on a background thread

@@ -454,6 +454,8 @@ void Graphics(Settings& s) {
     }
     if (RowCheck("Temporal AA", &s.temporal_aa,
                  "Jitters 3D draws and reprojects depth-validated history. Fast-moving geometry and the weapon or HUD can ghost. Vulkan only.")) Save();
+    if (RowCheck("Automatic exposure", &s.auto_exposure,
+                 "Meters scene brightness and eases exposure over time with an SDR tone curve. Vulkan only.")) Save();
     int filter = int(s.scale_filter % 2);
     const char* filter_names[] = {"Bilinear", "Sharp"};
     if (RowChoice("Scaling filter", &filter, filter_names, 2, "How the frame reaches the screen's size when render scale is not 100%.")) {
