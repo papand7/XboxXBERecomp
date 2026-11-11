@@ -490,6 +490,20 @@ void Graphics(Settings& s) {
     }
     if (RowCheck("Ambient occlusion", &s.ambient_occlusion,
                  "Darkens corners and nearby surfaces. Uses ray queries when supported, with screen-space depth AO as a fallback. Vulkan only.")) Save();
+    if (RowCheck("Depth of field", &s.depth_of_field,
+                 "Blurs surfaces away from the selected focus distance using scene depth. The first-person weapon may blur too. Vulkan only.")) Save();
+    if (s.depth_of_field) {
+        int focus = int(s.focus_distance);
+        if (RowSlider("Focus distance", &focus, 1, 100, 1, " m")) {
+            s.focus_distance = uint32_t(focus);
+            Save();
+        }
+        int blur = int(s.dof_blur);
+        if (RowSlider("Depth blur", &blur, 0, 12, 1, " px")) {
+            s.dof_blur = uint32_t(blur);
+            Save();
+        }
+    }
     const char* style_names[] = {"Original", "Enhanced Color", "Toon (Screen)", "Retro", "Noir"};
     int vignette = int(s.vignette);
     if (RowSlider("Vignette", &vignette, 0, 100, 5, "%", "Darkens the edges of the finished frame.")) {

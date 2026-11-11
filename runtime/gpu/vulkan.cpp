@@ -716,6 +716,7 @@ private:
     void UploadGammaRamp();
     void BlitFrame(Target& t, VkImageView view, VkImageView source);
     VkImageView AmbientOcclusion(Target& t, VkImageView source, VkImageView depth);
+    VkImageView DepthOfField(Target& t, VkImageView source, VkImageView depth);
     void RenderUi();
     void ReleaseOldTextures();
     void CountFps();
@@ -863,6 +864,8 @@ private:
     uint64_t smaa_edge_vs_ = 0, smaa_edge_ps_ = 0, smaa_weight_vs_ = 0, smaa_weight_ps_ = 0;
     Image ao_half_, ao_scene_;
     uint32_t ao_w_ = 0, ao_h_ = 0;
+    Image dof_scene_;
+    uint32_t dof_w_ = 0, dof_h_ = 0;
     std::vector<Chunk> chunks_;  // stream chunks: [0] is being filled
     Buffer readback_;
     Dxc dxc_;
@@ -1454,6 +1457,7 @@ VulkanBackend::~VulkanBackend() {
     textures_.clear();
     DropImage(ao_half_);
     DropImage(ao_scene_);
+    DropImage(dof_scene_);
     for (auto& [k, m] : movie_up_) DropImage(m.up), DropImage(m.out);
     movie_up_.clear();
     DropImage(lut_);
@@ -2631,6 +2635,80 @@ float4 trace(O i) : SV_Target {
     End();
     Barrier();
     return ao_scene_.view;
+}
+
+VkImageView VulkanBackend::DepthOfField(Target& t, VkImageView source, VkImageView depth) {
+    if (!source || !depth || !app::Get().dof_blur) return source;
+    static const std::string hlsl = R"(
+cbuffer P : register(b1) { float4 p[2]; };
+Texture2D scene : register(t0);
+Texture2D<float> depthtex : register(t1);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o; float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o;
+}
+float viewz(float d) {
+    return d >= 0.99999 ? 10000 : p[0].w > 0.5 ? d * 4096.0 : rcp(max(1.0 - d, 1e-6));
+}
+float blur(float z) {
+    return saturate(abs(1.0 - p[1].x / max(z, 0.1)) * 1.5) * p[1].y;
+}
+float4 dof(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 centre = scene.SampleLevel(pt, uv, 0).rgb;
+    float z0 = viewz(depthtex.SampleLevel(pt, uv, 0));
+    float r0 = blur(z0);
+    if (r0 < 0.5 || z0 >= 9999) return float4(centre, 1);
+    float2 px = p[0].xy;
+    float3 sum = centre;
+    float weight_sum = 1;
+    [unroll] for (int k = 0; k < 16; ++k) {
+        float rr = sqrt((k + 0.5) / 16.0);
+        float a = k * 2.39996323;
+        float2 q = uv + float2(cos(a), sin(a)) * (r0 * rr) * px;
+        if (any(q < 0) || any(q > 1)) continue;
+        float z = viewz(depthtex.SampleLevel(pt, q, 0));
+        float w = z < z0 * 0.97 ? saturate(blur(z) - rr * r0 + 1) : 1;
+        sum += scene.SampleLevel(ls, q, 0).rgb * w;
+        weight_sum += w;
+    }
+    return float4(sum / weight_sum, 1);
+}
+)";
+    uint64_t vs_hash, ps_hash;
+    if (!Compile(hlsl, "vs", "vs_5_0", vs_hash) || !Compile(hlsl, "dof", "ps_5_0", ps_hash)) {
+        LOG_FIRST(1, "vulkan: depth-of-field shader did not compile; drawing without depth of field");
+        return source;
+    }
+    if (dof_scene_.img && (dof_w_ != t.w || dof_h_ != t.h)) DropImage(dof_scene_);
+    if (!dof_scene_.img) {
+        if (!MakeImage(dof_scene_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+            LOG_FIRST(1, "vulkan: depth-of-field target could not be made; drawing without depth of field");
+            return source;
+        }
+        dof_w_ = t.w;
+        dof_h_ = t.h;
+    }
+    VkPipeline pipeline = PassPipeline({vs_hash, ps_hash, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pipeline) return source;
+    static const bool wbuffer = [] {
+        const char* e = std::getenv("XBE_WBUFFER");
+        return !(e && *e == '0');
+    }();
+    const app::Settings& st = app::Get();
+    float constants[8] = {1.0f / t.w, 1.0f / t.h, float(t.w) / float(t.h), wbuffer ? 1.0f : 0.0f,
+                          float(st.focus_distance), float(st.dof_blur), 0.0f, 0.0f};
+    VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
+    VkRect2D sc{{0, 0}, {t.w, t.h}};
+    VkImageView views[4] = {source, depth, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    FullScreen(pipeline, {dof_scene_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, constants, 8, views, 2);
+    End();
+    Barrier();
+    return dof_scene_.view;
 }
 
 VkImageView VulkanBackend::UpscaleMovie(Tex& tx, const TextureDesc& d) {
@@ -3940,6 +4018,9 @@ void VulkanBackend::Present(const Surface& front) {
         if (t && app::Get().ambient_occlusion && scene_depth_frame_ == presents_ + 1 &&
             scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
             frame_source = AmbientOcclusion(*t, frame_source, scene_depth_view_);
+        if (t && app::Get().depth_of_field && scene_depth_frame_ == presents_ + 1 &&
+            scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
+            frame_source = DepthOfField(*t, frame_source, scene_depth_view_);
         cb = Cmd();
         VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
         ib.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;

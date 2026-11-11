@@ -232,6 +232,9 @@ void Load() {
     s.color_style = std::min<uint32_t>(t["color_style"].value_or(s.color_style), 4);
     s.bloom = std::min<uint32_t>(t["bloom"].value_or(s.bloom), 100);
     s.ambient_occlusion = t["ambient_occlusion"].value_or(s.ambient_occlusion);
+    s.depth_of_field = t["depth_of_field"].value_or(s.depth_of_field);
+    s.focus_distance = std::clamp<uint32_t>(t["focus_distance"].value_or(s.focus_distance), 1, 100);
+    s.dof_blur = std::min<uint32_t>(t["dof_blur"].value_or(s.dof_blur), 12);
     s.vignette = std::min<uint32_t>(t["vignette"].value_or(s.vignette), 100);
     s.film_grain = std::min<uint32_t>(t["film_grain"].value_or(s.film_grain), 100);
     s.movie_upscale = t["movie_upscale"].value_or(s.movie_upscale);
@@ -338,6 +341,9 @@ toml::table Table() {
                   {"color_style", int64_t(s.color_style)},
                   {"bloom", int64_t(s.bloom)},
                   {"ambient_occlusion", s.ambient_occlusion},
+                  {"depth_of_field", s.depth_of_field},
+                  {"focus_distance", int64_t(s.focus_distance)},
+                  {"dof_blur", int64_t(s.dof_blur)},
                   {"vignette", int64_t(s.vignette)},
                   {"film_grain", int64_t(s.film_grain)},
                   {"movie_upscale", s.movie_upscale},
