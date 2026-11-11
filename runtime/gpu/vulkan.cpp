@@ -49,6 +49,7 @@
 #include "gpu/ext.h"
 #include "gpu/shaders.h"
 #include "gpu/smaa.h"
+#include "gpu/texture_pack.h"
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
@@ -2616,6 +2617,14 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
     const uint64_t key = uint64_t(palette.va) << 32 | d.data;
     Tex& tx = textures_[key];
     bool same = SameTexture(tx, d);
+    const uint8_t* guest = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
+    if (tx.frame != presents_ + 1 || !same || tx.palette != palette.hash) {
+        TexturePackSeen(d, guest, palette.va ? palette.colours : nullptr, palette.hash);
+        if (auto replacement = FindReplacement(d.data); replacement && ReplacementFits(*replacement, d)) {
+            stages.replaced[stage] = true;
+            return BindReplacement(*replacement, d, stages.levels[stage]);
+        }
+    }
     if (!same && !CreateTexture(tx, d, fi)) {
         DropImage(tx.img);
         textures_.erase(key);
@@ -2627,7 +2636,7 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         uint64_t sig = SurfaceSig(d.data, TotalSize(d)) ^ DirtyEpoch(d.data) ^ palette.hash;
         if (sig != tx.sig || !same) {
             tx.sig = sig;
-            UploadTexture(tx, d, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), palette.va ? palette.colours : nullptr);
+            UploadTexture(tx, d, guest, palette.va ? palette.colours : nullptr);
         }
     }
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);

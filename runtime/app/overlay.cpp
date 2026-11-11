@@ -459,6 +459,8 @@ void Graphics(Settings& s) {
         Save();
     }
     if (RowCheck("Enhanced world textures", &s.world_textures, "Doubles the 3D scene's textures in the background as they appear. Uses more video memory; textures may sharpen a moment after they show. Can cause hitches of a quarter of a second as new scenery appears.")) Save();
+    if (RowCheck("HD texture pack", &s.texture_pack, "Loads matching PNGs from mods/textures beside the game executable. Texture packs are not included.")) Save();
+    if (RowCheck("Dump textures", &s.dump_textures, "Writes original game textures to mods/textures/dump so you can build a pack.")) Save();
     int sharp = int(s.sharpen);
     if (RowSlider("Sharpening", &sharp, 0, 100, 5, "%")) {
         s.sharpen = uint32_t(sharp);

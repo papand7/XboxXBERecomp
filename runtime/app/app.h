@@ -51,6 +51,8 @@ struct Settings {
     uint32_t scale_filter = 0;       // the frame to the screen's size: 0 bilinear, 1 sharp (Catmull-Rom)
     bool alpha_coverage = false;     // with MSAA, alpha tested edges (fences, leaves) get partial coverage
     bool world_textures = false;     // the 3D scene's colour textures enlarged twice on a background thread
+    bool texture_pack = true;       // replace game textures with PNGs from mods/textures
+    bool dump_textures = false;     // dump originals to mods/textures/dump
     bool low_latency = false;        // a waitable swap chain holding one frame, at the next start
     uint32_t sharpen = 0;            // percent, contrast adaptive sharpening of the finished frame
     uint32_t renderer = 0;           // Vulkan, at the next start
