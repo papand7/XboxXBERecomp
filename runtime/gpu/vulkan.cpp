@@ -1381,6 +1381,7 @@ bool VulkanBackend::CreateDevice() {
                  vkGetAccelerationStructureBuildSizesKHR && vkCmdBuildAccelerationStructuresKHR &&
                  vkGetAccelerationStructureDeviceAddressKHR;
     }
+    app::ray_query_ok = rt_ok_;  // the settings pages offer ray tracing only where it can run
 #define VK_CHECK_LOADED(f)                                   \
     if (!f) {                                                \
         LOGE("vulkan: %s missing from the driver", #f);      \

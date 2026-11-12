@@ -159,6 +159,8 @@ void OverlayInit();  // the fonts, after ImGui's context and before a renderer's
 // a key pressed while the overlay waits for one to bind (window thread); true takes it
 bool OverlayKey(uint16_t vk);
 
+// the Vulkan device has ray queries and acceleration structures (set when the device is made): ray tracing settings show only then
+inline std::atomic<bool> ray_query_ok{false};
 Settings& Get();
 void Load();
 void Save();
