@@ -51,6 +51,7 @@
 #include "gpu/ext.h"
 #include "gpu/fx_hlsl.h"
 #include "gpu/rt_hlsl.h"
+#include "gpu/rt_relight_hlsl.h"
 #include "gpu/shaders.h"
 #include "gpu/smaa.h"
 #include "gpu/texture_pack.h"
@@ -847,6 +848,11 @@ private:
     void RtReadReflections();
     void RtReflectPass(Target& rt);
     void RtTimes();
+    // ray traced lighting (gpu/rt_relight_hlsl.h): the game's lights as the draws set them (RtHarvestLights), the
+    // relight over the lightmaps (RtRelightPass), the traced space put into the last frame's (RtReproject)
+    void RtHarvestLights(const State& s);
+    void RtToSpace(const float w[3], bool point, float out[3]) const;
+    void RtRelightPass(Target& rt);
     bool DrawGeometry(const Assembled& a);
     // visibility tests
     bool NewQuery(uint32_t& index);
@@ -952,6 +958,23 @@ private:
     std::filesystem::file_time_type rt_reflect_time_{};
     uint64_t rt_reflect_checked_ = 0;
     bool rt_reflect_read_ = false;
+    // the game's point lights this frame (world places; RtHarvestLights), and when each was first and last seen:
+    // kind 1 (dynamic: added with traced shadows) for a light reaching under 2000 units first seen within the last 15 frames, else 0 (a static lamp,
+    // in the lightmap already: only the shadows of models are taken from it)
+    struct RtLight {
+        float world[3], range, colour[3];
+        int kind;
+    };
+    std::vector<RtLight> rt_lights_;
+    uint64_t rt_lights_frame_ = 0;
+    struct RtLightSeen {
+        uint64_t first = 0, last = 0;
+    };
+    std::unordered_map<uint64_t, RtLightSeen> rt_light_seen_;
+    // the strongest directional light the game set for its models this frame (toward it, world; its colour)
+    float rt_dir_light_[6]{};
+    float rt_dir_light_lum_ = 0;
+    uint64_t rt_dir_light_frame_ = 0;
     bool null_descriptor_ = false;
     bool custom_border_ = false;
     bool mirror_once_ = false;
@@ -4956,6 +4979,137 @@ void VulkanBackend::RtReflectPass(Target& rt) {
                                  rt_reflect_list_.size());
 }
 
+// the game's lights as a lit draw sets them (D3DLIGHT8: type, diffuse, specular, ambient, position, direction, range
+// ...): the point and spot lights listed once a frame (the same place and colour once), the strongest directional one
+// kept (the light the game shades its models by outdoors)
+void VulkanBackend::RtHarvestLights(const State& s) {
+    const uint64_t frame = presents_ + 1;
+    if (rt_lights_frame_ != frame) {
+        rt_lights_frame_ = frame;
+        rt_lights_.clear();
+        // lights not seen for 10 s forgotten (their next sighting is new again)
+        if (frame % 64 == 0)
+            for (auto it = rt_light_seen_.begin(); it != rt_light_seen_.end();)
+                it = frame > it->second.last + 600 ? rt_light_seen_.erase(it) : std::next(it);
+    }
+    for (int i = 0; i < 8; i++) {
+        if (!(s.light_enable >> i & 1)) continue;
+        const auto& L = s.lights[i];
+        auto f = [&](int k) {
+            float v;
+            std::memcpy(&v, &L[k], 4);
+            return std::isfinite(v) ? v : 0.0f;
+        };
+        const uint32_t type = L[0];
+        const float col[3] = {std::max(f(1), 0.0f), std::max(f(2), 0.0f), std::max(f(3), 0.0f)};
+        const float lum = col[0] * 0.3f + col[1] * 0.59f + col[2] * 0.11f;
+        if (lum < 0.02f) continue;
+        if (type == 3) {  // directional: toward the light is against its direction
+            if (rt_dir_light_frame_ != frame || lum > rt_dir_light_lum_) {
+                const float d[3] = {-f(16), -f(17), -f(18)};
+                const float l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                if (l < 1e-6f) continue;
+                rt_dir_light_[0] = d[0] / l, rt_dir_light_[1] = d[1] / l, rt_dir_light_[2] = d[2] / l;
+                std::memcpy(rt_dir_light_ + 3, col, sizeof(col));
+                rt_dir_light_lum_ = lum;
+                rt_dir_light_frame_ = frame;
+            }
+            continue;
+        }
+        if (type != 1 && type != 2) continue;
+        const float range = f(19);
+        if (range < 1 || range > 1e5f || rt_lights_.size() >= 64) continue;
+        const float pos[3] = {f(13), f(14), f(15)};
+        const int32_t q[7] = {int32_t(std::floor(pos[0] / 8)), int32_t(std::floor(pos[1] / 8)), int32_t(std::floor(pos[2] / 8)),
+                              int32_t(col[0] * 32), int32_t(col[1] * 32), int32_t(col[2] * 32), int32_t(range / 8)};
+        const uint64_t key = Hash(q, sizeof(q));
+        RtLightSeen& seen = rt_light_seen_[key];
+        if (!seen.first || frame > seen.last + 600) seen.first = frame;
+        const bool listed = seen.last == frame;
+        seen.last = frame;
+        if (listed) continue;
+        // a fill light the game places about each model (a reach of thousands of units, moving with it) is never a
+        // dynamic one, however new
+        const bool dynamic = frame < seen.first + 15 && range < 2000;
+        if (dynamic && std::getenv("AUF_RT_DIAG"))
+            LOG_FIRST(40, "rt: dynamic light at %.0f %.0f %.0f reach %.0f colour %.2f %.2f %.2f (frame %llu)", pos[0], pos[1],
+                      pos[2], range, col[0], col[1], col[2], (unsigned long long)frame);
+        RtLight l{{pos[0], pos[1], pos[2]}, range, {col[0], col[1], col[2]}, dynamic ? 1 : 0};
+        rt_lights_.push_back(l);
+    }
+}
+
+// a world place (point) or direction into the traced space by the scene's camera (RtCapture's)
+void VulkanBackend::RtToSpace(const float w[3], bool point, float out[3]) const {
+    const float* V = rt_cam_.view;
+    const float* P = rt_cam_.proj;
+    float v[3];
+    for (int c = 0; c < 3; c++) v[c] = w[0] * V[c] + w[1] * V[4 + c] + w[2] * V[8 + c] + (point ? V[12 + c] : 0);
+    const float cx = v[0] * P[0] + v[1] * P[4] + v[2] * P[8] + (point ? P[12] : 0);
+    const float cy = v[0] * P[1] + v[1] * P[5] + v[2] * P[9] + (point ? P[13] : 0);
+    const float cw = v[0] * P[3] + v[1] * P[7] + v[2] * P[11] + (point ? P[15] : 0);
+    out[0] = cx * rt_cam_.tanx, out[1] = cy * rt_cam_.tany, out[2] = cw;
+}
+
+// the level lit again over its lightmaps (kRtRelightHlsl ps): the dynamic lights added with traced shadows, the static
+// lamps' light taken where a model stands in its way
+void VulkanBackend::RtRelightPass(Target& rt) {
+    const app::Settings& st = app::Get();
+    const bool shadows = st.FxOf(app::kFxRtShadows) != 0, lighting = st.FxOf(app::kFxRtLighting) != 0;
+    static const std::string src = std::string("#define RT_P 136\n") + kRtCommonHlsl + kRtRelightHlsl;
+    uint64_t vh, ph;
+    if (!Compile(src, "vs", "vs_6_5", vh) || !Compile(src, "ps", "ps_6_5", ph)) {
+        LOG_FIRST(1, "vulkan: the ray traced lighting did not compile; not drawn");
+        return;
+    }
+    PassKey pk{vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    pk.rt = 1;
+    VkPipeline pipe = PassPipeline(pk);
+    if (!pipe || !RtCopyScene(rt)) return;
+    const bool kept = rt_ds_->rt_depth.img && rt_ds_->rt_depth_frame == presents_ + 1;
+    const int test = RtTest() >= 6 && RtTest() <= 9 ? RtTest() : 0;
+    std::vector<float> c(136 * 4, 0.0f);
+    const float head[8] = {1.0f / rt.w, 1.0f / rt.h, rt_cam_.tany, rt_cam_.tanx / rt_cam_.tany,
+                           rt_cam_.za, rt_cam_.zb, kept ? 1.0f : 0.0f, kRtUnitsPerMetre};
+    std::memcpy(c.data(), head, sizeof(head));
+    uint32_t n = 0;
+    if (rt_lights_frame_ == presents_ + 1)
+        for (const RtLight& l : rt_lights_) {
+            float* q = &c[(8 + 2 * n) * 4];
+            RtToSpace(l.world, true, q);
+            q[3] = l.range;
+            q[4] = l.colour[0], q[5] = l.colour[1], q[6] = l.colour[2], q[7] = float(l.kind);
+            if (++n >= 64) break;
+        }
+    c[8] = float(n), c[9] = float(test), c[10] = shadows ? 1.0f : 0.0f, c[11] = lighting ? 1.0f : 0.0f;
+    c[21] = 1.0f;  // the lamps' scale
+    c[22] = 1e6f;  // the march's far distance
+    const VkImageView keptv = kept ? rt_ds_->rt_depth.view : rt_ds_->res.view;
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[4] = {rt_scene_.view, rt_ds_->res.view, dummy_.view, keptv};
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c.data(), uint32_t(c.size()), views, 4,
+               rt_[frame_slot_].tlas);
+    End();
+    Barrier();
+    static const bool diag = std::getenv("AUF_RT_DIAG") != nullptr;
+    if (diag && presents_ % 300 == 0) {
+        uint32_t dyn = 0;
+        for (const RtLight& l : rt_lights_) dyn += l.kind;
+        LOGR("rt: frame %llu: %u lights (%u dynamic), directional %s", (unsigned long long)presents_, n, dyn,
+             rt_dir_light_frame_ == presents_ + 1 ? "yes" : "no");
+        for (const RtLight& l : rt_lights_)
+            LOGR("rt:   light at %.0f %.0f %.0f reach %.0f colour %.2f %.2f %.2f kind %d", l.world[0], l.world[1],
+                 l.world[2], l.range, l.colour[0], l.colour[1], l.colour[2], l.kind);
+        if (rt_dir_light_frame_ == presents_ + 1)
+            LOGR("rt:   directional toward %.2f %.2f %.2f colour %.2f %.2f %.2f", rt_dir_light_[0], rt_dir_light_[1],
+                 rt_dir_light_[2], rt_dir_light_[3], rt_dir_light_[4], rt_dir_light_[5]);
+    }
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: ray traced lighting drawn (%u lights, shadows %d, dynamic lights %d)", n,
+                                 shadows ? 1 : 0, lighting ? 1 : 0);
+}
+
 // the ray traced passes over the finished 3D scene, once a frame: at the first 2D draw over it (before the HUD), or at
 // Present; the frame's capture built first
 void VulkanBackend::RtScenePass(Target& rt) {
@@ -4975,6 +5129,8 @@ void VulkanBackend::RtScenePass(Target& rt) {
         return e ? std::atoi(e) : 0;
     }();
     rt_built_ = skip != 1 && RtBuild();
+    if (rt_built_ && skip != 2 && (app::Get().FxOf(app::kFxRtShadows) || app::Get().FxOf(app::kFxRtLighting)))
+        RtRelightPass(rt);
     if (rt_built_ && skip != 2 && app::Get().FxOf(app::kFxRtAo) > 0) RtAoPass(rt);
     if (rt_built_ && skip != 2 && app::Get().FxOf(app::kFxReflections) > 0) RtReflectPass(rt);
     End();
@@ -5071,6 +5227,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (pk.wbuf) k.zbias = 0, k.zslope = 0;
     // ray tracing: a draw of the scene writes its vertices as it is drawn (its vertex shader's capture variant)
     uint32_t rt_push[4] = {};
+    if (s.rs[kRsLighting] && s.light_enable && !draw_2d_ && RtWanted()) RtHarvestLights(s);
     const bool rt_capturing = RtCapture(s, a, sh, k, stages, rt_push);
     VkPipeline p = EnsurePipeline(k);
     if (!p && rt_capturing) {
