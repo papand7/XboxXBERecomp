@@ -50,6 +50,7 @@
 #include "gpu/d3d_common.h"
 #include "gpu/ext.h"
 #include "gpu/fx_hlsl.h"
+#include "gpu/rt.h"
 #include "gpu/rt_hlsl.h"
 #include "gpu/rt_relight_hlsl.h"
 #include "gpu/shaders.h"
@@ -208,6 +209,7 @@ constexpr uint32_t kBindVsc = 0, kBindDc = 1, kBindTex = 2, kBindSmp = 6, kBindC
 // name and their sampler (gpu/rt_hlsl.h kRtCommonHlsl)
 constexpr uint32_t kBindRtVerts = 12, kBindRtTris = 13, kBindRtMats = 14, kBindRtSpare = 15, kBindRtAdj = 16;
 constexpr uint32_t kRtTextures = 1024;
+constexpr uint32_t kRtStamps = 6;  // GPU timestamps a frame slot: before the build, after it and each traced step
 constexpr uint32_t kRtVertBytes = 32;  // a captured vertex: place, fog, texture coordinates 0, diffuse, coordinates 1
 constexpr uint32_t kRtCaptureCapacity = 1u << 20;  // vertices a frame
 constexpr uint64_t kRtCaptureShaderSalt = 0xD1B54A32D192ED13ull;
@@ -848,11 +850,16 @@ private:
     void RtReadReflections();
     void RtReflectPass(Target& rt);
     void RtTimes();
+    void RtStamp(uint32_t k);
     // ray traced lighting (gpu/rt_relight_hlsl.h): the game's lights as the draws set them (RtHarvestLights), the
     // relight over the lightmaps (RtRelightPass), the traced space put into the last frame's (RtReproject)
     void RtHarvestLights(const State& s);
     void RtToSpace(const float w[3], bool point, float out[3]) const;
     void RtRelightPass(Target& rt);
+    void RtLightConstants(Target& rt, std::vector<float>& c);
+    bool RtReproject(float m[12]);
+    VkImageView RtAccumulate(Target& rt, Image& cur, Image (&acc)[2], uint64_t& frame, bool distance);
+    void RtVolPass(Target& rt);
     bool DrawGeometry(const Assembled& a);
     // visibility tests
     bool NewQuery(uint32_t& index);
@@ -928,6 +935,7 @@ private:
     float rt_tick_ns_ = 1;
     double rt_gpu_ms_ = 0;  // summed since LogPerf last wrote it
     uint32_t rt_gpu_n_ = 0;
+    double rt_step_ms_[kRtStamps - 1] = {};  // build, relight, occlusion, reflections, the air
     // this frame's capture, the CPU's side: (presents_ + 1) it is for, vertices written, triangles, two material words
     // a triangle, the textures they name, the depth target the draws wrote
     uint64_t rt_frame_ = 0;
@@ -975,6 +983,16 @@ private:
     float rt_dir_light_[6]{};
     float rt_dir_light_lum_ = 0;
     uint64_t rt_dir_light_frame_ = 0;
+    // the light the game shades its models by most (a point light thousands of units off, as AUF's): toward it from
+    // the model, its colour; the sun where the level names none
+    float rt_key_light_[6]{};
+    float rt_key_light_lum_ = 0;
+    uint64_t rt_key_light_frame_ = 0;
+    // the bounced light and the air (half size), built up over frames; the camera last frame (RtReproject)
+    Image rt_gi_, rt_vol_, rt_gi_acc_[2], rt_vol_acc_[2];
+    uint64_t rt_gi_frame_ = 0, rt_vol_frame_ = 0, rt_prev_frame_ = 0;
+    float rt_prev_view_[16]{};
+    float rt_sun_[7]{};  // the sun the relight used this frame (the traced space, strength, colour): the air's too
     bool null_descriptor_ = false;
     bool custom_border_ = false;
     bool mirror_once_ = false;
@@ -1563,7 +1581,7 @@ bool VulkanBackend::CreateFixed() {
         }
         VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qci.queryCount = 2 * kFramesInFlight;
+        qci.queryCount = kRtStamps * kFramesInFlight;
         if (vkCreateQueryPool(dev_, &qci, nullptr, &rt_time_pool_) != VK_SUCCESS) rt_time_pool_ = VK_NULL_HANDLE;
         VkPhysicalDeviceProperties pp;
         vkGetPhysicalDeviceProperties(pd_, &pp);
@@ -1714,6 +1732,7 @@ VulkanBackend::~VulkanBackend() {
     }
     DropImage(rt_scene_);
     DropImage(rt_ao_);
+    for (Image* im : {&rt_gi_, &rt_vol_, &rt_gi_acc_[0], &rt_gi_acc_[1], &rt_vol_acc_[0], &rt_vol_acc_[1]}) DropImage(*im);
     if (cmd_) Submit();
     vkDeviceWaitIdle(dev_);
     for (auto& [serial, f] : retire_) f();
@@ -4794,18 +4813,25 @@ void VulkanBackend::RtKeepDepth(Target& ds) {
     dirty_ = true;
 }
 
-// the GPU's time for the slot's last ray traced work (its frame is done: its capture waited for it)
+// the GPU's time for the slot's last ray traced work (its frame is done: its capture waited for it), by step: the
+// build, the relight (with the bounced light), occlusion, reflections, the air
 void VulkanBackend::RtTimes() {
     RtFrame& f = rt_[frame_slot_];
     if (!rt_time_pool_ || !f.timed) return;
     f.timed = false;
-    uint64_t t[2] = {};
-    if (vkGetQueryPoolResults(dev_, rt_time_pool_, frame_slot_ * 2, 2, sizeof(t), t, sizeof(uint64_t),
-                              VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
-        t[1] > t[0]) {
-        rt_gpu_ms_ += double(t[1] - t[0]) * rt_tick_ns_ / 1e6;
-        rt_gpu_n_++;
-    }
+    uint64_t t[kRtStamps] = {};
+    if (vkGetQueryPoolResults(dev_, rt_time_pool_, frame_slot_ * kRtStamps, kRtStamps, sizeof(t), t, sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS || t[kRtStamps - 1] < t[0])
+        return;
+    rt_gpu_ms_ += double(t[kRtStamps - 1] - t[0]) * rt_tick_ns_ / 1e6;
+    for (uint32_t k = 1; k < kRtStamps; k++) rt_step_ms_[k - 1] += double(t[k] - t[k - 1]) * rt_tick_ns_ / 1e6;
+    rt_gpu_n_++;
+}
+
+void VulkanBackend::RtStamp(uint32_t k) {
+    if (!rt_time_pool_) return;
+    End();
+    vkCmdWriteTimestamp(Cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rt_time_pool_, frame_slot_ * kRtStamps + k);
 }
 
 // the scene copied for the passes to read (rt_scene_), the target written over by them
@@ -5020,6 +5046,21 @@ void VulkanBackend::RtHarvestLights(const State& s) {
         const float range = f(19);
         if (range < 1 || range > 1e5f || rt_lights_.size() >= 64) continue;
         const float pos[3] = {f(13), f(14), f(15)};
+        const float sat = (std::max({col[0], col[1], col[2]}) - std::min({col[0], col[1], col[2]})) /
+                          std::max(std::max({col[0], col[1], col[2]}), 1e-3f);
+        const float keyness = lum * (1 + 2 * sat);  // the coloured key light before a white fill
+        if (range >= 5000 && (rt_key_light_frame_ != frame || keyness > rt_key_light_lum_)) {
+            // a key light far off: its direction from the model (the world matrix's place) is the level's sun
+            const float* W = s.transforms[256].data();
+            const float d[3] = {pos[0] - W[12], pos[1] - W[13], pos[2] - W[14]};
+            const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (dl > 1) {
+                rt_key_light_[0] = d[0] / dl, rt_key_light_[1] = d[1] / dl, rt_key_light_[2] = d[2] / dl;
+                std::memcpy(rt_key_light_ + 3, col, sizeof(col));
+                rt_key_light_lum_ = keyness;
+                rt_key_light_frame_ = frame;
+            }
+        }
         const int32_t q[7] = {int32_t(std::floor(pos[0] / 8)), int32_t(std::floor(pos[1] / 8)), int32_t(std::floor(pos[2] / 8)),
                               int32_t(col[0] * 32), int32_t(col[1] * 32), int32_t(col[2] * 32), int32_t(range / 8)};
         const uint64_t key = Hash(q, sizeof(q));
@@ -5051,24 +5092,14 @@ void VulkanBackend::RtToSpace(const float w[3], bool point, float out[3]) const 
     out[0] = cx * rt_cam_.tanx, out[1] = cy * rt_cam_.tany, out[2] = cw;
 }
 
-// the level lit again over its lightmaps (kRtRelightHlsl ps): the dynamic lights added with traced shadows, the static
-// lamps' light taken where a model stands in its way
-void VulkanBackend::RtRelightPass(Target& rt) {
+// the lighting passes' constants (kRtRelightHlsl's b1): the camera, the game's lights in the traced space, the sun (the
+// level's, else the key light the game shades its models by), the bounced light's and the air's settings
+void VulkanBackend::RtLightConstants(Target& rt, std::vector<float>& c) {
     const app::Settings& st = app::Get();
     const bool shadows = st.FxOf(app::kFxRtShadows) != 0, lighting = st.FxOf(app::kFxRtLighting) != 0;
-    static const std::string src = std::string("#define RT_P 136\n") + kRtCommonHlsl + kRtRelightHlsl;
-    uint64_t vh, ph;
-    if (!Compile(src, "vs", "vs_6_5", vh) || !Compile(src, "ps", "ps_6_5", ph)) {
-        LOG_FIRST(1, "vulkan: the ray traced lighting did not compile; not drawn");
-        return;
-    }
-    PassKey pk{vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
-    pk.rt = 1;
-    VkPipeline pipe = PassPipeline(pk);
-    if (!pipe || !RtCopyScene(rt)) return;
     const bool kept = rt_ds_->rt_depth.img && rt_ds_->rt_depth_frame == presents_ + 1;
     const int test = RtTest() >= 6 && RtTest() <= 9 ? RtTest() : 0;
-    std::vector<float> c(136 * 4, 0.0f);
+    c.assign(136 * 4, 0.0f);
     const float head[8] = {1.0f / rt.w, 1.0f / rt.h, rt_cam_.tany, rt_cam_.tanx / rt_cam_.tany,
                            rt_cam_.za, rt_cam_.zb, kept ? 1.0f : 0.0f, kRtUnitsPerMetre};
     std::memcpy(c.data(), head, sizeof(head));
@@ -5082,32 +5113,213 @@ void VulkanBackend::RtRelightPass(Target& rt) {
             if (++n >= 64) break;
         }
     c[8] = float(n), c[9] = float(test), c[10] = shadows ? 1.0f : 0.0f, c[11] = lighting ? 1.0f : 0.0f;
-    c[21] = 1.0f;  // the lamps' scale
-    c[22] = 1e6f;  // the march's far distance
+    {
+        float sdir[3] = {}, scol[3] = {}, sstr = 0;
+        RtSun sun;
+        if (GetRtSun(sun)) {
+            std::memcpy(sdir, sun.dir, sizeof(sdir)), std::memcpy(scol, sun.colour, sizeof(scol)), sstr = sun.strength;
+        } else if (rt_key_light_frame_) {
+            std::memcpy(sdir, rt_key_light_, sizeof(sdir)), std::memcpy(scol, rt_key_light_ + 3, sizeof(scol)), sstr = 1;
+        }
+        sstr *= float(st.FxOf(app::kFxRtSun)) / 100.0f;
+        float d[3];
+        RtToSpace(sdir, false, d);
+        const float l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (sstr > 0 && l > 1e-6f) {
+            c[12] = d[0] / l, c[13] = d[1] / l, c[14] = d[2] / l, c[15] = 0.35f * sstr;
+            c[16] = scol[0], c[17] = scol[1], c[18] = scol[2];
+        }
+        std::memcpy(rt_sun_, &c[12], sizeof(float) * 7);
+    }
+    c[19] = st.FxOf(app::kFxRtGi) ? float(st.FxOf(app::kFxRtGiStrength)) / 100.0f : 0.0f;
+    c[20] = float(st.FxOf(app::kFxRtVolStrength)) / 100.0f;
+    c[21] = 1.0f;                    // the lamps' scale
+    c[22] = 60 * kRtUnitsPerMetre;   // the air marched to 60 m at most
+    const uint32_t hw = std::max<uint32_t>(rt.w / 2, 1), hh = std::max<uint32_t>(rt.h / 2, 1);
+    c[24] = 1.0f / hw, c[25] = 1.0f / hh, c[26] = 4;  // the bounced light: 4 rays a half-size pixel
+}
+
+// the traced space now put into last frame's (the camera's move: the view matrices, the traced space's z the view's
+// times the projection's w column): three rows for kRtAccHlsl, false without a last frame
+bool VulkanBackend::RtReproject(float m[12]) {
+    if (rt_prev_frame_ != presents_) return false;
+    const float* V = rt_cam_.view;
+    const float k = rt_cam_.proj[11] != 0 ? rt_cam_.proj[11] : 1.0f;
+    // the inverse of the view (an affine row-vector matrix: rotation and scale, then the place)
+    const float a = V[0], b = V[1], cc = V[2], d = V[4], e = V[5], f = V[6], g = V[8], h = V[9], i = V[10];
+    const float det = a * (e * i - f * h) - b * (d * i - f * g) + cc * (d * h - e * g);
+    if (std::abs(det) < 1e-12f) return false;
+    float R[9] = {(e * i - f * h) / det, (cc * h - b * i) / det, (b * f - cc * e) / det,
+                  (f * g - d * i) / det, (a * i - cc * g) / det, (cc * d - a * f) / det,
+                  (d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det};
+    auto to_last = [&](const float r[3], bool point, float out[3]) {
+        const float v[3] = {r[0], r[1], r[2] / k};  // the traced space to the view
+        float w[3];
+        for (int c2 = 0; c2 < 3; c2++) {
+            float s = v[0] * R[c2] + v[1] * R[3 + c2] + v[2] * R[6 + c2];
+            if (point) s -= V[12] * R[c2] + V[13] * R[3 + c2] + V[14] * R[6 + c2];
+            w[c2] = s;
+        }
+        const float* L = rt_prev_view_;
+        float l[3];
+        for (int c2 = 0; c2 < 3; c2++) l[c2] = w[0] * L[c2] + w[1] * L[4 + c2] + w[2] * L[8 + c2] + (point ? L[12 + c2] : 0);
+        out[0] = l[0], out[1] = l[1], out[2] = l[2] * k;
+    };
+    const float o[3] = {0, 0, 0}, ax[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    float t[3];
+    to_last(o, true, t);
+    for (int r = 0; r < 3; r++) {
+        float col[3];
+        for (int q = 0; q < 3; q++) {
+            to_last(ax[q], false, col);
+            m[r * 4 + q] = col[r];
+        }
+        m[r * 4 + 3] = t[r];
+    }
+    return true;
+}
+
+// a half-size traced image built up over frames (kRtAccHlsl, rt_denoise): the result's view
+VkImageView VulkanBackend::RtAccumulate(Target& rt, Image& cur, Image (&acc)[2], uint64_t& frame, bool distance) {
+    if (!app::Get().FxOf(app::kFxRtDenoise)) return cur.view;
+    uint64_t vh, ah;
+    if (!Compile(kRtAccHlsl, "vs", "vs_5_0", vh) || !Compile(kRtAccHlsl, "acc", "ps_5_0", ah)) return cur.view;
+    VkPipeline pl = PassPipeline({vh, ah, cur.fmt, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pl) return cur.view;
+    for (Image& im : acc) {
+        if (im.img && (im.w != cur.w || im.h != cur.h)) DropImage(im), frame = 0;
+        if (!im.img && !MakeImage(im, VK_IMAGE_TYPE_2D, cur.fmt, cur.w, cur.h, 1, 1, 1,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+            return cur.view;
+    }
+    float c[20] = {1.0f / cur.w, 1.0f / cur.h, rt_cam_.tany, rt_cam_.tanx / rt_cam_.tany, 0, 0.2f, distance ? 1.0f : 0.0f, 0};
+    c[4] = frame == presents_ && RtReproject(c + 8) ? 1.0f : 0.0f;
+    Image& out = acc[presents_ & 1];
+    const Image& was = acc[(presents_ + 1) & 1];
+    VkViewport vp{0, 0, float(cur.w), float(cur.h), 0, 1};
+    VkRect2D sc{{0, 0}, {cur.w, cur.h}};
+    VkImageView v[4] = {cur.view, was.view, dummy_.view, dummy_.view};
+    FullScreen(pl, {out.att, VK_NULL_HANDLE, cur.w, cur.h}, vp, sc, c, 20, v, 4);
+    End();
+    Barrier();
+    frame = presents_ + 1;
+    (void)rt;
+    return out.view;
+}
+
+// the level lit again over its lightmaps (kRtRelightHlsl ps): the dynamic lights added with traced shadows, the
+// static lamps' and the sun's light taken where a model stands in its way, the sun added where it is open, the
+// bounced light (gi, half size, built up over frames) added
+void VulkanBackend::RtRelightPass(Target& rt) {
+    const app::Settings& st = app::Get();
+    static const std::string src = std::string("#define RT_P 136\n") + kRtCommonHlsl + kRtRelightHlsl;
+    uint64_t vh, ph, gh;
+    if (!Compile(src, "vs", "vs_6_5", vh) || !Compile(src, "ps", "ps_6_5", ph) || !Compile(src, "gi", "ps_6_5", gh)) {
+        LOG_FIRST(1, "vulkan: the ray traced lighting did not compile; not drawn");
+        return;
+    }
+    PassKey pk{vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    pk.rt = 1;
+    VkPipeline pipe = PassPipeline(pk);
+    if (!pipe) return;
+    std::vector<float> c;
+    RtLightConstants(rt, c);
+    const bool kept = rt_ds_->rt_depth.img && rt_ds_->rt_depth_frame == presents_ + 1;
     const VkImageView keptv = kept ? rt_ds_->rt_depth.view : rt_ds_->res.view;
+    const VkAccelerationStructureKHR tlas = rt_[frame_slot_].tlas;
+    VkImageView gi = dummy_.view;
+    if (c[19] > 0) {
+        constexpr VkFormat kGiFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        PassKey gk{vh, gh, kGiFormat, VK_FORMAT_UNDEFINED, 0, 0};
+        gk.rt = 1;
+        VkPipeline gp = PassPipeline(gk);
+        const uint32_t hw = std::max<uint32_t>(rt.w / 2, 1), hh = std::max<uint32_t>(rt.h / 2, 1);
+        if (rt_gi_.img && (rt_gi_.w != hw || rt_gi_.h != hh)) DropImage(rt_gi_);
+        if (gp && (rt_gi_.img || MakeImage(rt_gi_, VK_IMAGE_TYPE_2D, kGiFormat, hw, hh, 1, 1, 1,
+                                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) {
+            VkViewport hvp{0, 0, float(hw), float(hh), 0, 1};
+            VkRect2D hsc{{0, 0}, {hw, hh}};
+            VkImageView gv[4] = {dummy_.view, rt_ds_->res.view, dummy_.view, keptv};
+            FullScreen(gp, {rt_gi_.att, VK_NULL_HANDLE, hw, hh}, hvp, hsc, c.data(), uint32_t(c.size()), gv, 4, tlas);
+            End();
+            Barrier();
+            gi = RtAccumulate(rt, rt_gi_, rt_gi_acc_, rt_gi_frame_, false);
+        } else {
+            c[19] = 0;
+        }
+    }
+    if (!st.FxOf(app::kFxRtShadows) && !st.FxOf(app::kFxRtLighting) && c[15] <= 0 && c[19] <= 0) return;
+    if (!RtCopyScene(rt)) return;
     VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
     VkRect2D sc{{0, 0}, {rt.w, rt.h}};
-    VkImageView views[4] = {rt_scene_.view, rt_ds_->res.view, dummy_.view, keptv};
-    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c.data(), uint32_t(c.size()), views, 4,
-               rt_[frame_slot_].tlas);
+    VkImageView views[4] = {rt_scene_.view, rt_ds_->res.view, gi, keptv};
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c.data(), uint32_t(c.size()), views, 4, tlas);
     End();
     Barrier();
     static const bool diag = std::getenv("AUF_RT_DIAG") != nullptr;
     if (diag && presents_ % 300 == 0) {
         uint32_t dyn = 0;
         for (const RtLight& l : rt_lights_) dyn += l.kind;
-        LOGR("rt: frame %llu: %u lights (%u dynamic), directional %s", (unsigned long long)presents_, n, dyn,
+        LOGR("rt: frame %llu: %u lights (%u dynamic), directional %s", (unsigned long long)presents_, uint32_t(c[8]), dyn,
              rt_dir_light_frame_ == presents_ + 1 ? "yes" : "no");
+        RtSun lsun;
+        const bool level_sun = GetRtSun(lsun);
+        LOGR("rt:   sun (%s) toward %.2f %.2f %.2f (world %.2f %.2f %.2f), strength %.2f, colour %.2f %.2f %.2f",
+             level_sun ? "the level's" : "the models' key light", rt_sun_[0], rt_sun_[1], rt_sun_[2],
+             level_sun ? lsun.dir[0] : rt_key_light_[0], level_sun ? lsun.dir[1] : rt_key_light_[1],
+             level_sun ? lsun.dir[2] : rt_key_light_[2], rt_sun_[3], rt_sun_[4], rt_sun_[5], rt_sun_[6]);
         for (const RtLight& l : rt_lights_)
             LOGR("rt:   light at %.0f %.0f %.0f reach %.0f colour %.2f %.2f %.2f kind %d", l.world[0], l.world[1],
                  l.world[2], l.range, l.colour[0], l.colour[1], l.colour[2], l.kind);
-        if (rt_dir_light_frame_ == presents_ + 1)
-            LOGR("rt:   directional toward %.2f %.2f %.2f colour %.2f %.2f %.2f", rt_dir_light_[0], rt_dir_light_[1],
-                 rt_dir_light_[2], rt_dir_light_[3], rt_dir_light_[4], rt_dir_light_[5]);
     }
     static bool said = false;
-    if (!said) said = true, LOGR("vulkan: ray traced lighting drawn (%u lights, shadows %d, dynamic lights %d)", n,
-                                 shadows ? 1 : 0, lighting ? 1 : 0);
+    if (!said) said = true, LOGR("vulkan: ray traced lighting drawn (%u lights, sun %.2f, bounced light %.2f)",
+                                 uint32_t(c[8]), c[15], c[19]);
+}
+
+// the air lit (kRtRelightHlsl vol, volc; rt_volumetric): the sun's shafts and the lamps' glow, traced at half size,
+// built up over frames, then added over the scene
+void VulkanBackend::RtVolPass(Target& rt) {
+    static const std::string src = std::string("#define RT_P 136\n") + kRtCommonHlsl + kRtRelightHlsl;
+    uint64_t vh, mh, ch;
+    if (!Compile(src, "vs", "vs_6_5", vh) || !Compile(src, "vol", "ps_6_5", mh) || !Compile(src, "volc", "ps_6_5", ch)) {
+        LOG_FIRST(1, "vulkan: the ray traced volumetric light did not compile; not drawn");
+        return;
+    }
+    constexpr VkFormat kVolFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    PassKey mk{vh, mh, kVolFormat, VK_FORMAT_UNDEFINED, 0, 0};
+    mk.rt = 1;
+    PassKey ck{vh, ch, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    ck.rt = 1;
+    VkPipeline mp = PassPipeline(mk), cp = PassPipeline(ck);
+    if (!mp || !cp) return;
+    std::vector<float> c;
+    RtLightConstants(rt, c);
+    if (c[15] <= 0 && c[8] <= 0) return;  // no sun and no lamps: nothing lights the air
+    const uint32_t hw = std::max<uint32_t>(rt.w / 2, 1), hh = std::max<uint32_t>(rt.h / 2, 1);
+    if (rt_vol_.img && (rt_vol_.w != hw || rt_vol_.h != hh)) DropImage(rt_vol_);
+    if (!rt_vol_.img && !MakeImage(rt_vol_, VK_IMAGE_TYPE_2D, kVolFormat, hw, hh, 1, 1, 1,
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        return;
+    const bool kept = rt_ds_->rt_depth.img && rt_ds_->rt_depth_frame == presents_ + 1;
+    const VkImageView keptv = kept ? rt_ds_->rt_depth.view : rt_ds_->res.view;
+    const VkAccelerationStructureKHR tlas = rt_[frame_slot_].tlas;
+    VkViewport hvp{0, 0, float(hw), float(hh), 0, 1};
+    VkRect2D hsc{{0, 0}, {hw, hh}};
+    VkImageView mv[4] = {dummy_.view, rt_ds_->res.view, dummy_.view, keptv};
+    FullScreen(mp, {rt_vol_.att, VK_NULL_HANDLE, hw, hh}, hvp, hsc, c.data(), uint32_t(c.size()), mv, 4, tlas);
+    End();
+    Barrier();
+    const VkImageView air = RtAccumulate(rt, rt_vol_, rt_vol_acc_, rt_vol_frame_, true);
+    if (!RtCopyScene(rt)) return;
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[4] = {rt_scene_.view, rt_ds_->res.view, air, keptv};
+    FullScreen(cp, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c.data(), uint32_t(c.size()), views, 4, tlas);
+    End();
+    Barrier();
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: ray traced volumetric light drawn (strength %.2f)", c[20]);
 }
 
 // the ray traced passes over the finished 3D scene, once a frame: at the first 2D draw over it (before the HUD), or at
@@ -5121,23 +5333,29 @@ void VulkanBackend::RtScenePass(Target& rt) {
     End();
     if (rt_time_pool_) {
         RtTimes();
-        vkCmdResetQueryPool(Cmd(), rt_time_pool_, frame_slot_ * 2, 2);
-        vkCmdWriteTimestamp(Cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rt_time_pool_, frame_slot_ * 2);
+        vkCmdResetQueryPool(Cmd(), rt_time_pool_, frame_slot_ * kRtStamps, kRtStamps);
     }
+    RtStamp(0);
     static const int skip = [] {
         const char* e = std::getenv("XBE_RT_SKIP");  // diagnostic: 1 no build or passes, 2 no passes
         return e ? std::atoi(e) : 0;
     }();
+    const app::Settings& st = app::Get();
     rt_built_ = skip != 1 && RtBuild();
-    if (rt_built_ && skip != 2 && (app::Get().FxOf(app::kFxRtShadows) || app::Get().FxOf(app::kFxRtLighting)))
+    RtStamp(1);
+    const bool passes = rt_built_ && skip != 2;
+    if (passes && (st.FxOf(app::kFxRtShadows) || st.FxOf(app::kFxRtLighting) || st.FxOf(app::kFxRtSun) || st.FxOf(app::kFxRtGi)))
         RtRelightPass(rt);
-    if (rt_built_ && skip != 2 && app::Get().FxOf(app::kFxRtAo) > 0) RtAoPass(rt);
-    if (rt_built_ && skip != 2 && app::Get().FxOf(app::kFxReflections) > 0) RtReflectPass(rt);
-    End();
-    if (rt_time_pool_) {
-        vkCmdWriteTimestamp(Cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rt_time_pool_, frame_slot_ * 2 + 1);
-        f.timed = true;
-    }
+    RtStamp(2);
+    if (passes && st.FxOf(app::kFxRtAo) > 0) RtAoPass(rt);
+    RtStamp(3);
+    if (passes && st.FxOf(app::kFxReflections) > 0) RtReflectPass(rt);
+    RtStamp(4);
+    if (passes && st.FxOf(app::kFxRtVolumetric)) RtVolPass(rt);
+    RtStamp(5);
+    if (rt_time_pool_) f.timed = true;
+    std::memcpy(rt_prev_view_, rt_cam_.view, sizeof(rt_prev_view_));
+    rt_prev_frame_ = presents_ + 1;
     static const bool diag = std::getenv("AUF_RT_DIAG") != nullptr;
     if (diag && presents_ % 300 == 0)
         LOGR("rt: frame %llu: %u opaque and %u cut-out triangles, %u vertices, %zu textures, %zu cameras (scene %016llx), "
@@ -6011,6 +6229,12 @@ void VulkanBackend::LogPerf() {
         LOGR("perf: ray tracing per frame: GPU %.2f ms (capture build and passes, %u frames timed), %.0f draws and "
              "%.0f triangles traced",
              rt_gpu_n_ ? rt_gpu_ms_ / rt_gpu_n_ : 0.0, rt_gpu_n_, double(perf_rt_draws_) / n, double(perf_rt_tris_) / n);
+    if (rt_gpu_n_)
+        LOGR("perf: ray tracing steps per frame: build %.2f ms, relight and bounce %.2f, occlusion %.2f, reflections %.2f, "
+             "air %.2f",
+             rt_step_ms_[0] / rt_gpu_n_, rt_step_ms_[1] / rt_gpu_n_, rt_step_ms_[2] / rt_gpu_n_, rt_step_ms_[3] / rt_gpu_n_,
+             rt_step_ms_[4] / rt_gpu_n_);
+    for (double& v : rt_step_ms_) v = 0;
     rt_gpu_ms_ = 0, rt_gpu_n_ = 0, perf_rt_draws_ = perf_rt_tris_ = 0;
     logx::Flush();
     perf_t_ = now;
@@ -6095,5 +6319,23 @@ void VulkanBackend::RescaleTargets() {
 std::unique_ptr<Backend> CreateVulkanBackend() { return std::make_unique<VulkanBackend>(); }
 
 std::unique_ptr<Backend> CreateBackend() { return CreateVulkanBackend(); }
+
+namespace {
+std::mutex g_rt_sun_lock;
+RtSun g_rt_sun{};
+bool g_rt_sun_set = false;
+}  // namespace
+
+void SetRtSun(const RtSun* sun) {
+    std::lock_guard lock(g_rt_sun_lock);
+    g_rt_sun_set = sun != nullptr;
+    if (sun) g_rt_sun = *sun;
+}
+
+bool GetRtSun(RtSun& out) {
+    std::lock_guard lock(g_rt_sun_lock);
+    if (g_rt_sun_set) out = g_rt_sun;
+    return g_rt_sun_set;
+}
 
 }  // namespace gpu

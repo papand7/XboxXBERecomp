@@ -624,6 +624,9 @@ static void DiscPace(uint32_t bytes) {
 }
 
 // pages is the FILE_SEGMENT_ELEMENT array for scatter and gather, 0 for one buffer
+static std::atomic<ReadObserver> g_read_observer{nullptr};
+void SetReadObserver(ReadObserver f) { g_read_observer.store(f); }
+
 static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], buf = a[5], len = a[6], off = a[7];
     auto f = FileFromHandle(h);
@@ -672,6 +675,8 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     g_read_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - read_begin).count());
     g_read_bytes += n;
     if (!write && (f->entry || f->cdrom)) DiscPace(n);
+    if (!write && n)
+        if (ReadObserver ob = g_read_observer.load(std::memory_order_relaxed)) ob(f->xbox, pos, n);
     if (!write && n < len && FilesLogAll())  // the end of a file reached: copies do it at every file's end
         if (static std::atomic<int> said{0}; said.fetch_add(1) < 2000)
             LOGR("files: %s read short at %llu: %u of %u bytes (to %08X)", f->xbox.c_str(), (unsigned long long)pos, n,

@@ -8,8 +8,9 @@ namespace gpu {
 // the lightmap (stage 1, the static lamps' light and shadows already in it); a lightmapped pixel's colour is multiplied
 // by (baked + added - taken) / baked, so nothing the lightmap darkened is darkened again. added: the game's dynamic
 // lights (kind 1: muzzle flashes, explosions) with traced shadows (rt_lighting), the sun where a ray toward it is open
-// (rt_sun), the bounced light (gi); taken (rt_shadows): a static lamp's light (kind 0, the lights the game sets for its
-// models) where a ray toward it meets a D3D-lit model (a character, a prop the lightmap never saw) first. D3D-lit models
+// (rt_sun), the bounced light (gi); taken (rt_shadows): a static lamp's light (kind 0, a reach under 5000 units; the far
+// fill lights the game places about each model are left out) and the sun's (twice what it adds), where a ray
+// toward it meets a D3D-lit model (a character, a prop the lightmap never saw) first. D3D-lit models
 // and surfaces without a lightmap are left as the game lit them.
 // b1: p[2] the lamps, test (XBE_RT_TEST=6 the change, halved; 7 the bounced light; 8 the air's light), static lamps'
 // shadows on, dynamic lamps on; p[3] toward the sun (the traced space), its strength (0 none); p[4] its colour, the
@@ -27,17 +28,25 @@ bool model_shadow(float3 o, float3 d, float tmax) {
     r.Direction = d;
     r.TMin = 0;
     r.TMax = tmax;
-    RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;  // the nearest hit (cut-outs by their alpha)
     q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, r);
-    bool hit = false;
-    while (q.Proceed()) {
-        uint tri = rt_tri(q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex());
-        if ((rt_mat(tri) >> 25) & 1) {
-            hit = true;
-            q.Abort();
-        }
-    }
-    return hit;
+    RT_PROCEED(q)
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return false;
+    return (rt_mat(rt_tri(q.CommittedGeometryIndex(), q.CommittedPrimitiveIndex())) >> 25) & 1;
+}
+// a model within 25 m toward the sun with the sky open past it: the shadow it casts where the lightmap has the sun
+bool sun_model_shadow(float3 o, float3 d) {
+    RayDesc r;
+    r.Origin = o;
+    r.Direction = d;
+    r.TMin = 0;
+    r.TMax = metres(25);
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, r);
+    RT_PROCEED(q)
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT || !((rt_mat(rt_tri(q.CommittedGeometryIndex(), q.CommittedPrimitiveIndex())) >> 25) & 1))
+        return false;
+    return open(o + d * (q.CommittedRayT() + metres(0.5)), d, kFar) > 0;
 }
 // a lamp's light on a point (N 0: in the air)
 float3 lampe(int n, float3 P, float3 N, out float3 dir, out float dist) {
@@ -62,7 +71,7 @@ void lamps(float3 P, float3 N, float3 o, bool shadows, out float3 added, out flo
         if (dot(e, float3(0.3, 0.59, 0.11)) < 0.004) continue;
         if (p[9 + 2 * n].w > 0.5) {
             if (p[2].w != 0) added += shadows ? e * open(o, dir, dist * 0.95) : e;
-        } else if (shadows && p[2].z != 0 && model_shadow(o, dir, dist * 0.95)) {
+        } else if (shadows && p[2].z != 0 && p[8 + 2 * n].w < 5000 && model_shadow(o, dir, dist * 0.95)) {
             taken += e;
         }
     }
@@ -129,7 +138,7 @@ float4 vol(O i) : SV_Target {
     float3 dir = normalize(viewpos(i.uv, 1));
     uint2 ip = uint2(i.pos.xy);
     float j = (bayer[(ip.y & 3) * 4 + (ip.x & 3)] + 0.5) / 16.0;
-    const int steps = 12;
+    const int steps = 8;
     float dt = tmax / steps, sigma = 0.004 / metres(1) * p[5].x;
     float g = 0.3, cs = dot(dir, p[3].xyz);
     float phase = (1 - g * g) / pow(1 + g * g - 2 * g * cs, 1.5);
@@ -143,6 +152,7 @@ float4 vol(O i) : SV_Target {
         [loop] for (int n = 0; n < int(p[2].x); n++) {
             float3 ld;
             float dist;
+            if (p[8 + 2 * n].w >= 5000) continue;  // the far fill lights about the models are no lamps in the air
             float3 e = lampe(n, X, float3(0, 0, 0), ld, dist);
             if (dot(e, float3(0.3, 0.59, 0.11)) < 0.01) continue;
             sum += e * 8 * w * open(X, ld, dist * 0.95);
@@ -189,6 +199,11 @@ float4 ps(O i) : SV_Target {
     float3 added, taken;
     lamps(P, N, o, true, added, taken);
     added += sunlight(o, N);
+    // the sun's share the lightmap holds (twice what it adds) taken where a model (a character) stands toward it
+    if (p[3].w > 0 && p[2].z != 0) {
+        float sl = saturate(dot(N, p[3].xyz));
+        if (sl > 0 && sun_model_shadow(o, p[3].xyz)) taken += p[4].rgb * (2 * p[3].w * sl);
+    }
     if (p[4].w > 0) {
         float3 b = 0;
         float wsum = 0;

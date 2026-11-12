@@ -190,6 +190,10 @@ uint32_t FileObjectBody(const ObjectRef& o);  // the guest FILE_OBJECT of a file
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
 // a part of one: len bytes from offset (fewer at its end); false when it is missing or the offset past its end
 bool ReadGameFileRange(const std::string& xbox_path, uint64_t offset, uint32_t len, std::vector<uint8_t>& out);
+// a title's reads of its files watched (a game's hooks: which level a pack's read is in, say): called after each read
+// with the file's Xbox path, where it read and how much; null none. Set at the game's init, before its threads read
+using ReadObserver = void (*)(const std::string& xbox_path, uint64_t offset, uint32_t len);
+void SetReadObserver(ReadObserver f);
 
 // boot
 bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::string& game_dir, const std::string& data_dir);
