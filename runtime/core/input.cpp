@@ -287,7 +287,8 @@ Pad Poll(int port) {
         for (int c = 0; c < kControls; c++) pad_used |= in[c] >= 0.5f;
         if (s.keyboard && !p.connected) key_used = true;  // nothing else to play with
         if (s.keyboard) p.connected = true;
-        if (s.keyboard && hwnd && GetForegroundWindow() == hwnd) {
+        // not while a title's key binding waits for its key, nor until that key is let go (app::BeginKeyCapture)
+        if (s.keyboard && hwnd && GetForegroundWindow() == hwnd && !app::KeyCaptureBusy()) {
             for (int c = 0; c < kControls; c++) {
                 std::array<uint16_t, 2> keys = c < int(s.keys.size()) ? s.keys[c] : app::DefaultKeys(c);
                 for (uint16_t k : keys)
@@ -311,7 +312,7 @@ Pad Poll(int port) {
         uint32_t pressed = held & ~last[port].exchange(held);
         constexpr uint32_t kStartBit = 1u << kStart, kBackBit = 1u << kBack;
         bool open = app::OverlayOpen();
-        if ((pressed & kStartBit) && ((held & kBackBit) || open)) {
+        if ((pressed & kStartBit) && ((held & kBackBit) || open) && (open || app::kGame.settings_window)) {
             std::lock_guard lock(app::UiLock());
             app::ToggleOverlay();
             for (auto& w : g_swallow) w = kStartBit | kBackBit;

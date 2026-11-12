@@ -218,13 +218,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                       : msg == WM_MBUTTONDOWN ? VK_MBUTTON
                       : GET_XBUTTON_WPARAM(wp) == XBUTTON1 ? VK_XBUTTON1
                                                            : VK_XBUTTON2;
+        if (CaptureKey(vk)) return 0;  // a title's own key binding
         std::lock_guard lock(UiLock());
         if (OverlayKey(vk)) return 0;
     }
     // the settings window: F1 opens and closes it, and a key binding it waits for takes the next key
     if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
         std::lock_guard lock(UiLock());
-        if (wp == VK_F1 && !(lp & (1 << 30))) {
+        if (!(lp & (1 << 30)) && CaptureKey(uint16_t(wp))) return 0;  // a title's binding: not a held key's repeat
+        if (wp == VK_F1 && kGame.settings_window && !(lp & (1 << 30))) {
             ToggleOverlay();
             return 0;
         }

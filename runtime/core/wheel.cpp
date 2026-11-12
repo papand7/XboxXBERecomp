@@ -565,6 +565,7 @@ void WheelInit(void* hwnd) {
 }
 
 bool WheelRead(float* v, bool* steers) {
+    if (app::WheelDetectQuiet()) return false;  // a binding being made in a title's menus (app::WheelDetectStart)
     std::lock_guard lock(g_lock);
     const Config& c = s.config;
     bool active = false;

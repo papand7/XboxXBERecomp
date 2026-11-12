@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <mutex>
 #include <filesystem>
 #include <string>
 #include <utility>
@@ -700,28 +702,30 @@ void GameOptions() {
 // the wheel and the rest of a rig (core/wheel.cpp): the devices found, and each control bound by moving or pressing it
 // on any of them (the binding names the device)
 const char* kAxisNames[8] = {"X", "Y", "Z", "Rx", "Ry", "Rz", "Slider 1", "Slider 2"};
-struct WheelDetect {
-    enum Kind { None, Steer, Pedal, Button } kind = None;
+// a binding being detected (WheelDetectStart): what, for which binding, every device's state as it began; under g_detect_lock
+struct Detection {
+    WheelDetect kind = WheelDetect::None;
     Settings::WheelBind* bind = nullptr;
     std::vector<input::WheelDevice> start;  // every device's state when it began
 } g_detect;
+std::recursive_mutex g_detect_lock;
+bool g_detect_taken = false;                     // the last one ended with a binding (WheelDetectPoll)
+std::chrono::steady_clock::time_point g_quiet_until;  // the rig quiet until the control taken is let go
 
-std::string BindText(const Settings::WheelBind& b) {
-    if (b.axis < 0 && b.button < 0) return "-";
-    std::string dev = b.device.empty() ? "the wheel" : b.device;
-    if (b.axis >= 0) return dev + ": " + kAxisNames[std::clamp(b.axis, 0, 7)] + " axis";
-    return dev + ": button " + std::to_string(b.button);
-}
+std::string BindText(const Settings::WheelBind& b) { return WheelBindText(b); }
 
 void Bound(Settings::WheelBind& b, const input::WheelDevice& d) {
     b.device = d.name;
     b.guid = d.guid;
     Save();
     input::WheelSetup();
+    g_detect_taken = true;
+    g_quiet_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
 }
 
 // what moved or was pressed since the detection began, on any device
 void Detect(const input::WheelInfo& w) {
+    std::lock_guard lock(g_detect_lock);
     if (g_detect.kind == WheelDetect::None) return;
     for (size_t i = 0; i < w.devices.size() && i < g_detect.start.size(); i++) {
         const input::WheelDevice& d = w.devices[i];
@@ -756,7 +760,7 @@ void Detect(const input::WheelInfo& w) {
 }
 
 // a binding's row: press it, then move or press the control; Y or the x clears it
-void BindRow(const char* label, Settings::WheelBind& b, WheelDetect::Kind kind, const input::WheelInfo& w,
+void BindRow(const char* label, Settings::WheelBind& b, WheelDetect kind, const input::WheelInfo& w,
              const char* prompt, const char* help = nullptr) {
     bool waiting = g_detect.kind == kind && g_detect.bind == &b;
     Bind out = RowBind(label, waiting ? prompt : BindText(b), waiting, help);
@@ -943,6 +947,39 @@ void Controls(Settings& s) {
 
 }  // namespace
 
+std::string WheelBindText(const Settings::WheelBind& b) {
+    if (b.axis < 0 && b.button < 0) return "-";
+    std::string dev = b.device.empty() ? "the wheel" : b.device;
+    if (b.axis >= 0) return dev + ": " + kAxisNames[std::clamp(b.axis, 0, 7)] + " axis";
+    return dev + ": button " + std::to_string(b.button);
+}
+
+void WheelDetectStart(WheelDetect kind, Settings::WheelBind& bind) {
+    std::lock_guard lock(g_detect_lock);
+    g_detect = {.kind = kind, .bind = &bind, .start = input::Wheel().devices};
+    g_detect_taken = false;
+}
+void WheelDetectCancel() {
+    std::lock_guard lock(g_detect_lock);
+    g_detect = {};
+}
+WheelDetect WheelDetecting(const Settings::WheelBind* bind) {
+    std::lock_guard lock(g_detect_lock);
+    return bind && g_detect.bind != bind ? WheelDetect::None : g_detect.kind;
+}
+bool WheelDetectPoll() {
+    std::lock_guard lock(g_detect_lock);
+    if (g_detect.kind == WheelDetect::None) return false;
+    Detect(input::Wheel());
+    const bool taken = g_detect.kind == WheelDetect::None && g_detect_taken;
+    g_detect_taken = false;
+    return taken;
+}
+bool WheelDetectQuiet() {
+    std::lock_guard lock(g_detect_lock);
+    return g_detect.kind != WheelDetect::None || std::chrono::steady_clock::now() < g_quiet_until;
+}
+
 bool OverlayOpen() { return g_open; }
 
 void FeedPad() {
@@ -1084,12 +1121,46 @@ void DrawHud(double fps) {
 std::vector<Mode> ListModes() { return Modes(); }
 
 void ToggleOverlay() {
+    if (!g_open && !kGame.settings_window) return;  // the title's own menus hold the settings: no window
+    if (g_open) WheelDetectCancel();
     g_open = !g_open;
     g_bind_control = -1;
     g_focus_first = g_open;
     if (!g_open) input::SwallowHeld();  // what closed it (B, Escape) stays from the game until let go
     if (ImGui::GetCurrentContext()) ImGui::GetIO().MouseDrawCursor = g_open;
     LOGR("settings window %s", g_open ? "opened" : "closed");
+}
+
+namespace {
+std::atomic<int> g_capture{0};  // 0 none, 1 waiting, 2 a key taken
+std::atomic<uint16_t> g_captured{0}, g_capture_held{0};
+}  // namespace
+void BeginKeyCapture() {
+    g_captured = 0;
+    g_capture = 1;
+}
+void EndKeyCapture() { g_capture = 0; }
+bool KeyCaptureWaiting() { return g_capture == 1; }
+bool TakeCapturedKey(uint16_t& vk) {
+    int taken = 2;
+    if (!g_capture.compare_exchange_strong(taken, 0)) return false;
+    vk = g_captured;
+    return true;
+}
+bool KeyCaptureBusy() {
+    if (g_capture) return true;
+    const uint16_t held = g_capture_held;
+    if (!held) return false;
+    if (GetAsyncKeyState(held) & 0x8000) return true;
+    g_capture_held = 0;
+    return false;
+}
+bool CaptureKey(uint16_t vk) {
+    if (g_capture != 1) return false;
+    g_captured = vk;
+    g_capture_held = vk;
+    g_capture = 2;
+    return true;
 }
 
 bool OverlayKey(uint16_t vk) {
@@ -1176,9 +1247,8 @@ void Prompts(float right, float y) {
 
 void DrawOverlay() {
     static bool busy = false;  // last frame a list was open or a binding waited: its B or Escape was for that
-    if (!g_open) {
+    if (!g_open) {  // (a binding the window waited for was let go as it closed: ToggleOverlay)
         busy = false;
-        g_detect = {};
         return;
     }
     Settings& s = Get();

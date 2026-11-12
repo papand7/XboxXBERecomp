@@ -162,6 +162,25 @@ void DrawOverlay();
 void OverlayInit();  // the fonts, after ImGui's context and before a renderer's first frame
 // a key pressed while the overlay waits for one to bind (window thread); true takes it
 bool OverlayKey(uint16_t vk);
+// a title's own key binding (its menus, any thread): the next key or mouse button pressed is taken for it, and the
+// keyboard reaches no controller while it waits, nor until that key is let go
+void BeginKeyCapture();
+void EndKeyCapture();
+bool KeyCaptureWaiting();             // begun, no key taken yet
+bool TakeCapturedKey(uint16_t& vk);  // the key taken (VK_ESCAPE: the player cleared it), once
+bool KeyCaptureBusy();                // waiting, or the key taken still held
+bool CaptureKey(uint16_t vk);         // window thread, a new press (not a repeat): true when the capture takes it
+// a wheel control bound by moving or pressing it on any device (a title's own menus, as the settings window's Wheel tab
+// does): every device's state is kept as it begins, then the first axis moved far enough (the steering a little, a pedal
+// most of its travel) or button newly pressed becomes the binding, saved at once. One at a time. While it waits, and
+// for half a second after, the rig reaches no controller (its button would press the menu's own)
+enum class WheelDetect { None, Steer, Pedal, Button };
+void WheelDetectStart(WheelDetect kind, Settings::WheelBind& bind);
+void WheelDetectCancel();
+WheelDetect WheelDetecting(const Settings::WheelBind* bind = nullptr);  // what waits (for that binding), None nothing
+bool WheelDetectPoll();   // each frame while one waits: true when the binding was taken
+bool WheelDetectQuiet();  // waiting, or just taken: input::WheelRead gives nothing
+std::string WheelBindText(const Settings::WheelBind& b);  // "the wheel: X axis", "G27 Pedals: button 3", "-" unbound
 
 // the Vulkan device has ray queries and acceleration structures (set when the device is made): ray tracing settings show only then
 inline std::atomic<bool> ray_query_ok{false};
@@ -364,6 +383,8 @@ struct GameInfo {
     // a fixed-function stage with no texture reads (0,0,0,0) as its texture, as the hardware's stage with texture mode NONE
     // does, not white: True Crime clears its shadow map's border with untextured lines that select the texture
     bool unbound_texture_zero = false;
+    // F1 (and a controller's Back + Start) open the settings window; off for a title whose own menus hold every setting
+    bool settings_window = true;
 };
 extern const GameInfo kGame;
 
