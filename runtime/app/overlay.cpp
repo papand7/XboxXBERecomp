@@ -423,6 +423,30 @@ struct QualityPreset {
 };
 constexpr QualityPreset kQuality[] = {{0, 0, false, 0}, {4, 1, false, 20}, {8, 2, true, 30}, {16, 2, true, 40}};
 
+// the FxId rows (app.h AUF_FX_LIST): a heading where a row has one, rows gated by another setting shown only then
+void FxRows(Settings& s) {
+    for (int i = 0; i < kFxCount; i++) {
+        const FxDef& d = FxInfo(i);
+        if (d.gate >= 0 && (d.gate_val < 0 ? s.fx[d.gate] == 0 : s.fx[d.gate] != d.gate_val)) continue;
+        if (d.section) Section(d.section);
+        int v = int(s.fx[i]);
+        bool changed = false;
+        if (d.kind == 2) {
+            bool b = v != 0;
+            changed = RowCheck(d.label, &b, d.help);
+            v = b;
+        } else if (d.kind == 1) {
+            changed = RowChoice(d.label, &v, d.names, d.hi + 1, d.help);
+        } else {
+            changed = RowSlider(d.label, &v, d.lo, d.hi, d.step, d.unit, d.help);
+        }
+        if (changed) {
+            s.fx[i] = int32_t(v);
+            Save();
+        }
+    }
+}
+
 void Graphics(Settings& s) {
     int q = 4;  // Custom unless the values are a preset's
     for (int i = 0; i < 4; i++) {
@@ -615,6 +639,7 @@ void Graphics(Settings& s) {
     if (RowCheck("Discord status", &s.discord, "Shows the mission you play on your Discord profile while Discord runs on this PC.")) Save();
     if (RowCheck("Performance overlay", &s.perf_overlay, "A corner panel: frames a second, the frame time and a graph of the last two seconds, the size the 3D scene is drawn at.")) Save();
     if (kGame.sharpen_2d && RowCheck("Sharp text and HUD", &s.sharp_2d)) Save();
+    FxRows(s);
 }
 
 void General(Settings& s) {

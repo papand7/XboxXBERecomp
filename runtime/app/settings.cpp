@@ -166,10 +166,17 @@ toml::table BindTable(const Settings::WheelBind& w) {
 
 }  // namespace
 
+#define AUF_FX_DEF(id, key, label, help, kind, def, lo, hi, step, unit, names, gate, gate_val, section)     {key, label, help, kind, def, lo, hi, step, unit, names, gate, gate_val, section},
+static const FxDef kFxTable[] = {AUF_FX_LIST(AUF_FX_DEF)};
+#undef AUF_FX_DEF
+static_assert(sizeof(kFxTable) / sizeof(kFxTable[0]) == kFxCount);
+const FxDef& FxInfo(int id) { return kFxTable[id]; }
+
 Settings& Get() {
     // the control tables have their size from the start: the settings window changes entries, game threads read them
     static Settings s = [] {
         Settings d;
+        for (int i = 0; i < kFxCount; i++) d.fx[i] = kFxTable[i].def;
         d.keys.resize(input::kControls);
         d.pad_map.resize(input::kControls);
         d.wheel_buttons.resize(input::kControls);
@@ -241,6 +248,8 @@ void Load() {
     s.hit_feedback = std::min<uint32_t>(t["hit_feedback"].value_or(s.hit_feedback), 2);
     s.damage_numbers = t["damage_numbers"].value_or(s.damage_numbers);
     s.color_style = std::min<uint32_t>(t["color_style"].value_or(s.color_style), 4);
+    for (int i = 0; i < kFxCount; i++)
+        s.fx[i] = std::clamp<int32_t>(t[kFxTable[i].key].value_or<int64_t>(s.fx[i]), kFxTable[i].lo, kFxTable[i].hi);
     s.bloom = std::min<uint32_t>(t["bloom"].value_or(s.bloom), 100);
     s.light_shafts = std::min<uint32_t>(t["light_shafts"].value_or(s.light_shafts), 100);
     s.atmospheric_fog = std::min<uint32_t>(t["atmospheric_fog"].value_or(s.atmospheric_fog), 100);
@@ -418,6 +427,7 @@ toml::table Table() {
         t.insert("mouse_invert_y", s.mouse_invert_y);
     }
     if (!pad.empty()) t.insert("gamepad", pad);
+    for (int i = 0; i < kFxCount; i++) t.insert(kFxTable[i].key, int64_t(s.fx[i]));
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
         else t.insert(o.key, int64_t(*o.value));

@@ -48,6 +48,7 @@
 #include "gpu/backend.h"
 #include "gpu/d3d_common.h"
 #include "gpu/ext.h"
+#include "gpu/fx_hlsl.h"
 #include "gpu/shaders.h"
 #include "gpu/smaa.h"
 #include "gpu/texture_pack.h"
@@ -726,6 +727,9 @@ private:
     VkImageView Bloom(Target& t, VkImageView source);
     VkImageView LightShafts(Target& t, VkImageView source, VkImageView depth);
     VkImageView AmbientOcclusion(Target& t, VkImageView source, VkImageView depth);
+    bool StyleWanted() const { return app::Get().FxOf(app::kFxStyle) != 0; }
+    VkImageView StylePass(Target& t, VkImageView source, VkImageView depth);
+    void SnapshotPreHud(Target& rt);
     VkImageView DepthOfField(Target& t, VkImageView source, VkImageView depth);
     VkImageView MotionBlur(Target& t, VkImageView source, VkImageView depth);
     bool RememberCamera(const State& s);
@@ -889,6 +893,9 @@ private:
     uint64_t smaa_edge_vs_ = 0, smaa_edge_ps_ = 0, smaa_weight_vs_ = 0, smaa_weight_ps_ = 0;
     uint64_t smaa_blend_vs_ = 0, smaa_blend_ps_ = 0;
     Image ao_half_, ao_scene_;
+    Image style_scene_, prehud_;  // the style pass's result; the scene as it was before the first 2D draw
+    uint32_t style_w_ = 0, style_h_ = 0;
+    uint64_t prehud_frame_ = 0;
     uint32_t ao_w_ = 0, ao_h_ = 0;
     Image dof_scene_;
     uint32_t dof_w_ = 0, dof_h_ = 0;
@@ -1519,6 +1526,8 @@ VulkanBackend::~VulkanBackend() {
     for (Image* im : {&up_depth_, &up_motion_, &up_out_, &up_kept_}) DropImage(*im);
     DropImage(ao_half_);
     DropImage(ao_scene_);
+    DropImage(style_scene_);
+    DropImage(prehud_);
     DropImage(dof_scene_);
     DropImage(motion_scene_);
     for (Image& im : bloom_down_) DropImage(im);
@@ -4583,6 +4592,11 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         up_wbuf_ = pk.wbuf != 0;
         up_draws_++;
     }
+    if (draw_2d_ && StyleWanted() && bound_rt_ && prehud_frame_ != presents_ + 1 && scene_depth_frame_ == presents_ + 1 &&
+        bound_rt_->data == scene_color_data_) {
+        SnapshotPreHud(*bound_rt_);
+        if (!BindTargets(s)) return;
+    }
     const bool camera_ok = RememberCamera(s);
     sh.pkey = Hash(&pk, sizeof(pk));
     EnsurePixelShader(pk, sh);
@@ -5105,6 +5119,67 @@ float4 comp(O i) : SV_Target {
     return shafts_scene_.view;
 }
 
+// the 3D scene as it stands when the first 2D draw (the HUD) comes: the style pass keeps the HUD out of its way by
+// seeing where the frame differs from this copy
+void VulkanBackend::SnapshotPreHud(Target& rt) {
+    prehud_frame_ = 0;
+    if (prehud_.img && (style_w_ != rt.w || style_h_ != rt.h)) DropImage(prehud_), DropImage(style_scene_);
+    if (!prehud_.img) {
+        if (!MakeImage(prehud_, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return;
+        style_w_ = rt.w;
+        style_h_ = rt.h;
+    }
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, prehud_.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+    prehud_frame_ = presents_ + 1;
+}
+
+// Enhanced / Toon / Retro on the 3D scene (fx_hlsl.h kStyleHlsl)
+VkImageView VulkanBackend::StylePass(Target& t, VkImageView source, VkImageView depth) {
+    const app::Settings& st = app::Get();
+    const int style = st.FxOf(app::kFxStyle);
+    if (!source || !style) return source;
+    uint64_t vh, ph;
+    if (!Compile(kStyleHlsl, "vs", "vs_5_0", vh) || !Compile(kStyleHlsl, "style_ps", "ps_5_0", ph)) {
+        LOG_FIRST(1, "vulkan: the style shader did not compile; drawing without it");
+        return source;
+    }
+    if (style_scene_.img && (style_w_ != t.w || style_h_ != t.h)) DropImage(style_scene_), DropImage(prehud_);
+    if (!style_scene_.img) {
+        if (!MakeImage(style_scene_, VK_IMAGE_TYPE_2D, kBgra, t.w, t.h, 1, 1, 1,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return source;
+        style_w_ = t.w;
+        style_h_ = t.h;
+    }
+    VkPipeline pipeline = PassPipeline({vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pipeline) return source;
+    static const bool wbuffer = [] {
+        const char* e = std::getenv("XBE_WBUFFER");
+        return !(e && *e == '0');
+    }();
+    const bool has_mask = prehud_.img && prehud_frame_ == presents_ + 1 && style_w_ == t.w && style_h_ == t.h;
+    auto fx = [&](app::FxId id) { return float(st.FxOf(id)); };
+    float c[24] = {1.0f / t.w, 1.0f / t.h, float(t.w), float(t.h),
+                   wbuffer ? 1.0f : 0.0f, float(style), fx(app::kFxTonemap), fx(app::kFxClarity) / 100.0f,
+                   fx(app::kFxToonBands), fx(app::kFxToonOutline), fx(app::kFxToonInner), fx(app::kFxToonThreshold) / 100.0f,
+                   fx(app::kFxToonHalftone) / 100.0f, fx(app::kFxRetroPixel), fx(app::kFxRetroBits), fx(app::kFxRetroDither),
+                   fx(app::kFxRetroTint) / 100.0f, depth ? 1.0f : 0.0f, has_mask ? 1.0f : 0.0f, 0.5774f,
+                   float(t.w) / float(t.h), float(presents_ & 1023u), 0, 0};
+    VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
+    VkRect2D sc{{0, 0}, {t.w, t.h}};
+    VkImageView views[4] = {source, depth ? depth : dummy_.view, has_mask ? prehud_.view : dummy_.view, t.res.view};
+    FullScreen(pipeline, {style_scene_.att, VK_NULL_HANDLE, t.w, t.h}, vp, sc, c, 24, views, 4);
+    End();
+    Barrier();
+    return style_scene_.view;
+}
+
 void VulkanBackend::RenderUi() {
     std::lock_guard lock(app::UiLock());
     app::FeedPad();
@@ -5209,6 +5284,11 @@ void VulkanBackend::Present(const Surface& front) {
         if (t && (app::Get().light_shafts || app::Get().atmospheric_fog) && scene_depth_frame_ == presents_ + 1 &&
             scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
             frame_source = LightShafts(*t, frame_source, scene_depth_view_);
+        if (t && StyleWanted()) {
+            const bool depth_ok = scene_depth_frame_ == presents_ + 1 && scene_color_data_ == t->data && scene_depth_view_ &&
+                                  scene_depth_w_ == t->w && scene_depth_h_ == t->h;
+            frame_source = StylePass(*t, frame_source, depth_ok ? scene_depth_view_ : VK_NULL_HANDLE);
+        }
         if (t && app::Get().auto_exposure) frame_source = AutoExposure(*t, frame_source);
         VkImageView bloom = t && app::Get().bloom ? Bloom(*t, frame_source) : VK_NULL_HANDLE;
         cb = Cmd();

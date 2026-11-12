@@ -18,6 +18,30 @@ struct WheelFeel;
 // the host side: window, settings
 namespace app {
 
+// The shader style and effect settings of the Vulkan renderer's own passes (style, weather, materials ...), one row
+// each: kind 0 slider (lo..hi in steps, a unit after), 1 a choice of names (0..hi), 2 a check. A row shows only while
+// the setting `gate` is gate_val (gate_val -1: any value but 0). In settings.toml each is its `key` as an integer.
+struct FxDef {
+    const char* key;
+    const char* label;
+    const char* help;
+    int kind;
+    int32_t def, lo, hi, step;
+    const char* unit;
+    const char* const* names;
+    int gate;  // an FxId, or -1
+    int32_t gate_val;
+    const char* section;  // a heading above this row, or null
+};
+inline constexpr const char* kFxStyleNames[] = {"Original", "Enhanced", "Toon", "Retro"};
+inline constexpr const char* kFxTonemapNames[] = {"Off", "Filmic", "Reinhard"};
+#define AUF_FX_LIST(X)     X(Style, "shader_style", "Shader style", "Original, Enhanced (tone mapping and clarity), Toon (outlines, bands, halftone) or Retro (pixels, few colours, dithering) on the finished 3D scene; the HUD is left alone. Vulkan only.", 1, 0, 0, 3, 1, "", kFxStyleNames, -1, 0, "Shader style")     X(Tonemap, "tonemap", "Tone mapping", "Rolls the brightest tones off smoothly instead of clipping them (8-bit, no HDR).", 1, 0, 0, 2, 1, "", kFxTonemapNames, kFxStyle, -1, nullptr)     X(Clarity, "style_clarity", "Clarity", "Local contrast: texture and edges stand out a little more.", 0, 30, 0, 100, 5, "%", nullptr, kFxStyle, 1, nullptr)     X(ToonBands, "toon_bands", "Lighting bands", "How many steps the light is cut into.", 0, 4, 2, 12, 1, "", nullptr, kFxStyle, 2, nullptr)     X(ToonOutline, "toon_outline", "Outline thickness", "Tenths of a pixel at 960 lines.", 0, 15, 0, 60, 1, "", nullptr, kFxStyle, 2, nullptr)     X(ToonInner, "toon_inner_lines", "Inner lines", "Lines on creases and colour edges too, not only silhouettes.", 2, 1, 0, 1, 1, "", nullptr, kFxStyle, 2, nullptr)     X(ToonThreshold, "toon_edge_threshold", "Edge threshold", "Lower draws more lines.", 0, 20, 2, 100, 2, "%", nullptr, kFxStyle, 2, nullptr)     X(ToonHalftone, "toon_halftone", "Halftone", "Comic dots in the shadows.", 0, 0, 0, 100, 5, "%", nullptr, kFxStyle, 2, nullptr)     X(RetroPixel, "retro_pixel", "Pixel size", "The 3D scene in blocks this many pixels wide.", 0, 3, 1, 8, 1, "", nullptr, kFxStyle, 3, nullptr)     X(RetroBits, "retro_color_bits", "Colour depth (bits)", "Bits a colour channel keeps.", 0, 5, 2, 8, 1, "", nullptr, kFxStyle, 3, nullptr)     X(RetroDither, "retro_dither", "Ordered dithering", "A fixed dot pattern hides the banding of few colours.", 2, 1, 0, 1, 1, "", nullptr, kFxStyle, 3, nullptr)     X(RetroTint, "retro_tint", "Retro grading", "A warm, washed 90s colour grade.", 0, 40, 0, 100, 5, "%", nullptr, kFxStyle, 3, nullptr)
+#define AUF_FX_ID(id, ...) kFx##id,
+enum FxId : int { AUF_FX_LIST(AUF_FX_ID) kFxCount };
+#undef AUF_FX_ID
+constexpr int kFxMax = 128;
+const FxDef& FxInfo(int id);
+
 enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
 
 struct Settings {
@@ -72,6 +96,8 @@ struct Settings {
     uint32_t sharpen = 0;            // percent, contrast adaptive sharpening of the finished frame
     uint32_t hit_feedback = 2;       // a player's shot hitting (HitMarker): 0 nothing, 1 a mark, 2 a mark and a tick
     bool damage_numbers = false;     // the damage a hit did, a number floating up from the mark
+    int32_t fx[kFxMax] = {};         // the FxId settings; FxDefaults() fills them at the first Load
+    int32_t FxOf(int id) const { return fx[id]; }
     uint32_t color_style = 0;        // 0 original, 1 Enhanced Color, 2 Toon Screen, 3 Retro, 4 Noir
     uint32_t bloom = 0;              // percent, screen-space glow around bright pixels
     uint32_t light_shafts = 0;       // screen-space rays from bright scene regions; Vulkan only
