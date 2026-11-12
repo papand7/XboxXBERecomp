@@ -49,6 +49,7 @@
 #include "gpu/d3d_common.h"
 #include "gpu/ext.h"
 #include "gpu/fx_hlsl.h"
+#include "gpu/rt_hlsl.h"
 #include "gpu/shaders.h"
 #include "gpu/smaa.h"
 #include "gpu/texture_pack.h"
@@ -166,7 +167,12 @@ namespace {
     X(vkCmdCopyImage)               \
     X(vkCmdClearAttachments)        \
     X(vkCmdBeginQuery)              \
-    X(vkCmdEndQuery)
+    X(vkCmdEndQuery)                \
+    X(vkAllocateDescriptorSets)     \
+    X(vkUpdateDescriptorSets)       \
+    X(vkCmdBindDescriptorSets)      \
+    X(vkCmdWriteTimestamp)          \
+    X(vkCmdResetQueryPool)
 
 #define VK_RT_DEVICE_FUNCS(X)                  \
     X(vkGetBufferDeviceAddress)                 \
@@ -195,8 +201,18 @@ constexpr VkFormat kBgra = VK_FORMAT_B8G8R8A8_UNORM;
 // set 0 has b0-b1, t0-t3, s0-s3, u0 capture storage and t9 ray-query scene
 constexpr uint32_t kBindVsc = 0, kBindDc = 1, kBindTex = 2, kBindSmp = 6, kBindCapture = 10,
                    kBindTlas = 11, kBindings = 12;
-constexpr uint32_t kRtCaptureCapacity = 1u << 20;
-constexpr uint64_t kRtCaptureShaderSalt = 0xD1B54A32D192ED03ull;
+// the ray traced passes' layout (rt_layout_) has those, then the frame's captured vertices, triangles, materials, a
+// spare and each vertex's triangles (RtBuild); its set 1 (one a frame slot, not pushed) the textures the materials
+// name and their sampler (gpu/rt_hlsl.h kRtCommonHlsl)
+constexpr uint32_t kBindRtVerts = 12, kBindRtTris = 13, kBindRtMats = 14, kBindRtSpare = 15, kBindRtAdj = 16;
+constexpr uint32_t kRtTextures = 1024;
+constexpr uint32_t kRtVertBytes = 32;  // a captured vertex: place, fog, texture coordinates 0, diffuse, coordinates 1
+constexpr uint32_t kRtCaptureCapacity = 1u << 20;  // vertices a frame
+constexpr uint64_t kRtCaptureShaderSalt = 0xD1B54A32D192ED13ull;
+constexpr uint32_t kGlAlways = 0x207;  // an alpha test that passes everything (the GL value the state holds)
+
+// a draw that covers what is behind it: no blending, or blending one / zero (GL values)
+bool Opaque(const PsoKey& k) { return !k.blend || (k.src == 1 && k.dst == 0); }
 
 const char* VkResultName(VkResult r) {
     switch (r) {
@@ -460,6 +476,10 @@ struct Target {
     bool up_small = false;
     float clear_z = 1;
     uint32_t clear_stencil = 0;
+    // ray tracing: the scene's depth as it was when the game cleared it for the weapon (RtKeepDepth), and the frame
+    // (presents_ + 1) it was kept in
+    Image rt_depth;
+    uint64_t rt_depth_frame = 0;
 };
 
 // a texture from guest memory
@@ -686,6 +706,7 @@ private:
         VkFormat color, depth;
         uint32_t blend;  // 0 opaque, 1 premultiplied over
         uint32_t zmode;  // 0 none, 1 depth always written
+        uint32_t rt = 0, pad = 0;  // 1: rt_layout_ (a ray traced pass)
     };
 
     // Init, in order
@@ -805,9 +826,22 @@ private:
     VkPipeline EnsurePipeline(const PsoKey& k);
     void PushDescriptors(const Stretch& vsc, const Stretch& dc, const DrawTextures& stages, const VkSampler smp[4],
                          const Buffer* capture = nullptr);
-    void CaptureGeometry(const State& s, const Assembled& a, const DrawShaders& sh, const PsoKey& key,
-                         const Stretch& vsc, const Stretch& dc, const DrawTextures& stages, const VkSampler smp[4]);
-    bool BuildRtStructures();
+    // ray tracing (gpu/rt_hlsl.h; ported from NightFire's): the scene's draws write their vertices as they are drawn
+    // (RtCapture: the draw's vertex shader swapped for its capture variant), built into an acceleration structure at
+    // the first 2D draw over the scene, before the HUD (RtScenePass: RtBuild, then the traced passes); the depth kept
+    // where the game clears it for the weapon (RtKeepDepth), which is left out of the rays
+    bool RtWanted() const { return rt_ok_ && rt_layout_ && app::Get().FxOf(app::kFxRayTracing) != 0; }
+    bool RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k, const DrawTextures& stages,
+                   uint32_t push[4]);
+    void RtUndo();
+    uint32_t RtSlot(VkImageView v);
+    bool RtStorage(Buffer& mem, VkAccelerationStructureKHR& as, VkDeviceSize need, VkAccelerationStructureTypeKHR type);
+    bool RtBuild();
+    void RtKeepDepth(Target& ds);
+    void RtScenePass(Target& rt);
+    bool RtCopyScene(Target& rt);
+    void RtAoPass(Target& rt);
+    void RtTimes();
     bool DrawGeometry(const Assembled& a);
     // visibility tests
     bool NewQuery(uint32_t& index);
@@ -861,19 +895,52 @@ private:
     VkQueryPool queries_ = VK_NULL_HANDLE;
     VkFormat depth_fmt_ = VK_FORMAT_D24_UNORM_S8_UINT;
     bool rt_ok_ = false;  // ray-query Vulkan prerequisites are available
-    struct RtCaptureSlot {
-        Buffer vertices;
-        uint32_t used = 0;
-        std::vector<uint32_t> triangles;
-        Buffer indices, instance, blas_store, tlas_store, scratch;
+    // ray tracing: a frame slot's buffers and structures, used again once its frame is done
+    struct RtFrame {
+        Buffer verts;  // the captured vertices (kRtVertBytes each)
+        Buffer tris;   // their triangles (host): the opaque ones, then the cut-outs
+        Buffer mats;   // (host) the opaque triangles' count, all of them, then two words a triangle (RtMaterial)
+        Buffer adj;    // (host) each vertex's triangles (RtBuild)
+        Buffer inst, scratch, blas_mem, tlas_mem;
         VkAccelerationStructureKHR blas = VK_NULL_HANDLE, tlas = VK_NULL_HANDLE;
-        VkDeviceSize blas_size = 0, tlas_size = 0, scratch_size = 0;
-        uint32_t blas_primitives = 0;
-        bool built = false;
-        uint64_t frame = 0;
+        VkDescriptorSet tex_set = VK_NULL_HANDLE;  // set 1: the textures the materials name
+        uint32_t tex_written = 0;
+        bool timed = false;  // its timestamps were written (RtTimes reads them once the slot comes round again)
     };
-    RtCaptureSlot rt_capture_[kFramesInFlight]{};
+    RtFrame rt_[kFramesInFlight]{};
     VkDeviceSize rt_scratch_align_ = 0;
+    VkDescriptorSetLayout rt_set_layout_ = VK_NULL_HANDLE, rt_tex_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout rt_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool rt_pool_ = VK_NULL_HANDLE;
+    VkSampler rt_sampler_ = VK_NULL_HANDLE;
+    VkQueryPool rt_time_pool_ = VK_NULL_HANDLE;  // two timestamps a slot about the ray traced work
+    float rt_tick_ns_ = 1;
+    double rt_gpu_ms_ = 0;  // summed since LogPerf last wrote it
+    uint32_t rt_gpu_n_ = 0;
+    // this frame's capture, the CPU's side: (presents_ + 1) it is for, vertices written, triangles, two material words
+    // a triangle, the textures they name, the depth target the draws wrote
+    uint64_t rt_frame_ = 0;
+    uint32_t rt_used_ = 0;
+    std::vector<uint32_t> rt_tris_, rt_cut_, rt_mats_, rt_cut_mats_, rt_adj_;
+    std::vector<VkImageView> rt_views_;
+    std::unordered_map<VkImageView, uint32_t> rt_view_slot_;
+    Target* rt_ds_ = nullptr;
+    bool rt_full_ = false;
+    struct { size_t tris, cut, mats, cut_mats; uint32_t used; } rt_undo_{};
+    // the scene's camera: the projection most of the last frame's triangles were drawn with (a sky box's or the
+    // weapon's is another), and the triangles each had this frame; this frame's camera (RtCapture's first draw):
+    // the half widths of the view, the depth to distance (w = zb / (d - za)), the view and projection matrices
+    uint64_t rt_main_proj_ = 0;
+    std::unordered_map<uint64_t, uint32_t> rt_proj_tris_;
+    struct RtCamera {
+        float tanx = 0.7f, tany = 0.5774f, za = 0, zb = 1;
+        float view[16]{}, proj[16]{};
+    } rt_cam_;
+    uint64_t rt_pass_frame_ = 0;  // presents_ + 1 the scene pass ran (once a frame)
+    bool rt_built_ = false;
+    Image rt_scene_;  // the scene the passes read (a copy), at the scene's size
+    Image rt_ao_;     // the traced occlusion, half size
+    uint64_t perf_rt_tris_ = 0, perf_rt_draws_ = 0;
     bool null_descriptor_ = false;
     bool custom_border_ = false;
     bool mirror_once_ = false;
@@ -1413,6 +1480,61 @@ bool VulkanBackend::CreateFixed() {
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(dev_, &pl, nullptr, &layout_) != VK_SUCCESS) return false;
+    // the ray traced passes': the same, the frame's capture buffers, and set 1 (a frame slot's textures)
+    if (rt_ok_) {
+        VkDescriptorSetLayoutBinding rb[kBindRtAdj + 1]{};
+        std::memcpy(rb, b, sizeof(VkDescriptorSetLayoutBinding) * kBindings);
+        rb[kBindTlas].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+        for (uint32_t i = kBindRtVerts; i <= kBindRtAdj; i++)
+            rb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo rdl = dl;
+        rdl.bindingCount = kBindRtAdj + 1;
+        rdl.pBindings = rb;
+        VkDescriptorSetLayoutBinding tb[2] = {
+            {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kRtTextures, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+        VkDescriptorSetLayoutCreateInfo tdl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        tdl.bindingCount = 2;
+        tdl.pBindings = tb;
+        VkSamplerCreateInfo rsi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        rsi.magFilter = rsi.minFilter = VK_FILTER_LINEAR;
+        rsi.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        rsi.addressModeU = rsi.addressModeV = rsi.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        rsi.maxLod = VK_LOD_CLAMP_NONE;
+        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kRtTextures * kFramesInFlight},
+                                      {VK_DESCRIPTOR_TYPE_SAMPLER, kFramesInFlight}};
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = kFramesInFlight;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = ps;
+        bool made = vkCreateDescriptorSetLayout(dev_, &rdl, nullptr, &rt_set_layout_) == VK_SUCCESS &&
+                    vkCreateDescriptorSetLayout(dev_, &tdl, nullptr, &rt_tex_layout_) == VK_SUCCESS &&
+                    vkCreateSampler(dev_, &rsi, nullptr, &rt_sampler_) == VK_SUCCESS &&
+                    vkCreateDescriptorPool(dev_, &dpi, nullptr, &rt_pool_) == VK_SUCCESS;
+        for (RtFrame& f : rt_) {
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = rt_pool_;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &rt_tex_layout_;
+            made = made && vkAllocateDescriptorSets(dev_, &ai, &f.tex_set) == VK_SUCCESS;
+            f.tex_written = kRtTextures;  // every one the dummy at the first build
+        }
+        VkDescriptorSetLayout sets[2] = {rt_set_layout_, rt_tex_layout_};
+        VkPipelineLayoutCreateInfo rpl = pl;
+        rpl.setLayoutCount = 2;
+        rpl.pSetLayouts = sets;
+        if (!made || vkCreatePipelineLayout(dev_, &rpl, nullptr, &rt_layout_) != VK_SUCCESS) {
+            LOGW("vulkan: the ray traced passes' layout could not be made; no ray tracing");
+            rt_layout_ = VK_NULL_HANDLE;
+        }
+        VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qci.queryCount = 2 * kFramesInFlight;
+        if (vkCreateQueryPool(dev_, &qci, nullptr, &rt_time_pool_) != VK_SUCCESS) rt_time_pool_ = VK_NULL_HANDLE;
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(pd_, &pp);
+        rt_tick_ns_ = pp.limits.timestampPeriod;
+    }
 
     // the pipeline cache kept beside the exe
     std::vector<char> cache_data;
@@ -1517,7 +1639,8 @@ VulkanBackend::~VulkanBackend() {
     WaitIdle();
     SavePipelineCache();
     if (ui_) ImGui_ImplVulkan_Shutdown();
-    for (auto& [k, t] : targets_) DropImage(t.res), DropImage(t.fb), DropImage(t.shrunk), DropImage(t.alt_res), DropImage(t.alt_fb);
+    for (auto& [k, t] : targets_)
+        DropImage(t.res), DropImage(t.fb), DropImage(t.shrunk), DropImage(t.alt_res), DropImage(t.alt_fb), DropImage(t.rt_depth);
     targets_.clear();
     up_rt_ = up_ds_ = nullptr;
     for (auto& [k, t] : textures_) DropImage(t.img);
@@ -1549,16 +1672,14 @@ VulkanBackend::~VulkanBackend() {
     DropBuffer(readback_);
     for (auto& [k, l] : late_)
         for (Buffer& b : l.staging) DropBuffer(b);
-    for (RtCaptureSlot& slot : rt_capture_) {
-        if (slot.blas) vkDestroyAccelerationStructureKHR(dev_, slot.blas, nullptr);
-        if (slot.tlas) vkDestroyAccelerationStructureKHR(dev_, slot.tlas, nullptr);
-        DropBuffer(slot.vertices);
-        DropBuffer(slot.indices);
-        DropBuffer(slot.instance);
-        DropBuffer(slot.blas_store);
-        DropBuffer(slot.tlas_store);
-        DropBuffer(slot.scratch);
+    for (RtFrame& f : rt_) {
+        if (f.blas) vkDestroyAccelerationStructureKHR(dev_, f.blas, nullptr);
+        if (f.tlas) vkDestroyAccelerationStructureKHR(dev_, f.tlas, nullptr);
+        for (Buffer* b : {&f.verts, &f.tris, &f.mats, &f.adj, &f.inst, &f.scratch, &f.blas_mem, &f.tlas_mem})
+            DropBuffer(*b);
     }
+    DropImage(rt_scene_);
+    DropImage(rt_ao_);
     if (cmd_) Submit();
     vkDeviceWaitIdle(dev_);
     for (auto& [serial, f] : retire_) f();
@@ -1573,6 +1694,12 @@ VulkanBackend::~VulkanBackend() {
     vkDestroyPipelineCache(dev_, cache_, nullptr);
     vkDestroyPipelineLayout(dev_, layout_, nullptr);
     vkDestroyDescriptorSetLayout(dev_, set_layout_, nullptr);
+    if (rt_layout_) vkDestroyPipelineLayout(dev_, rt_layout_, nullptr);
+    if (rt_set_layout_) vkDestroyDescriptorSetLayout(dev_, rt_set_layout_, nullptr);
+    if (rt_tex_layout_) vkDestroyDescriptorSetLayout(dev_, rt_tex_layout_, nullptr);
+    if (rt_pool_) vkDestroyDescriptorPool(dev_, rt_pool_, nullptr);
+    if (rt_sampler_) vkDestroySampler(dev_, rt_sampler_, nullptr);
+    if (rt_time_pool_) vkDestroyQueryPool(dev_, rt_time_pool_, nullptr);
     if (swap_) DestroySwapchain();
     for (VkSemaphore s : acquire_sem_) vkDestroySemaphore(dev_, s, nullptr);
     vkDestroySemaphore(dev_, timeline_, nullptr);
@@ -2024,6 +2151,8 @@ void VulkanBackend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator
     DropImage(it->second.shrunk);
     DropImage(it->second.alt_res);
     DropImage(it->second.alt_fb);
+    DropImage(it->second.rt_depth);
+    if (rt_ds_ == &it->second) rt_ds_ = nullptr;
     targets_.erase(it);
 }
 
@@ -2393,7 +2522,7 @@ VkPipeline VulkanBackend::PassPipeline(const PassKey& k) {
     pi.pDepthStencilState = &ds;
     pi.pColorBlendState = &cb;
     pi.pDynamicState = &dy;
-    pi.layout = layout_;
+    pi.layout = k.rt ? rt_layout_ : layout_;
     VkPipeline p = VK_NULL_HANDLE;
     if (!st[0].module || !st[1].module) return pass_pipelines_[h] = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines(dev_, cache_, 1, &pi, nullptr, &p) != VK_SUCCESS)
@@ -2414,7 +2543,7 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
     v.height = -vp.height;
     vkCmdSetViewport(c, 0, 1, &v);
     vkCmdSetScissor(c, 0, 1, &sc);
-    VkWriteDescriptorSet w[1 + 4 + 4 + 1]{};
+    VkWriteDescriptorSet w[1 + 4 + 4 + 6]{};
     VkDescriptorBufferInfo bi{};
     VkDescriptorImageInfo ii[4]{}, si[4]{};
     VkWriteDescriptorSetAccelerationStructureKHR wa{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
@@ -2436,13 +2565,24 @@ void VulkanBackend::FullScreen(VkPipeline p, const Attachments& a, const VkViewp
         w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindSmp + i, 0, 1,
                   VK_DESCRIPTOR_TYPE_SAMPLER, &si[i], nullptr, nullptr};
     }
+    VkDescriptorBufferInfo rb[5]{};
     if (tlas) {
         wa.accelerationStructureCount = 1;
         wa.pAccelerationStructures = &tlas;
         w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &wa, VK_NULL_HANDLE, kBindTlas, 0, 1,
                   VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr};
+        // the structure's own vertices, triangles, materials and vertex lists (this frame's, as tlas is), set 1 its
+        // textures
+        const RtFrame& f = rt_[frame_slot_];
+        const Buffer* bufs[5] = {&f.verts, &f.tris, &f.mats, &f.mats, &f.adj};
+        for (uint32_t i = 0; i < 5; i++) {
+            rb[i] = {bufs[i]->buf, 0, VK_WHOLE_SIZE};
+            w[n++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, kBindRtVerts + i, 0, 1,
+                      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rb[i], nullptr};
+        }
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, rt_layout_, 1, 1, &f.tex_set, 0, nullptr);
     }
-    vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, n, w);
+    vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, tlas ? rt_layout_ : layout_, 0, n, w);
     vkCmdDraw(c, 3, 1, 0, 0);
     ForgetDrawState();
 }
@@ -2623,55 +2763,6 @@ float4 composite(O i) : SV_Target {
     return c;
 }
 )";
-    static const std::string rt_hlsl = R"(
-cbuffer P : register(b1) { float4 p[2]; };
-Texture2D<float> depthtex : register(t1);
-RaytracingAccelerationStructure scene : register(t9);
-SamplerState pt : register(s1);
-struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-O vs(uint id : SV_VertexID) {
-    O o; float2 t = float2((id << 1) & 2, id & 2);
-    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o;
-}
-float z_at(float2 uv) {
-    float d = depthtex.SampleLevel(pt, uv, 0);
-    return p[1].x > 0.5 ? d * 4096.0 : rcp(max(1.0 - d, 1e-5));
-}
-float3 pos_at(float2 uv) {
-    float z = z_at(uv);
-    return float3((uv * 2 - 1) * float2(p[0].w, -1) * p[0].z * z, z);
-}
-float4 trace(O i) : SV_Target {
-    float d = depthtex.SampleLevel(pt, i.uv, 0);
-    if (d >= 0.99999) return float4(1, 1, 1, 1);
-    float3 P = pos_at(i.uv);
-    float3 dx = pos_at(i.uv + float2(p[0].x, 0)) - pos_at(i.uv - float2(p[0].x, 0));
-    float3 dy = pos_at(i.uv + float2(0, p[0].y)) - pos_at(i.uv - float2(0, p[0].y));
-    float3 N = normalize(cross(dx, dy));
-    if (dot(N, P) > 0) N = -N;
-    float3 up = abs(N.y) < 0.95 ? float3(0, 1, 0) : float3(1, 0, 0);
-    float3 T = normalize(cross(up, N)), B = cross(N, T);
-    float occ = 0;
-    float noise = frac(sin(dot(i.pos.xy, float2(12.9898, 78.233))) * 43758.5453);
-    [unroll] for (int k = 0; k < 4; ++k) {
-        float a = (k + noise) * 1.570796327;
-        float r = sqrt((k + 0.5) * 0.25);
-        float3 dir = normalize(N + r * (T * cos(a) + B * sin(a)));
-        RayDesc ray;
-        ray.Origin = P + N * 0.025;
-        ray.Direction = dir;
-        ray.TMin = 0.001;
-        ray.TMax = p[1].y;
-        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
-        while (q.Proceed()) {}
-        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
-            occ += 1.0 - q.CommittedRayT() / p[1].y;
-    }
-    float visibility = saturate(1.0 - p[1].z * occ * 0.25);
-    return float4(visibility, visibility, visibility, 1);
-}
-)";
     uint64_t vs_hash, ao_hash, comp_hash;
     if (!Compile(hlsl, "vs", "vs_5_0", vs_hash) || !Compile(hlsl, "ao", "ps_5_0", ao_hash) ||
         !Compile(hlsl, "composite", "ps_5_0", comp_hash)) {
@@ -2701,21 +2792,10 @@ float4 trace(O i) : SV_Target {
     }();
     float constants[8] = {1.0f / t.w, 1.0f / t.h, 0.5774f, float(t.w) / float(t.h),
                           wbuffer ? 1.0f : 0.0f, 0.75f * float(app::Get().ao_radius) / 100.0f, 0.85f, 0.0f};  // the reach: Settings::ao_radius
-    VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
-    if (rt_ok_ && rt_capture_[frame_slot_].built) {
-        uint64_t rv, rp;
-        if (Compile(rt_hlsl, "vs", "vs_6_5", rv) && Compile(rt_hlsl, "trace", "ps_6_5", rp)) {
-            VkPipeline rt_pipeline = PassPipeline({rv, rp, kBgra, VK_FORMAT_UNDEFINED, 0, 0});
-            if (rt_pipeline) {
-                pao = rt_pipeline;
-                tlas = rt_capture_[frame_slot_].tlas;
-            }
-        }
-    }
     VkViewport avp{0, 0, float(aw), float(ah), 0, 1};
     VkRect2D asc{{0, 0}, {aw, ah}};
     VkImageView av[4] = {VK_NULL_HANDLE, depth, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    FullScreen(pao, {ao_half_.att, VK_NULL_HANDLE, aw, ah}, avp, asc, constants, 8, av, 2, tlas);
+    FullScreen(pao, {ao_half_.att, VK_NULL_HANDLE, aw, ah}, avp, asc, constants, 8, av, 2);
     End();
     Barrier();
     VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
@@ -3713,6 +3793,8 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
             t->clear_z = std::clamp(z, 0.0f, 1.0f);
         }
         if (t == ds && (flags & kClearStencil)) t->clear_stencil = stencil & 0xFF;
+        // ray tracing: the scene's depth cleared after its traced draws (the weapon drawn next): kept for the passes
+        if (t == ds && (flags & kClearZ) && t == rt_ds_ && rt_frame_ == presents_ + 1 && rt_used_) RtKeepDepth(*t);
         ClearRects(*t, rs, flags, col, std::clamp(z, 0.0f, 1.0f), stencil);
         t->drawn = true;
     }
@@ -4262,158 +4344,302 @@ bool VulkanBackend::DrawGeometry(const Assembled& a) {
     return true;
 }
 
-void VulkanBackend::CaptureGeometry(const State& s, const Assembled& a, const DrawShaders& sh, const PsoKey& key,
-                                    const Stretch& vsc, const Stretch& dc, const DrawTextures& stages,
-                                    const VkSampler smp[4]) {
-    const char* capture_env = std::getenv("XBE_RT_CAPTURE");
-    const bool enabled = app::Get().ambient_occlusion || (capture_env && *capture_env == '1');
-    if (!enabled || !rt_ok_ || draw_2d_ || !bound_rt_ || !bound_ds_ || bound_rt_->gw != guest_w_ ||
-        bound_rt_->gh != guest_h_ || bound_ds_->w != bound_rt_->w || bound_ds_->h != bound_rt_->h || !key.zen ||
-        !key.zwrite || key.blend || a.topology != Topology::Triangles || a.pretransformed || sh.quad ||
-        SimpleState(s, kMAlphaTestEnable))
-        return;
+// ---- ray tracing (gpu/rt_hlsl.h; ported from NightFire's)
 
+// the capture variant's tail: the draw's own vertex shader (renamed game_main), then the vertex written to u0 at the
+// push constant's base + its index less the draw's least one (kRtVertBytes): its place on the screen without the
+// jitter times w, w (the view's z), the fog's share; texture coordinates 0, the diffuse colour, coordinates 1 as two
+// halves. %s the shader's parameters, %s its argument.
+const char* kRtCaptureMain = R"(
+RWByteAddressBuffer rt_cap : register(u0);
+struct RtCap { uint base; uint count; int vmin; uint pad; };
+[[vk::push_constant]] RtCap rt_pc;
+VOut main(%s, uint rt_vid : SV_VertexID) {
+    VOut o = game_main(%s);
+    int slot = int(rt_vid) - rt_pc.vmin;
+    if (slot >= 0 && uint(slot) < rt_pc.count) {
+        float2 pxy = o.pos.xy - taa.xy * o.pos.w;
+        uint at = (rt_pc.base + uint(slot)) * 32;
+        rt_cap.Store4(at, asuint(float4(pxy, o.pos.w, saturate(o.fogamt))));
+        uint4 col = uint4(saturate(o.d0) * 255 + 0.5);
+        uint2 h = f32tof16(o.tc1.xy);
+        rt_cap.Store4(at + 16, uint4(asuint(o.tc0.xy), col.r | col.g << 8 | col.b << 16 | col.a << 24, h.x | h.y << 16));
+    }
+    return o;
+}
+)";
+
+// a texture's place in the frame's set 1 (0xFFF: none, or the set is full)
+uint32_t VulkanBackend::RtSlot(VkImageView v) {
+    if (!v) return 0xFFF;
+    if (auto it = rt_view_slot_.find(v); it != rt_view_slot_.end()) return it->second;
+    if (rt_views_.size() >= kRtTextures - 1) return 0xFFF;
+    uint32_t slot = uint32_t(rt_views_.size());
+    rt_views_.push_back(v);
+    return rt_view_slot_[v] = slot;
+}
+
+// a draw of the scene captured as it is drawn: its vertex shader swapped for the capture variant (k.vs), its
+// triangles and materials listed; push the capture's constants. Two material words a triangle: [0] the diffuse
+// texture's slot, the alpha test's reference << 12 and comparison (Cmp() less 1) << 20, a cut-out << 23, the texture
+// modulated by the diffuse colour << 24, lit by the game's lights (D3D lighting) << 25; [1] the lightmap's slot (stage
+// 1 modulating: the baked light), its coordinates' set (0 or 1) << 12, its scale (1, 2, 4: modulate, 2x, 4x) << 13
+bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShaders& sh, PsoKey& k,
+                              const DrawTextures& stages, uint32_t push[4]) {
+    if (!RtWanted() || draw_2d_ || !bound_rt_ || !bound_ds_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_ ||
+        bound_ds_->w != bound_rt_->w || bound_ds_->h != bound_rt_->h)
+        return false;
+    if (!k.zen || !k.zwrite || a.topology != Topology::Triangles || sh.quad || a.pretransformed) return false;
     const uint32_t n = a.index_count ? a.index_count : a.draw_count;
-    if (n < 3) return;
-    int64_t vmin = 0, vmax = int64_t(n) - 1;
+    if (n < 3) return false;
+    static const bool nocapture = [] {
+        const char* e = std::getenv("XBE_RT_SKIP");
+        return e && *e == '3';
+    }();
+    if (nocapture) return false;
+    const uint64_t frame = presents_ + 1;
+    if (rt_frame_ != frame) {
+        // the frame's first: the last frame's camera is the one most of its triangles had
+        uint32_t most = 0;
+        for (auto& [key, tris] : rt_proj_tris_)
+            if (tris > most) most = tris, rt_main_proj_ = key;
+        rt_proj_tris_.clear();
+        rt_frame_ = frame;
+        rt_used_ = 0;
+        rt_tris_.clear(), rt_cut_.clear(), rt_mats_.clear(), rt_cut_mats_.clear();
+        rt_views_.clear(), rt_view_slot_.clear();
+        rt_ds_ = nullptr;
+        rt_full_ = false;
+        // the slot's buffers are written from here on: the frame it last held must be done with them
+        Wait(frame_serial_[frame_slot_]);
+    }
+    // after the scene's depth was cleared for the weapon: the weapon and hands, left out of the rays
+    if (bound_ds_->rt_depth_frame == frame) return false;
+    // the camera: a sky box's (drawn first, its depth cleared after) or another view's projection is not the scene's
+    const uint64_t proj = Hash(s.transforms[3].data(), sizeof(float) * 16, Hash(&s.viewport, sizeof(s.viewport)));
+    rt_proj_tris_[proj] += n / 3;
+    if (rt_main_proj_ && proj != rt_main_proj_) return false;
+    // cut-outs (fences, leaves): alpha tested where a ray meets them, by their texture's alpha
+    const bool cut = SimpleState(s, kMAlphaTestEnable) && SimpleState(s, kMAlphaFunc) != kGlAlways;
+    if (!cut && !Opaque(k)) return false;  // blended: glass, smoke
+    const uint32_t op0 = s.tss[0][kTssColorOp], op1 = s.tss[1][kTssColorOp];
+    const uint32_t diffuse = op0 > 1 ? RtSlot(stages.view[0]) : 0xFFF;
+    if (cut && diffuse == 0xFFF) return false;
+    uint32_t mat0 = diffuse | (SimpleState(s, kMAlphaRef) & 0xFF) << 12 |
+                    ((uint32_t(Cmp(SimpleState(s, kMAlphaFunc))) - 1) & 7) << 20 | (cut ? 1u << 23 : 0u) |
+                    (op0 == 4 ? 1u << 24 : 0u) | (s.rs[kRsLighting] ? 1u << 25 : 0u);
+    uint32_t mat1 = 0xFFF;
+    if (op0 > 1 && op1 >= 4 && op1 <= 6 && stages.view[1]) {
+        mat1 = RtSlot(stages.view[1]) | (s.tss[1][kTssTexCoordIndex] & 0xFFFF ? 1u : 0u) << 12 | (op1 - 4) << 13;
+    }
+    // the scene's camera, from the frame's first draw: the projection by the viewport (the target's clip space),
+    // its half widths and depth to distance
+    if (rt_tris_.empty() && rt_cut_.empty()) {
+        GuestExtent size;
+        SurfaceSize(s.rt, size.w, size.h);
+        size = DrawnExtent(s, size);
+        if (!size.w || !size.h) return false;
+        const auto& vp = s.viewport;
+        const float sx = float(vp.w) / size.w, sy = float(vp.h) / size.h;
+        const float ox = (2.0f * vp.x + vp.w) / size.w - 1, oy = 1 - (2.0f * vp.y + vp.h) / size.h;
+        const float vpm[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, vp.max_z - vp.min_z, 0, ox, oy, vp.min_z, 1};
+        const float* P = s.transforms[3].data();
+        float pc[16]{};
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++)
+                for (int q = 0; q < 4; q++) pc[r * 4 + c] += P[r * 4 + q] * vpm[q * 4 + c];
+        if (!std::isfinite(pc[0]) || !std::isfinite(pc[5]) || std::abs(pc[0]) < 1e-5f || std::abs(pc[5]) < 1e-5f ||
+            std::abs(pc[11]) < 1e-5f) {
+            LOG_FIRST(1, "vulkan: ray tracing: the scene's projection is not a perspective one; not traced");
+            return false;
+        }
+        rt_cam_.tanx = 1.0f / pc[0];
+        rt_cam_.tany = 1.0f / pc[5];
+        rt_cam_.za = pc[10] / pc[11];
+        rt_cam_.zb = pc[14] - pc[15] * rt_cam_.za;
+        std::memcpy(rt_cam_.view, s.transforms[2].data(), sizeof(rt_cam_.view));
+        std::memcpy(rt_cam_.proj, pc, sizeof(rt_cam_.proj));
+    }
+    // the vertices it reads: SV_VertexID is an index plus the base vertex
+    int64_t vmin = 0, vmax = int64_t(a.draw_count) - 1;
+    auto index = [&](uint32_t i) -> int64_t {
+        return int64_t(a.index16 ? static_cast<const uint16_t*>(a.index_src)[i]
+                                 : static_cast<const uint32_t*>(a.index_src)[i]) + a.base_vertex;
+    };
     if (a.index_count) {
-        vmin = INT64_MAX;
-        vmax = INT64_MIN;
+        vmin = INT64_MAX, vmax = INT64_MIN;
         for (uint32_t i = 0; i < n; i++) {
-            int64_t v = int64_t(a.index16 ? static_cast<const uint16_t*>(a.index_src)[i]
-                                          : static_cast<const uint32_t*>(a.index_src)[i]) + a.base_vertex;
-            vmin = std::min(vmin, v);
-            vmax = std::max(vmax, v);
+            int64_t v = index(i);
+            vmin = std::min(vmin, v), vmax = std::max(vmax, v);
         }
     }
-    if (vmin < 0 || vmax < vmin || vmax > INT32_MAX) return;
-    const uint64_t span = uint64_t(vmax - vmin + 1);
-    if (span > kRtCaptureCapacity) return;
-
-    RtCaptureSlot& slot = rt_capture_[frame_slot_];
-    const uint64_t frame = presents_ + 1;
-    if (slot.frame != frame) {
-        // Present waits too late for mapped/frame-owned resources; wait before recording the first capture write.
-        Wait(frame_serial_[frame_slot_]);
-        slot.frame = frame;
-        slot.used = 0;
-        slot.triangles.clear();
-        slot.built = false;
+    if (vmin < 0 || vmax < vmin || vmax > INT32_MAX) return false;
+    const uint64_t count = uint64_t(vmax - vmin + 1);
+    RtFrame& f = rt_[frame_slot_];
+    if (!f.verts.buf && !MakeBuffer(f.verts, VkDeviceSize(kRtCaptureCapacity) * kRtVertBytes,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                                    false)) {
+        LOG_FIRST(1, "vulkan: no memory for ray tracing's vertices; the scene is not ray traced");
+        return false;
     }
-    if (!slot.vertices.buf &&
-        !MakeBuffer(slot.vertices, VkDeviceSize(kRtCaptureCapacity) * 16,
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-                    false)) {
-        LOG_FIRST(1, "vulkan: RT capture buffer allocation failed; scene capture is disabled");
-        return;
+    if (rt_used_ + count > kRtCaptureCapacity || rt_tris_.size() + rt_cut_.size() + size_t(n) > (12u << 20)) {
+        if (!rt_full_) LOG_FIRST(4, "vulkan: ray tracing: the frame's %u vertices are full; the rest is not traced",
+                                 kRtCaptureCapacity);
+        rt_full_ = true;
+        return false;
     }
-    if (uint64_t(slot.used) + span > kRtCaptureCapacity) {
-        LOG_FIRST(1, "vulkan: RT capture reached its per-frame %u-vertex limit", kRtCaptureCapacity);
-        return;
-    }
-
-    const uint64_t shader_key = sh.vkey ^ kRtCaptureShaderSalt;
-    uint64_t capture_vs = 0;
-    if (auto it = shader_src_.find(shader_key); it != shader_src_.end()) {
-        capture_vs = it->second;
+    // the capture variant of its vertex shader
+    const uint64_t key = sh.vkey ^ kRtCaptureShaderSalt;
+    uint64_t vh = 0;
+    if (auto it = shader_src_.find(key); it != shader_src_.end()) {
+        vh = it->second;
     } else {
-        std::string source = VertexHlsl(s, a, sh);
-        const size_t at = source.find("VOut main(");
-        const size_t close = at == std::string::npos ? at : source.find(')', at);
-        if (close == std::string::npos) return;
-        const std::string params = source.substr(at + 10, close - at - 10);
-        const size_t last_space = params.find_last_of(' ');
-        if (last_space == std::string::npos) return;
-        const std::string arg = params.substr(last_space + 1);
-        source.replace(at, 10, "VOut game_main(");
-        char tail[2048];
-        std::snprintf(tail, sizeof(tail),
-                      "\nRWByteAddressBuffer rt_cap : register(u0);\n"
-                      "struct RtCapturePC { uint base; uint count; int vmin; uint wbuf; };\n"
-                      "[[vk::push_constant]] RtCapturePC rt_pc;\n"
-                      "VOut main(%s, uint rt_vid : SV_VertexID) {\n"
-                      "    VOut o = game_main(%s);\n"
-                      "    int slot = int(rt_vid) - rt_pc.vmin;\n"
-                      "    if (slot >= 0 && uint(slot) < rt_pc.count) {\n"
-                      "        float w = abs(o.pos.w) > 1e-8 ? o.pos.w : 1e-8;\n"
-                      "        float3 p;\n"
-                      "        if (rt_pc.wbuf != 0) p = float3(o.pos.xy / w * o.wlin, o.wlin);\n"
-                      "        else { float z = 1 / max(1 - o.pos.z / w, 1e-6); p = float3(o.pos.xy / w * z, z); }\n"
-                      "        rt_cap.Store4((rt_pc.base + uint(slot)) * 16, asuint(float4(p, 1)));\n"
-                      "    }\n"
-                      "    return o;\n"
-                      "}\n",
-                      params.c_str(), arg.c_str());
-        source += tail;
-        if (!Compile(source, "main", "vs_5_0", capture_vs)) capture_vs = 0;
-        shader_src_[shader_key] = capture_vs;
+        std::string src = VertexHlsl(s, a, sh);
+        const size_t at = src.find("VOut main(");
+        const size_t close = at == std::string::npos ? at : src.find(')', at);
+        if (close != std::string::npos) {
+            const std::string params = src.substr(at + 10, close - at - 10);
+            const std::string arg = params.substr(params.find_last_of(' ') + 1);
+            src.replace(at, 10, "VOut game_main(");
+            char tail[2048];
+            std::snprintf(tail, sizeof(tail), kRtCaptureMain, params.c_str(), arg.c_str());
+            src += tail;
+            if (!Compile(src, "main", "vs_5_0", vh)) vh = 0;
+        }
+        if (!vh) LOG_FIRST(4, "vulkan: a vertex shader's ray tracing variant could not be made; its draws are not traced");
+        shader_src_[key] = vh;
     }
-    if (!capture_vs) return;
-
-    PsoKey capture_key = key;
-    capture_key.vs = capture_vs;
-    capture_key.blend = 0;
-    capture_key.wmask = 0;
-    capture_key.zen = 0;
-    capture_key.zwrite = 0;
-    capture_key.sten = 0;
-    capture_key.fill = 0;
-    VkPipeline pipeline = EnsurePipeline(capture_key);
-    if (!pipeline) return;
-
-    uint32_t wbuf = s.rs[kRsZEnable] == 2;
-    static const bool wbuffer_enabled = [] {
-        const char* e = std::getenv("XBE_WBUFFER");
-        return !(e && *e == '0');
-    }();
-    wbuf = wbuf && wbuffer_enabled;
-    if (slot.triangles.size() + size_t(n) > (6u << 20)) return;
-    const uint32_t base = slot.used;
-    const uint32_t push[4] = {base, uint32_t(span), uint32_t(int32_t(vmin)), wbuf};
-    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ds_.pipeline = pipeline);
-    PushDescriptors(vsc, dc, stages, smp, &slot.vertices);
-    vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), push);
-    if (!DrawGeometry(a)) return;
-    auto vertex = [&](uint32_t i) -> uint32_t {
-        const int64_t raw = a.index_count
-                                ? int64_t(a.index16 ? static_cast<const uint16_t*>(a.index_src)[i]
-                                                    : static_cast<const uint32_t*>(a.index_src)[i]) + a.base_vertex
-                                : int64_t(i);
-        return base + uint32_t(raw - vmin);
-    };
-    auto add_triangle = [&](uint32_t i0, uint32_t i1, uint32_t i2) {
-        if (i0 != i1 && i1 != i2 && i0 != i2) slot.triangles.insert(slot.triangles.end(), {i0, i1, i2});
-    };
+    if (!vh) return false;
+    // its triangles, as indices into the frame's vertices
+    rt_undo_ = {rt_tris_.size(), rt_cut_.size(), rt_mats_.size(), rt_cut_mats_.size(), rt_used_};
+    std::vector<uint32_t>& tris = cut ? rt_cut_ : rt_tris_;
+    const uint32_t base = rt_used_;
+    auto at = [&](uint32_t i) { return base + uint32_t((a.index_count ? index(i) : int64_t(i)) - vmin); };
     if (a.strip) {
         for (uint32_t i = 0; i + 2 < n; i++) {
-            uint32_t i0 = vertex(i), i1 = vertex(i + 1), i2 = vertex(i + 2);
+            uint32_t i0 = at(i), i1 = at(i + 1), i2 = at(i + 2);
+            if (i0 == i1 || i1 == i2 || i0 == i2) continue;
             if (i & 1) std::swap(i0, i1);
-            add_triangle(i0, i1, i2);
+            tris.insert(tris.end(), {i0, i1, i2});
         }
     } else {
-        for (uint32_t i = 0; i + 2 < n; i += 3) add_triangle(vertex(i), vertex(i + 1), vertex(i + 2));
+        for (uint32_t i = 0; i + 2 < n; i += 3) tris.insert(tris.end(), {at(i), at(i + 1), at(i + 2)});
     }
-    slot.used += uint32_t(span);
+    std::vector<uint32_t>& mats = cut ? rt_cut_mats_ : rt_mats_;
+    while (mats.size() < tris.size() / 3 * 2) mats.insert(mats.end(), {mat0, mat1});
+    k.vs = vh;
+    rt_used_ += uint32_t(count);
+    rt_ds_ = bound_ds_;
+    push[0] = base;
+    push[1] = uint32_t(count);
+    push[2] = uint32_t(int32_t(vmin));
+    push[3] = 0;
+    perf_rt_draws_++;
+    return true;
 }
-bool VulkanBackend::BuildRtStructures() {
-    if (!rt_ok_) return false;
-    const char* capture_env = std::getenv("XBE_RT_CAPTURE");
-    const bool enabled = app::Get().ambient_occlusion || (capture_env && *capture_env == '1');
-    RtCaptureSlot& slot = rt_capture_[frame_slot_];
-    slot.built = false;
-    if (!enabled || slot.frame != presents_ + 1 || !slot.used || slot.triangles.empty()) return false;
 
-    const VkDeviceSize index_bytes = VkDeviceSize(slot.triangles.size()) * sizeof(uint32_t);
-    const VkBufferUsageFlags input_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-    if (!slot.indices.buf || slot.indices.size < index_bytes) {
-        DropBuffer(slot.indices);
-        if (!MakeBuffer(slot.indices, std::max<VkDeviceSize>(index_bytes, 4), input_usage, true)) return false;
+// the last capture taken back (its draw was not drawn after all)
+void VulkanBackend::RtUndo() {
+    rt_tris_.resize(rt_undo_.tris), rt_cut_.resize(rt_undo_.cut);
+    rt_mats_.resize(rt_undo_.mats), rt_cut_mats_.resize(rt_undo_.cut_mats);
+    rt_used_ = rt_undo_.used;
+}
+
+// an acceleration structure's storage, made (again, larger) when it needs more
+bool VulkanBackend::RtStorage(Buffer& mem, VkAccelerationStructureKHR& as, VkDeviceSize need,
+                              VkAccelerationStructureTypeKHR type) {
+    if (as && mem.size >= need) return true;
+    if (as) {
+        VkAccelerationStructureKHR old = as;
+        Retire([this, old] { vkDestroyAccelerationStructureKHR(dev_, old, nullptr); });
+        as = VK_NULL_HANDLE;
     }
-    if (!slot.indices.mem.map) return false;
-    std::memcpy(slot.indices.mem.map, slot.triangles.data(), size_t(index_bytes));
+    DropBuffer(mem);
+    VkDeviceSize size = (need + need / 2 + 0xFFFF) & ~VkDeviceSize(0xFFFF);
+    if (!MakeBuffer(mem, size, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                    false))
+        return false;
+    VkAccelerationStructureCreateInfoKHR ci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+    ci.buffer = mem.buf;
+    ci.size = size;
+    ci.type = type;
+    return vkCreateAccelerationStructureKHR(dev_, &ci, nullptr, &as) == VK_SUCCESS;
+}
 
+// this frame's triangles built into the slot's bottom level structure (the opaque ones one geometry, the cut-outs,
+// alpha tested by the passes' queries, another), one instance of it scaled by the view's half widths (the view space)
+// the top level; recorded after a barrier past the draws that wrote the places
+bool VulkanBackend::RtBuild() {
+    RtFrame& f = rt_[frame_slot_];
+    const uint32_t opaque = uint32_t(rt_tris_.size() / 3), cut = uint32_t(rt_cut_.size() / 3), tris = opaque + cut;
+    if (!tris || !f.verts.buf || !rt_used_) return false;
+    const VkDeviceSize ibytes = VkDeviceSize(tris) * 12, mbytes = VkDeviceSize(tris) * 8 + 8;
+    const VkBufferUsageFlags input = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    if (f.tris.size < ibytes) {
+        DropBuffer(f.tris);
+        if (!MakeBuffer(f.tris, std::max<VkDeviceSize>(ibytes + ibytes / 2, 1u << 20), input | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        true))
+            return false;
+    }
+    if (f.mats.size < mbytes) {
+        DropBuffer(f.mats);
+        if (!MakeBuffer(f.mats, std::max<VkDeviceSize>(mbytes + mbytes / 2, 1u << 18), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true))
+            return false;
+    }
+    if (!f.inst.buf && !MakeBuffer(f.inst, sizeof(VkAccelerationStructureInstanceKHR), input, true)) return false;
+    if (!f.tris.mem.map || !f.mats.mem.map || !f.inst.mem.map) return false;
+    std::memcpy(f.tris.mem.map, rt_tris_.data(), rt_tris_.size() * 4);
+    std::memcpy(f.tris.mem.map + rt_tris_.size() * 4, rt_cut_.data(), rt_cut_.size() * 4);
+    uint32_t* mw = reinterpret_cast<uint32_t*>(f.mats.mem.map);
+    mw[0] = opaque, mw[1] = tris;
+    std::memcpy(mw + 2, rt_mats_.data(), rt_mats_.size() * 4);
+    std::memcpy(mw + 2 + rt_mats_.size(), rt_cut_mats_.data(), rt_cut_mats_.size() * 4);
+    // each vertex's triangles, for smooth normals: [0] the vertex count, [1 + v] its first entry ([1 + V] the end),
+    // then the triangles (their place in tris, as rt_tri gives a hit's); built in a CPU vector, then copied once
+    {
+        static const bool flat = std::getenv("XBE_RT_FLAT") != nullptr;  // diagnostic: the flat normals
+        const uint32_t V = flat ? 0 : rt_used_;
+        const size_t n1 = rt_tris_.size();
+        auto ti = [&](size_t i) { return i < n1 ? rt_tris_[i] : rt_cut_[i - n1]; };
+        rt_adj_.assign(size_t(V) + 2 + size_t(tris) * 3, 0);
+        uint32_t* off = rt_adj_.data() + 1;
+        rt_adj_[0] = V;
+        for (size_t i = 0; i < size_t(tris) * 3; i++)
+            if (uint32_t v = ti(i); v < V) off[v + 1]++;
+        for (uint32_t v = 1; v <= V; v++) off[v] += off[v - 1];
+        std::vector<uint32_t> next(off, off + V);
+        uint32_t* list = rt_adj_.data() + V + 2;
+        for (uint32_t t = 0; t < tris; t++)
+            for (uint32_t q = 0; q < 3; q++)
+                if (uint32_t v = ti(size_t(t) * 3 + q); v < V) list[next[v]++] = t;
+        const VkDeviceSize abytes = VkDeviceSize(rt_adj_.size()) * 4;
+        if (f.adj.size < abytes) {
+            DropBuffer(f.adj);
+            if (!MakeBuffer(f.adj, std::max<VkDeviceSize>(abytes + abytes / 2, 1u << 20), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true))
+                return false;
+        }
+        if (!f.adj.mem.map) return false;
+        std::memcpy(f.adj.mem.map, rt_adj_.data(), size_t(abytes));
+    }
+    // the textures the materials name; those an earlier frame wrote past them back to the dummy (they may be gone)
+    {
+        const uint32_t used = uint32_t(rt_views_.size()), upto = std::max(used, f.tex_written);
+        std::vector<VkDescriptorImageInfo> ii(upto);
+        for (uint32_t i = 0; i < upto; i++)
+            ii[i] = {VK_NULL_HANDLE, i < used ? rt_views_[i] : dummy_.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo si{rt_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        VkWriteDescriptorSet w[2]{};
+        uint32_t nw = 0;
+        if (upto)
+            w[nw++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, f.tex_set, 0, 0, upto,
+                       VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ii.data(), nullptr, nullptr};
+        w[nw++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, f.tex_set, 1, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &si,
+                   nullptr, nullptr};
+        vkUpdateDescriptorSets(dev_, nw, w, 0, nullptr);
+        f.tex_written = used;
+    }
     if (!rt_scratch_align_) {
         VkPhysicalDeviceAccelerationStructurePropertiesKHR as_props{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
@@ -4421,128 +4647,233 @@ bool VulkanBackend::BuildRtStructures() {
         vkGetPhysicalDeviceProperties2(pd_, &props);
         rt_scratch_align_ = std::max<VkDeviceSize>(as_props.minAccelerationStructureScratchOffsetAlignment, 1);
     }
-
-    VkAccelerationStructureGeometryTrianglesDataKHR tri{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR};
-    tri.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-    tri.vertexData.deviceAddress = BufferAddress(slot.vertices);
-    tri.vertexStride = 16;
-    tri.maxVertex = slot.used - 1;
-    tri.indexType = VK_INDEX_TYPE_UINT32;
-    tri.indexData.deviceAddress = BufferAddress(slot.indices);
-    VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
-    geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-    geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-    geometry.geometry.triangles = tri;
-
-    const uint32_t primitive_count = uint32_t(slot.triangles.size() / 3);
-    VkAccelerationStructureBuildGeometryInfoKHR blas_info{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
-    blas_info.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    blas_info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-    blas_info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-    blas_info.geometryCount = 1;
-    blas_info.pGeometries = &geometry;
-    VkAccelerationStructureBuildSizesInfoKHR blas_sizes{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
-    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &blas_info,
-                                            &primitive_count, &blas_sizes);
-
-    auto ensure_as = [&](VkAccelerationStructureKHR& as, Buffer& storage, VkDeviceSize& capacity, VkDeviceSize need,
-                         VkAccelerationStructureTypeKHR type) {
-        if (as && capacity >= need) return true;
-        if (as) vkDestroyAccelerationStructureKHR(dev_, as, nullptr);
-        as = VK_NULL_HANDLE;
-        DropBuffer(storage);
-        if (!MakeBuffer(storage, need, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
-                                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                        false))
-            return false;
-        VkAccelerationStructureCreateInfoKHR ci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
-        ci.buffer = storage.buf;
-        ci.size = need;
-        ci.type = type;
-        if (vkCreateAccelerationStructureKHR(dev_, &ci, nullptr, &as) != VK_SUCCESS) return false;
-        capacity = need;
-        return true;
+    VkAccelerationStructureGeometryKHR g[2]{};
+    uint32_t counts[2]{}, ng = 0;
+    auto geometry = [&](uint32_t first, uint32_t count, bool opaque_geo) {
+        if (!count) return;
+        VkAccelerationStructureGeometryKHR& gg = g[ng];
+        gg.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        gg.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        gg.flags = opaque_geo ? VK_GEOMETRY_OPAQUE_BIT_KHR : VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
+        VkAccelerationStructureGeometryTrianglesDataKHR& tr = gg.geometry.triangles;
+        tr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        tr.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        tr.vertexData.deviceAddress = BufferAddress(f.verts);
+        tr.vertexStride = kRtVertBytes;
+        tr.maxVertex = rt_used_ - 1;
+        tr.indexType = VK_INDEX_TYPE_UINT32;
+        tr.indexData.deviceAddress = BufferAddress(f.tris) + VkDeviceSize(first) * 12;
+        counts[ng++] = count;
     };
-    if (slot.blas && slot.blas_primitives < primitive_count) slot.blas_size = 0;
-    if (!ensure_as(slot.blas, slot.blas_store, slot.blas_size, blas_sizes.accelerationStructureSize,
-                   VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR))
+    // (without opaque ones the cut-outs are geometry 0, and rt_tri's count before them is 0 too)
+    geometry(0, opaque, true);
+    geometry(opaque, cut, false);
+    VkAccelerationStructureBuildGeometryInfoKHR bi{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    // traced for fast rays: its build costs a little more, the passes' many rays a lot less
+    bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    bi.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    bi.geometryCount = ng;
+    bi.pGeometries = g;
+    VkAccelerationStructureBuildSizesInfoKHR bs{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, counts, &bs);
+    VkAccelerationStructureGeometryKHR tg{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    tg.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tg.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    tg.geometry.instances.data.deviceAddress = BufferAddress(f.inst);
+    VkAccelerationStructureBuildGeometryInfoKHR tb = bi;
+    tb.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tb.geometryCount = 1;
+    tb.pGeometries = &tg;
+    const uint32_t instances = 1;
+    VkAccelerationStructureBuildSizesInfoKHR ts{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tb, &instances, &ts);
+    if (!RtStorage(f.blas_mem, f.blas, bs.accelerationStructureSize, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) ||
+        !RtStorage(f.tlas_mem, f.tlas, ts.accelerationStructureSize, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR)) {
+        LOG_FIRST(1, "vulkan: no memory for ray tracing's acceleration structures; the scene is not ray traced");
         return false;
-    slot.blas_primitives = std::max(slot.blas_primitives, primitive_count);
-
-    if (!slot.instance.buf && !MakeBuffer(slot.instance, sizeof(VkAccelerationStructureInstanceKHR), input_usage, true))
-        return false;
-    if (!slot.instance.mem.map) return false;
-    VkAccelerationStructureDeviceAddressInfoKHR blas_address_info{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
-    blas_address_info.accelerationStructure = slot.blas;
-    VkAccelerationStructureInstanceKHR instance{};
-    instance.transform.matrix[0][0] = 1;
-    instance.transform.matrix[1][1] = 1;
-    instance.transform.matrix[2][2] = 1;
-    instance.mask = 0xFF;
-    instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    instance.accelerationStructureReference = vkGetAccelerationStructureDeviceAddressKHR(dev_, &blas_address_info);
-    if (!instance.accelerationStructureReference) return false;
-    std::memcpy(slot.instance.mem.map, &instance, sizeof(instance));
-
-    VkAccelerationStructureGeometryInstancesDataKHR instances{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR};
-    instances.arrayOfPointers = VK_FALSE;
-    instances.data.deviceAddress = BufferAddress(slot.instance);
-    VkAccelerationStructureGeometryKHR tlas_geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
-    tlas_geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-    tlas_geometry.geometry.instances = instances;
-    VkAccelerationStructureBuildGeometryInfoKHR tlas_info{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
-    tlas_info.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-    tlas_info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-    tlas_info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-    tlas_info.geometryCount = 1;
-    tlas_info.pGeometries = &tlas_geometry;
-    const uint32_t instance_count = 1;
-    VkAccelerationStructureBuildSizesInfoKHR tlas_sizes{
-        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
-    vkGetAccelerationStructureBuildSizesKHR(dev_, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tlas_info,
-                                            &instance_count, &tlas_sizes);
-    if (!ensure_as(slot.tlas, slot.tlas_store, slot.tlas_size, tlas_sizes.accelerationStructureSize,
-                   VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR))
-        return false;
-
-    const VkDeviceSize scratch_need = std::max(blas_sizes.buildScratchSize, tlas_sizes.buildScratchSize) +
-                                      rt_scratch_align_;
-    if (!slot.scratch.buf || slot.scratch_size < scratch_need) {
-        DropBuffer(slot.scratch);
-        if (!MakeBuffer(slot.scratch, scratch_need, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+    }
+    const VkDeviceSize scratch = std::max(bs.buildScratchSize, ts.buildScratchSize) + rt_scratch_align_;
+    if (f.scratch.size < scratch) {
+        DropBuffer(f.scratch);
+        if (!MakeBuffer(f.scratch, scratch + scratch / 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                         false))
             return false;
-        slot.scratch_size = scratch_need;
     }
-    VkDeviceAddress scratch = BufferAddress(slot.scratch);
-    scratch = (scratch + rt_scratch_align_ - 1) & ~(rt_scratch_align_ - 1);
-    if (!scratch) return false;
-
+    const VkDeviceAddress sa = (BufferAddress(f.scratch) + rt_scratch_align_ - 1) & ~(rt_scratch_align_ - 1);
+    VkAccelerationStructureInstanceKHR in{};
+    in.transform.matrix[0][0] = rt_cam_.tanx;  // the captured places are the screen's times w: the view space
+    in.transform.matrix[1][1] = rt_cam_.tany;
+    in.transform.matrix[2][2] = 1;
+    in.instanceCustomIndex = 0;
+    in.mask = 1;
+    in.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    VkAccelerationStructureDeviceAddressInfoKHR ai{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+    ai.accelerationStructure = f.blas;
+    in.accelerationStructureReference = vkGetAccelerationStructureDeviceAddressKHR(dev_, &ai);
+    if (!in.accelerationStructureReference || !sa) return false;
+    std::memcpy(f.inst.mem.map, &in, sizeof(in));
     End();
     Barrier();
-    blas_info.dstAccelerationStructure = slot.blas;
-    blas_info.scratchData.deviceAddress = scratch;
-    VkAccelerationStructureBuildRangeInfoKHR blas_range{primitive_count, 0, 0, 0};
-    const VkAccelerationStructureBuildRangeInfoKHR* blas_ranges = &blas_range;
-    vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &blas_info, &blas_ranges);
+    bi.dstAccelerationStructure = f.blas;
+    bi.scratchData.deviceAddress = sa;
+    VkAccelerationStructureBuildRangeInfoKHR br[2] = {{counts[0], 0, 0, 0}, {counts[1], 0, 0, 0}};
+    const VkAccelerationStructureBuildRangeInfoKHR* pbr = br;
+    vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &bi, &pbr);
     Barrier();
-
-    tlas_info.dstAccelerationStructure = slot.tlas;
-    tlas_info.scratchData.deviceAddress = scratch;
-    VkAccelerationStructureBuildRangeInfoKHR tlas_range{1, 0, 0, 0};
-    const VkAccelerationStructureBuildRangeInfoKHR* tlas_ranges = &tlas_range;
-    vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &tlas_info, &tlas_ranges);
+    tb.dstAccelerationStructure = f.tlas;
+    tb.scratchData.deviceAddress = sa;
+    VkAccelerationStructureBuildRangeInfoKHR tr1{instances, 0, 0, 0};
+    const VkAccelerationStructureBuildRangeInfoKHR* ptr = &tr1;
+    vkCmdBuildAccelerationStructuresKHR(Cmd(), 1, &tb, &ptr);
     Barrier();
-    slot.built = true;
+    perf_rt_tris_ += tris;
     return true;
 }
+
+// the scene's depth as the game clears it for the weapon (the first such clear after the frame's traced draws): kept
+// for the passes, which leave out what is nearer than it (the weapon and hands)
+void VulkanBackend::RtKeepDepth(Target& ds) {
+    if (ds.rt_depth_frame == presents_ + 1) return;
+    if (ds.rt_depth.img && (ds.rt_depth.w != ds.w || ds.rt_depth.h != ds.h)) DropImage(ds.rt_depth);
+    if (!ds.rt_depth.img && !MakeImage(ds.rt_depth, VK_IMAGE_TYPE_2D, depth_fmt_, ds.w, ds.h, 1, 1, 1,
+                                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return;
+    ds.rt_depth_frame = presents_ + 1;
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    cp.extent = {ds.w, ds.h, 1};
+    vkCmdCopyImage(Cmd(), ds.res.img, VK_IMAGE_LAYOUT_GENERAL, ds.rt_depth.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    dirty_ = true;
+}
+
+// the GPU's time for the slot's last ray traced work (its frame is done: its capture waited for it)
+void VulkanBackend::RtTimes() {
+    RtFrame& f = rt_[frame_slot_];
+    if (!rt_time_pool_ || !f.timed) return;
+    f.timed = false;
+    uint64_t t[2] = {};
+    if (vkGetQueryPoolResults(dev_, rt_time_pool_, frame_slot_ * 2, 2, sizeof(t), t, sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+        t[1] > t[0]) {
+        rt_gpu_ms_ += double(t[1] - t[0]) * rt_tick_ns_ / 1e6;
+        rt_gpu_n_++;
+    }
+}
+
+// the scene copied for the passes to read (rt_scene_), the target written over by them
+bool VulkanBackend::RtCopyScene(Target& rt) {
+    if (rt_scene_.img && (rt_scene_.w != rt.w || rt_scene_.h != rt.h)) DropImage(rt_scene_);
+    if (!rt_scene_.img && !MakeImage(rt_scene_, VK_IMAGE_TYPE_2D, kBgra, rt.w, rt.h, 1, 1, 1,
+                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return false;
+    End();
+    if (dirty_) Barrier();
+    VkImageCopy cp{};
+    cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {rt.w, rt.h, 1};
+    vkCmdCopyImage(Cmd(), rt.res.img, VK_IMAGE_LAYOUT_GENERAL, rt_scene_.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    Barrier();
+    return true;
+}
+
+// game units a metre (Quake III's: an inch a unit)
+constexpr float kRtUnitsPerMetre = 40.0f;
+
+// XBE_RT_TEST: the passes' test views (rt_hlsl.h)
+int RtTest() {
+    static const int test = [] {
+        const char* e = std::getenv("XBE_RT_TEST");
+        return e ? std::atoi(e) : 0;
+    }();
+    return test;
+}
+
+// ray traced ambient occlusion over the scene (kRtAoHlsl): traced at half its size, then the scene darkened by it
+void VulkanBackend::RtAoPass(Target& rt) {
+    static const std::string src = std::string("#define RT_P 4\n") + kRtCommonHlsl + kRtAoHlsl;
+    uint64_t vh, th, ch;
+    if (!Compile(src, "vs", "vs_6_5", vh) || !Compile(src, "trace", "ps_6_5", th) || !Compile(src, "comp", "ps_6_5", ch)) {
+        LOG_FIRST(1, "vulkan: the ray traced occlusion did not compile; not drawn");
+        return;
+    }
+    constexpr VkFormat kAoFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    PassKey tk{vh, th, kAoFormat, VK_FORMAT_UNDEFINED, 0, 0};
+    tk.rt = 1;
+    PassKey ck{vh, ch, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    ck.rt = 1;
+    VkPipeline pt = PassPipeline(tk), pc = PassPipeline(ck);
+    if (!pt || !pc) return;
+    const uint32_t hw = std::max<uint32_t>(rt.w / 2, 1), hh = std::max<uint32_t>(rt.h / 2, 1);
+    if (rt_ao_.img && (rt_ao_.w != hw || rt_ao_.h != hh)) DropImage(rt_ao_);
+    if (!rt_ao_.img && !MakeImage(rt_ao_, VK_IMAGE_TYPE_2D, kAoFormat, hw, hh, 1, 1, 1,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        return;
+    if (!RtCopyScene(rt)) return;
+    const app::Settings& st = app::Get();
+    const bool kept = rt_ds_->rt_depth.img && rt_ds_->rt_depth_frame == presents_ + 1;
+    const int test = RtTest() >= 1 && RtTest() <= 3 ? RtTest() : 0;
+    const float c[16] = {1.0f / rt.w, 1.0f / rt.h, rt_cam_.tany, rt_cam_.tanx / rt_cam_.tany,
+                         rt_cam_.za, rt_cam_.zb, kept ? 1.0f : 0.0f, kRtUnitsPerMetre,
+                         float(st.FxOf(app::kFxRtRadius)) / 100.0f * kRtUnitsPerMetre, float(st.FxOf(app::kFxRtAo)) / 100.0f,
+                         float(st.FxOf(app::kFxRtRays)), float(test),
+                         1.0f / hw, 1.0f / hh, 0, 0};
+    const VkImageView keptv = kept ? rt_ds_->rt_depth.view : rt_ds_->res.view;
+    const VkAccelerationStructureKHR tlas = rt_[frame_slot_].tlas;
+    VkViewport hvp{0, 0, float(hw), float(hh), 0, 1};
+    VkRect2D hsc{{0, 0}, {hw, hh}};
+    VkImageView tv[4] = {rt_scene_.view, rt_ds_->res.view, VK_NULL_HANDLE, keptv};
+    FullScreen(pt, {rt_ao_.att, VK_NULL_HANDLE, hw, hh}, hvp, hsc, c, 16, tv, 4, tlas);
+    End();
+    Barrier();
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[4] = {rt_scene_.view, rt_ds_->res.view, rt_ao_.view, keptv};
+    FullScreen(pc, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4, tlas);
+    End();
+    Barrier();
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: ray traced ambient occlusion drawn (%u triangles, %d rays, %d cm)",
+                                 uint32_t((rt_tris_.size() + rt_cut_.size()) / 3), st.FxOf(app::kFxRtRays),
+                                 st.FxOf(app::kFxRtRadius));
+}
+
+// the ray traced passes over the finished 3D scene, once a frame: at the first 2D draw over it (before the HUD), or at
+// Present; the frame's capture built first
+void VulkanBackend::RtScenePass(Target& rt) {
+    rt_pass_frame_ = presents_ + 1;
+    rt_built_ = false;
+    if (!RtWanted() || rt_frame_ != presents_ + 1 || !rt_used_ || !rt_ds_ || rt_ds_->w != rt.w || rt_ds_->h != rt.h)
+        return;
+    RtFrame& f = rt_[frame_slot_];
+    End();
+    if (rt_time_pool_) {
+        RtTimes();
+        vkCmdResetQueryPool(Cmd(), rt_time_pool_, frame_slot_ * 2, 2);
+        vkCmdWriteTimestamp(Cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rt_time_pool_, frame_slot_ * 2);
+    }
+    static const int skip = [] {
+        const char* e = std::getenv("XBE_RT_SKIP");  // diagnostic: 1 no build or passes, 2 no passes
+        return e ? std::atoi(e) : 0;
+    }();
+    rt_built_ = skip != 1 && RtBuild();
+    if (rt_built_ && skip != 2 && app::Get().FxOf(app::kFxRtAo) > 0) RtAoPass(rt);
+    End();
+    if (rt_time_pool_) {
+        vkCmdWriteTimestamp(Cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rt_time_pool_, frame_slot_ * 2 + 1);
+        f.timed = true;
+    }
+    static const bool diag = std::getenv("AUF_RT_DIAG") != nullptr;
+    if (diag && presents_ % 300 == 0)
+        LOGR("rt: frame %llu: %u opaque and %u cut-out triangles, %u vertices, %zu textures, %zu cameras (scene %016llx), "
+             "tan %.3f %.3f, depth %.4f %.3f, kept %d, built %d",
+             (unsigned long long)presents_, uint32_t(rt_tris_.size() / 3), uint32_t(rt_cut_.size() / 3), rt_used_,
+             rt_views_.size(), rt_proj_tris_.size(), (unsigned long long)rt_main_proj_, rt_cam_.tanx, rt_cam_.tany,
+             rt_cam_.za, rt_cam_.zb, rt_ds_->rt_depth_frame == presents_ + 1 ? 1 : 0, rt_built_ ? 1 : 0);
+}
+
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     PerfScope ps{perf_draw_};
     if (const State* sprites = PointSpriteStages(s, prim)) return Draw(*sprites, prim, start, count, indices);
@@ -4573,6 +4904,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (draw_2d_ && app::Get().hide_2d) return;  // photo mode: no HUD, no menus
     for (int i = 0; i < 4; i++) stages.view[i] = BindTexture(s, i, stages);
     if (!BindTargets(s)) return;
+    // ray tracing: the first 2D draw over the finished scene has the traced passes drawn over it first, so the HUD
+    // stays out of them
+    if (draw_2d_ && bound_rt_ && rt_pass_frame_ != presents_ + 1 && rt_frame_ == presents_ + 1 &&
+        scene_depth_frame_ == presents_ + 1 && bound_rt_->data == scene_color_data_) {
+        RtScenePass(*bound_rt_);
+        if (!BindTargets(s)) return;
+    }
     // the upscaler: the scene's targets drawn smaller from its first 3D draw; the first 2D draw over them (the HUD)
     // has FSR 2 bring the scene to its size first, so the HUD is drawn sharp over it and stays out of it
     if (UpscaleWanted() && bound_rt_) {
@@ -4613,8 +4951,18 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     float wdepth[4] = {float(k.zbias) * s.zscale / kDepth24Max, k.zslope, 1.0f / (s.zscale + 1.0f),
                        sh.prog ? 1.0f : s.zscale * s.inv_wfar};
     if (pk.wbuf) k.zbias = 0, k.zslope = 0;
+    // ray tracing: a draw of the scene writes its vertices as it is drawn (its vertex shader's capture variant)
+    uint32_t rt_push[4] = {};
+    const bool rt_capturing = RtCapture(s, a, sh, k, stages, rt_push);
     VkPipeline p = EnsurePipeline(k);
+    if (!p && rt_capturing) {
+        RtUndo();
+        LOG_FIRST(4, "vulkan: a ray tracing capture pipeline could not be made; the draw is drawn without it");
+        k.vs = sh.vh;
+        p = EnsurePipeline(k);
+    }
     if (!p) return;
+    const bool rt_captured = rt_capturing && k.vs != sh.vh;
 
     // constants
     GuestExtent size;
@@ -4703,7 +5051,8 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         dc_last_.assign(b, b + sizeof(c));
     }
     if (ds_.pipeline != p) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ds_.pipeline = p);
-    PushDescriptors(last_vsc_, last_dc_, stages, smp);
+    PushDescriptors(last_vsc_, last_dc_, stages, smp, rt_captured ? &rt_[frame_slot_].verts : nullptr);
+    if (rt_captured) vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(rt_push), rt_push);
     float bf[4];
     BlendFactor(s, bf);
     if (std::memcmp(ds_.bf, bf, sizeof(bf))) {
@@ -4762,7 +5111,6 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         vkCmdEndQuery(cb, queries_, q);
         counted_.push_back({q, serial_ + 1, SamplesPerPixel()});
     }
-    CaptureGeometry(s, a, sh, k, last_vsc_, last_dc_, stages, smp);
 }
 
 // ---- visibility tests
@@ -5266,7 +5614,8 @@ void VulkanBackend::Present(const Surface& front) {
     if (acquired && t && app::Get().smaa && !UpscaleWanted()) frame_source = SmaaFrame(*t);
     if (acquired) {
         End();
-        BuildRtStructures();
+        if (t && rt_pass_frame_ != presents_ + 1 && rt_frame_ == presents_ + 1 && t->data == scene_color_data_)
+            RtScenePass(*t);  // no 2D draw over the scene this frame
         VkCommandBuffer cb = Cmd();
         if (dirty_) Barrier();
         if (t && app::Get().ambient_occlusion && scene_depth_frame_ == presents_ + 1 &&
@@ -5383,6 +5732,11 @@ void VulkanBackend::LogPerf() {
          g_perf_wait_kind_ns[0].exchange(0) / n / 1e6, g_perf_wait_kind_ns[1].exchange(0) / n / 1e6,
          g_perf_wait_kind_ns[2].exchange(0) / n / 1e6, g_perf_wait_kind_ns[3].exchange(0) / n / 1e6,
          g_perf_wait_kind_ns[4].exchange(0) / n / 1e6, g_perf_wait_kind_ns[5].exchange(0) / n / 1e6);
+    if (rt_gpu_n_ || perf_rt_draws_)
+        LOGR("perf: ray tracing per frame: GPU %.2f ms (capture build and passes, %u frames timed), %.0f draws and "
+             "%.0f triangles traced",
+             rt_gpu_n_ ? rt_gpu_ms_ / rt_gpu_n_ : 0.0, rt_gpu_n_, double(perf_rt_draws_) / n, double(perf_rt_tris_) / n);
+    rt_gpu_ms_ = 0, rt_gpu_n_ = 0, perf_rt_draws_ = perf_rt_tris_ = 0;
     logx::Flush();
     perf_t_ = now;
     perf_frames_ = perf_submits_ = perf_draws_ = 0;
@@ -5419,12 +5773,14 @@ void VulkanBackend::RescaleTargets() {
         DropImage(x.alt_res), DropImage(x.alt_fb);
     }
     up_rt_ = up_ds_ = nullptr;
+    rt_ds_ = nullptr;
     for (auto it = targets_.begin(); it != targets_.end();) {
         Target& old = it->second;
         if (old.depth) {
             DropImage(old.res);
             DropImage(old.fb);
             DropImage(old.shrunk);
+            DropImage(old.rt_depth);
             it = targets_.erase(it);
             continue;
         }
