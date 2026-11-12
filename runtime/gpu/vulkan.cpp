@@ -4159,6 +4159,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     draw_rt_ = bound_rt_;
     draw_ds_ = bound_ds_;
     draw_2d_ = a.pretransformed || ScreenDraw(s);
+    if (draw_2d_ && app::Get().hide_2d) return;  // photo mode: no HUD, no menus
     for (int i = 0; i < 4; i++) stages.view[i] = BindTexture(s, i, stages);
     if (!BindTargets(s)) return;
     // the pixel shader made for the textures

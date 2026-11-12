@@ -44,6 +44,7 @@ struct Settings {
     uint32_t monitor = 0;            // 0 the primary display, n the nth display Windows lists
     bool pause_unfocused = false;    // the game stands still, silent, while its window is not in front
     bool show_fps = false;           // frames a second in a corner
+    bool hide_2d = false;            // a game's photo mode: every 2D draw (HUD, menus) is left out; never saved
     bool sharp_2d = true;            // GameInfo::sharpen_2d: the HUD's, menus' and text's pictures enlarged sharp
     uint32_t msaa = 0;               // 0 none, 1 2 3 MSAA 2x 4x 8x on the scene
     bool fxaa = false;               // FXAA on the finished frame
