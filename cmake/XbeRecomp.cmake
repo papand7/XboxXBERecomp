@@ -30,6 +30,45 @@ FetchContent_Declare(dxc URL https://github.com/microsoft/DirectXShaderCompiler/
     URL_HASH SHA256=e2627f004f0f9424d8c71ea1314d04f38c5a5096884ae9217f1f18bd320267b5)
 FetchContent_MakeAvailable(VulkanHeaders dxc)
 
+# FSR 2 (MIT, AMD FidelityFX): the Vulkan renderer's temporal upscaler (gpu/upscale_fsr.cpp). Its library and Vulkan
+# backend are built from the fetched sources (not its CMake files, which want the Vulkan SDK); the backend's GLSL compute
+# shaders are compiled to SPIR-V at build time by tools/fsr2_shaders through glslang (BSD/Apache, Khronos; built from
+# source, never part of the executable), which also writes each shader's bindings. The FidelityFX_SC.exe the FSR 2
+# archive carries is never run.
+FetchContent_Declare(fsr2 URL https://github.com/GPUOpen-Effects/FidelityFX-FSR2/archive/refs/tags/v2.2.1.tar.gz
+    URL_HASH SHA256=4d7261ef054b071de83c7d201f6850c274226bd3025f4a2274ef4968343bd534 SOURCE_SUBDIR none)
+set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+set(ENABLE_PCH OFF CACHE BOOL "" FORCE)
+set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(glslang URL https://github.com/KhronosGroup/glslang/archive/refs/tags/15.4.0.tar.gz
+    URL_HASH SHA256=b16c78e7604b9be9f546ee35ad8b6db6f39bbbbfb19e8d038b6fe2ea5bba4ff4 EXCLUDE_FROM_ALL)
+FetchContent_MakeAvailable(fsr2 glslang)
+set(XBE_FSR2_API ${fsr2_SOURCE_DIR}/src/ffx-fsr2-api)
+add_executable(fsr2_shaders EXCLUDE_FROM_ALL ${XBE_SDK_DIR}/tools/fsr2_shaders/main.cpp)
+target_link_libraries(fsr2_shaders PRIVATE glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/fsr2/fsr2_blobs.inc
+    COMMAND fsr2_shaders ${XBE_FSR2_API}/shaders ${CMAKE_BINARY_DIR}/fsr2/fsr2_blobs.inc
+    DEPENDS fsr2_shaders
+    COMMENT "FSR 2's Vulkan shaders to SPIR-V"
+    VERBATIM)
+add_library(xbe_fsr2 STATIC EXCLUDE_FROM_ALL
+    ${XBE_FSR2_API}/ffx_fsr2.cpp
+    ${XBE_FSR2_API}/ffx_assert.cpp
+    ${XBE_FSR2_API}/vk/ffx_fsr2_vk.cpp
+    ${XBE_SDK_DIR}/tools/fsr2_shaders/blobs_vk.cpp
+    ${CMAKE_BINARY_DIR}/fsr2/fsr2_blobs.inc)
+target_include_directories(xbe_fsr2 PRIVATE ${vulkanheaders_SOURCE_DIR}/include ${XBE_FSR2_API}/vk/shaders
+    ${CMAKE_BINARY_DIR}/fsr2)
+target_compile_definitions(xbe_fsr2 PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS
+    _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS _SILENCE_ALL_CXX20_DEPRECATION_WARNINGS)
+target_compile_options(xbe_fsr2 PRIVATE -w)
+
 # XBE_GAME_DLL, set by a game before including this: a release holds the runtime and the compiler, and the game's code
 # is built on the player's PC into <exe>.dll (runtime/app/game_code.cpp, from TGP482's XboxXBE-Recomp, MIT). Without it
 # the game's code links into its executable, as the launcher's whole build and the harness do.
@@ -94,6 +133,9 @@ set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp P
     COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_NO_PROTOTYPES INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include")
 set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/vulkan.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include;${dxc_SOURCE_DIR}/inc")
+set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/upscale_fsr.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${vulkanheaders_SOURCE_DIR}/include;${XBE_FSR2_API};${XBE_FSR2_API}/vk"
+    COMPILE_DEFINITIONS "_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS")
 
 # the settings window reads controllers from the runtime's SDL input (app::FeedPad), not XInput
 set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp PROPERTIES
@@ -141,7 +183,7 @@ function(add_xbe_image_dll target xbe config partitions game_dir)
     target_include_directories(${target} SYSTEM PRIVATE ${imgui_SOURCE_DIR})
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
     target_compile_definitions(${target} PRIVATE XBE_GAME_DLL UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> dinput8 dxguid xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
+    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> xbe_fsr2 dinput8 dxguid xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
     target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
     target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
 
@@ -201,7 +243,7 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_include_directories(${target} SYSTEM PRIVATE ${imgui_SOURCE_DIR})
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> dinput8 dxguid xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
+    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> xbe_fsr2 dinput8 dxguid xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
     # the Vulkan renderer's shader compiler, beside the exe
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll $<TARGET_FILE_DIR:${target}>)

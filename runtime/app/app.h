@@ -50,6 +50,13 @@ struct Settings {
     bool fxaa = false;               // FXAA on the finished frame
     bool smaa = false;               // SMAA on the finished frame, in place of FXAA
     bool temporal_aa = false;        // jittered Vulkan temporal antialiasing; weapon/UI can ghost
+    // temporal upscaler (Vulkan, gpu/upscale_fsr.h): 0 off, 1 AMD FSR 2. The 3D scene drawn smaller by the quality's
+    // ratio (0 Quality 1.5x, 1 Balanced 1.7x, 2 Performance 2x, 3 Ultra Performance 3x), jittered, and rebuilt at the
+    // target's size with the frames before (camera motion from the depth) before the HUD; temporal_aa and SMAA are
+    // left out meanwhile
+    uint32_t upscaler = 0;
+    uint32_t upscale_quality = 0;
+    uint32_t upscale_sharpness = 30;  // percent, FSR 2's RCAS
     bool auto_exposure = false;      // metered SDR exposure and tone mapping; Vulkan only
     uint32_t scale_filter = 0;       // the frame to the screen's size: 0 bilinear, 1 sharp (Catmull-Rom)
     bool alpha_coverage = false;     // with MSAA, alpha tested edges (fences, leaves) get partial coverage

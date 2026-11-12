@@ -52,6 +52,7 @@
 #include "gpu/smaa.h"
 #include "gpu/texture_pack.h"
 #include "gpu/texture.h"
+#include "gpu/upscale_fsr.h"
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 
@@ -451,6 +452,13 @@ struct Target {
     bool linear32 = true;         // a 32 bit linear surface in guest memory, written back row by row
     bool swizzled32 = false;      // a 32 bit swizzled one, written back in Morton order (a title reading it as data)
     std::vector<uint8_t> read;    // what Sync left in guest memory
+    // the temporal upscaler drawing the scene smaller (VulkanBackend::UpscaleShrink): while up_small, res and fb are
+    // the smaller pair and alt_res, alt_fb the full-sized ones put aside (else the other way about); the depth's last
+    // clear, which a smaller depth target starts from
+    Image alt_res, alt_fb;
+    bool up_small = false;
+    float clear_z = 1;
+    uint32_t clear_stencil = 0;
 };
 
 // a texture from guest memory
@@ -722,6 +730,17 @@ private:
     VkImageView MotionBlur(Target& t, VkImageView source, VkImageView depth);
     bool RememberCamera(const State& s);
     VkImageView TemporalAA(Target& t, VkImageView source, VkImageView depth);
+    bool TaaActive() const { return app::Get().temporal_aa && !UpscaleWanted(); }
+    // temporal upscaler (app::Settings::upscaler, gpu/upscale_fsr.h): the scene's colour and depth targets drawn
+    // smaller from its first 3D draw (UpscaleTargets, UpscaleShrink), FSR 2 over them at the first 2D draw over the
+    // scene (the HUD) or else at Present (UpscalePass), which brings them back to their size (UpscaleExpand); what FSR
+    // reads beside the scene (kUpscaleHlsl: its device depth, the camera's motion) and writes (the full-sized scene)
+    bool UpscaleWanted() const { return app::Get().upscaler == 1; }
+    void UpscaleTargets();
+    bool UpscaleShrink(Target& t, float ratio);
+    void UpscaleExpand(Target& t, bool fill);
+    void UpscaleKeep(Target& ds);
+    void UpscalePass(Target& rt, Target* ds);
     VkImageView AutoExposure(Target& t, VkImageView source);
     void RenderUi();
     void ReleaseOldTextures();
@@ -887,6 +906,19 @@ private:
     std::chrono::steady_clock::time_point exposure_time_{};
     float camera_view_[16]{}, camera_projection_[16]{}, previous_view_[16]{}, previous_projection_[16]{};
     uint64_t camera_frame_ = 0, previous_camera_frame_ = 0;
+    // the upscaler: the scene's pair drawn smaller (null when none), its inputs and output, the depth kept at a
+    // mid-frame clear of the scene's depth (the weapon drawn after it, nearer), the frames (presents_ + 1) it was
+    // upscaled and kept for
+    Target* up_rt_ = nullptr;
+    Target* up_ds_ = nullptr;
+    Image up_depth_, up_motion_, up_out_, up_kept_;
+    uint64_t up_frame_ = 0, up_ok_frame_ = 0, up_kept_frame_ = 0;
+    uint32_t up_draws_ = 0;  // 3D draws into the smaller pair since it shrank
+    uint32_t up_keep_at_ = 0, up_keep_prev_ = 0;  // up_draws_ at the last keep and at the one before it this frame
+    bool up_wbuf_ = true;    // its 3D draws' depth is a W-buffer (kRsZEnable 2: W / 4096), else a z-buffer
+    std::chrono::steady_clock::time_point up_time_{};
+    Fsr2 fsr_;
+    bool fsr_tried_ = false, fsr_ok_ = false;
     std::vector<Chunk> chunks_;  // stream chunks: [0] is being filled
     Buffer readback_;
     Dxc dxc_;
@@ -1158,6 +1190,11 @@ bool VulkanBackend::CreateDevice() {
     on.features.dualSrcBlend = f2.features.dualSrcBlend;
     on.features.occlusionQueryPrecise = f2.features.occlusionQueryPrecise;
     on.features.depthBiasClamp = f2.features.depthBiasClamp;
+    // FSR 2's compute shaders (gpu/upscale_fsr.cpp): storage images without a format, wave64 where it asks for it
+    on.features.shaderStorageImageReadWithoutFormat = f2.features.shaderStorageImageReadWithoutFormat;
+    on.features.shaderStorageImageWriteWithoutFormat = f2.features.shaderStorageImageWriteWithoutFormat;
+    on13.subgroupSizeControl = f13.subgroupSizeControl;
+    on13.computeFullSubgroups = f13.computeFullSubgroups;
     fill_lines_ = f2.features.fillModeNonSolid;
     aniso_ok_ = f2.features.samplerAnisotropy;
     if (!f2.features.geometryShader) LOGW("vulkan: no geometry shaders, points are not drawn");
@@ -1472,10 +1509,13 @@ VulkanBackend::~VulkanBackend() {
     WaitIdle();
     SavePipelineCache();
     if (ui_) ImGui_ImplVulkan_Shutdown();
-    for (auto& [k, t] : targets_) DropImage(t.res), DropImage(t.fb), DropImage(t.shrunk);
+    for (auto& [k, t] : targets_) DropImage(t.res), DropImage(t.fb), DropImage(t.shrunk), DropImage(t.alt_res), DropImage(t.alt_fb);
     targets_.clear();
+    up_rt_ = up_ds_ = nullptr;
     for (auto& [k, t] : textures_) DropImage(t.img);
     textures_.clear();
+    fsr_.Destroy();
+    for (Image* im : {&up_depth_, &up_motion_, &up_out_, &up_kept_}) DropImage(*im);
     DropImage(ao_half_);
     DropImage(ao_scene_);
     DropImage(dof_scene_);
@@ -1964,9 +2004,16 @@ void VulkanBackend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator
         scene_depth_frame_ = 0;
     }
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) Unbind();
+    if (up_rt_ == &it->second || up_ds_ == &it->second) {
+        for (Target* x : {up_rt_, up_ds_})
+            if (x && x != &it->second && x->up_small) UpscaleExpand(*x, true);
+        up_rt_ = up_ds_ = nullptr;
+    }
     DropImage(it->second.res);
     DropImage(it->second.fb);
     DropImage(it->second.shrunk);
+    DropImage(it->second.alt_res);
+    DropImage(it->second.alt_fb);
     targets_.erase(it);
 }
 
@@ -2745,7 +2792,7 @@ float4 dof(O i) : SV_Target {
 }
 
 bool VulkanBackend::RememberCamera(const State& s) {
-    if ((!app::Get().motion_blur && !app::Get().temporal_aa) || draw_2d_ || !bound_rt_ || !bound_ds_ ||
+    if ((!app::Get().motion_blur && !app::Get().temporal_aa && !UpscaleWanted()) || draw_2d_ || !bound_rt_ || !bound_ds_ ||
         bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_ || bound_ds_->w != bound_rt_->w ||
         bound_ds_->h != bound_rt_->h || !s.rs[kRsZEnable])
         return false;
@@ -2763,7 +2810,8 @@ bool VulkanBackend::RememberCamera(const State& s) {
                            ox, oy, viewport.min_z, 1};
     float raw_projection[16];
     std::memcpy(raw_projection, s.transforms[3].data(), sizeof(raw_projection));
-    if (app::Get().temporal_aa) {
+    // TAA's history reprojects through the jittered projection; the upscaler's motion vectors are FSR's unjittered
+    if (TaaActive()) {
         auto halton = [](uint32_t i, uint32_t base) {
             float f = 1, r = 0;
             for (; i; i /= base) f /= float(base), r += f * float(i % base);
@@ -3176,6 +3224,349 @@ float4 taa(O i) : SV_Target {
     return out.view;
 }
 
+// ---- the temporal upscaler (FSR 2)
+
+// its inputs beside the scene (UpscalePass), at the scene's smaller size: depth, FSR 2's device depth (0 near to 1
+// far: p[1].x near, p[1].y far; the sky 1) from the W-buffer (W = d * 4096, as MotionBlur and TemporalAA read it;
+// a z-buffer's depth is one already) and the depth kept at a mid-frame clear (UpscaleKeep: the weapon nearer than
+// it); motion, the camera's: where each pixel was last frame (reprojected through its depth as TemporalAA does) less
+// where it is, in UV units, 0 for the weapon (it moves with the view) and without a last frame. p[0]: a W-buffer, a
+// last frame, the kept depth is there, XBE_UP_TEST (2: no motion). t0 the scene's depth, t1 the kept depth. keep: the
+// scene's depth as R32F; expand: a smaller depth drawn into the full-sized one.
+const char* kUpscaleHlsl = R"(
+cbuffer P : register(b1) {
+    row_major float4x4 inverse_view;
+    row_major float4x4 inverse_projection;
+    row_major float4x4 previous_view_projection;
+    float4 p[2];
+};
+Texture2D<float> depthtex : register(t0);
+Texture2D<float> keptz : register(t1);
+SamplerState ls : register(s0);
+SamplerState pt : register(s1);
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o; float2 q = float2((id << 1) & 2, id & 2);
+    o.pos = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = q; return o;
+}
+float3 view_at(float2 uv, float d) {
+    float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
+    float4 v;
+    if (p[0].x > 0.5) {
+        v = mul(float4(ndc, 1, 1), inverse_projection);
+        v.xyz /= max(abs(v.w), 1e-6) * sign(v.w);
+        float z = d * 4096.0;
+        v.xyz *= z / (max(abs(v.z), 1e-6) * sign(v.z));
+    } else {
+        v = mul(float4(ndc, d, 1), inverse_projection);
+        v.xyz /= max(abs(v.w), 1e-6) * sign(v.w);
+    }
+    return v.xyz;
+}
+float scenez(float2 uv, out bool gun) {
+    float d = depthtex.SampleLevel(pt, uv, 0);
+    float k = p[0].z > 0.5 ? keptz.SampleLevel(pt, uv, 0) : d;
+    gun = p[0].z > 0.5 && d < k - 1e-6;
+    return gun ? d : k;
+}
+float4 depth(O i) : SV_Target {
+    bool gun;
+    float d = scenez(i.uv, gun);
+    if (d >= 0.99999) return float4(1, 0, 0, 0);
+    if (p[0].x < 0.5) return float4(d, 0, 0, 0);
+    float n = p[1].x, f = p[1].y, z = max(d * 4096.0, n);
+    return float4(saturate(f * (z - n) / (z * (f - n))), 0, 0, 0);
+}
+float4 motion(O i) : SV_Target {
+    if (p[0].y < 0.5 || int(p[0].w) == 2) return 0;
+    bool gun;
+    float d = scenez(i.uv, gun);
+    if (gun) return 0;
+    float4 old;
+    if (d >= 0.99999) {
+        float2 ndc = float2(i.uv.x * 2 - 1, 1 - i.uv.y * 2);
+        float4 ray = mul(float4(ndc, 1, 1), inverse_projection);
+        ray.xyz /= max(abs(ray.w), 1e-6) * sign(ray.w);
+        float3 dir = mul(float4(normalize(ray.xyz), 0), inverse_view).xyz;
+        old = mul(float4(dir, 0), previous_view_projection);
+    } else {
+        float4 w = mul(float4(view_at(i.uv, d), 1), inverse_view);
+        w.xyz /= max(abs(w.w), 1e-6) * sign(w.w);
+        old = mul(float4(w.xyz, 1), previous_view_projection);
+    }
+    if (old.w <= 1e-5) return 0;
+    float2 was = float2(old.x / old.w * 0.5 + 0.5, 0.5 - old.y / old.w * 0.5);
+    return float4(was - i.uv, 0, 0);
+}
+float4 keep(O i) : SV_Target { return float4(depthtex.SampleLevel(pt, i.uv, 0), 0, 0, 0); }
+void expand(O i, out float z : SV_Depth) { z = depthtex.SampleLevel(pt, i.uv, 0); }
+)";
+
+bool Inverse4(const float* in, float* out) {
+    double a[4][8]{};
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) a[r][c] = in[r * 4 + c];
+        a[r][r + 4] = 1;
+    }
+    for (int c = 0; c < 4; c++) {
+        int pivot = c;
+        for (int r = c + 1; r < 4; r++) if (std::abs(a[r][c]) > std::abs(a[pivot][c])) pivot = r;
+        if (std::abs(a[pivot][c]) < 1e-10) return false;
+        if (pivot != c) for (int k = 0; k < 8; k++) std::swap(a[c][k], a[pivot][k]);
+        const double scale = a[c][c];
+        for (int k = 0; k < 8; k++) a[c][k] /= scale;
+        for (int r = 0; r < 4; r++) if (r != c) {
+            const double f = a[r][c];
+            for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
+        }
+    }
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) out[r * 4 + c] = float(a[r][c + 4]);
+    return true;
+}
+
+// at a 3D draw into a target of the screen's console size with depth: the pair drawn smaller from here to its
+// upscaling, once a frame (none after the frame's upscaling: what is drawn then stays at the target's size)
+void VulkanBackend::UpscaleTargets() {
+    Target* rt = bound_rt_;
+    Target* ds = bound_ds_;
+    if (!rt || !ds || rt->gw != guest_w_ || rt->gh != guest_h_ || up_frame_ == presents_ + 1) return;
+    if (rt->up_small || ds->up_small) return;
+    if (up_rt_ && (up_rt_->up_small || (up_ds_ && up_ds_->up_small))) return;  // another pair is drawn smaller
+    if (rt->w != ds->w || rt->h != ds->h) return;
+    const float r = UpscaleRatio(app::Get().upscale_quality);
+    if (!UpscaleShrink(*rt, r) || !UpscaleShrink(*ds, r)) {
+        UpscaleExpand(*rt, true);
+        UpscaleExpand(*ds, true);
+        return;
+    }
+    up_rt_ = rt;
+    up_ds_ = ds;
+    up_draws_ = 0;
+}
+
+// a target drawn smaller: its full-sized images put aside; a colour target starts as its picture so far scaled
+// down, a depth target as its last clear
+bool VulkanBackend::UpscaleShrink(Target& t, float ratio) {
+    if (t.up_small) return true;
+    const uint32_t sw = std::max(1u, uint32_t(std::lround(t.w / ratio))), sh = std::max(1u, uint32_t(std::lround(t.h / ratio)));
+    End();
+    if (!t.alt_res.img || t.alt_res.w != sw || t.alt_res.h != sh) {
+        DropImage(t.alt_res);
+        DropImage(t.alt_fb);
+        const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                    (t.depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        if (!MakeImage(t.alt_res, VK_IMAGE_TYPE_2D, t.depth ? depth_fmt_ : kBgra, sw, sh, 1, 1, 1, u)) {
+            LOG_FIRST(1, "vulkan: no memory for the upscaler's smaller scene; drawn at full size");
+            return false;
+        }
+    }
+    if (dirty_) Barrier();
+    if (t.depth) {
+        Begin(Attachments{VK_NULL_HANDLE, t.alt_res.att, sw, sh});
+        VkClearAttachment ca{};
+        ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        ca.clearValue.depthStencil = {t.clear_z, t.clear_stencil};
+        VkClearRect cr{{{0, 0}, {sw, sh}}, 0, 1};
+        vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
+    } else {
+        BlitWhole(t.res.view, t.alt_res, {.alpha = true});
+    }
+    End();
+    std::swap(t.res, t.alt_res);
+    std::swap(t.fb, t.alt_fb);
+    t.w = sw, t.h = sh;
+    t.up_small = true;
+    if (t.fb.img && (t.fb.w != t.w || t.fb.h != t.h)) DropImage(t.fb);
+    dirty_ = true;
+    ForgetDrawState();
+    return true;
+}
+
+// back to the full-sized images: a colour target's filled with its smaller picture scaled up (fill; the upscaler
+// writes its own instead), a depth target's with the smaller depth (kUpscaleHlsl's expand), which the passes at
+// Present (ambient occlusion, depth of field, motion blur, light shafts) read
+void VulkanBackend::UpscaleExpand(Target& t, bool fill) {
+    if (!t.up_small) return;
+    End();
+    if (dirty_) Barrier();
+    std::swap(t.res, t.alt_res);
+    std::swap(t.fb, t.alt_fb);
+    t.w = t.res.w, t.h = t.res.h;
+    t.up_small = false;
+    if (t.fb.img && (t.fb.w != t.w || t.fb.h != t.h)) DropImage(t.fb);
+    if (t.depth) {
+        uint64_t vh, eh;
+        VkPipeline pl = VK_NULL_HANDLE;
+        if (Compile(kUpscaleHlsl, "vs", "vs_5_0", vh) && Compile(kUpscaleHlsl, "expand", "ps_5_0", eh))
+            pl = PassPipeline({vh, eh, VK_FORMAT_UNDEFINED, depth_fmt_, 0, 1});
+        const Attachments a{VK_NULL_HANDLE, t.res.att, t.w, t.h};
+        Begin(a);
+        VkClearAttachment ca{};
+        ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        ca.clearValue.depthStencil = {t.clear_z, t.clear_stencil};
+        VkClearRect cr{{{0, 0}, {t.w, t.h}}, 0, 1};
+        vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
+        if (pl) {
+            VkViewport vp{0, 0, float(t.w), float(t.h), 0, 1};
+            VkRect2D sc{{0, 0}, {t.w, t.h}};
+            float c[4] = {};
+            FullScreen(pl, a, vp, sc, c, 4, &t.alt_res.view, 1);
+        }
+        End();
+        if (scene_depth_view_ == t.alt_res.view) {
+            scene_depth_view_ = t.res.view;
+            scene_depth_w_ = t.w;
+            scene_depth_h_ = t.h;
+        }
+    } else if (fill) {
+        BlitWhole(t.alt_res.view, t.res, {.alpha = true});
+        End();
+    }
+    dirty_ = true;
+    ForgetDrawState();
+}
+
+// the smaller scene's depth cleared after its 3D draws: kept (R32F) before the clear; what is drawn after it and
+// nearer (the weapon) is told apart in kUpscaleHlsl (no camera motion). XBE_UP_GUN=0: not kept.
+void VulkanBackend::UpscaleKeep(Target& ds) {
+    static const bool on = [] {
+        const char* e = std::getenv("XBE_UP_GUN");
+        return !(e && *e == '0');
+    }();
+    if (!on) return;
+    uint64_t vh, kh;
+    if (!Compile(kUpscaleHlsl, "vs", "vs_5_0", vh) || !Compile(kUpscaleHlsl, "keep", "ps_5_0", kh)) return;
+    VkPipeline pl = PassPipeline({vh, kh, VK_FORMAT_R32_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pl) return;
+    if (up_kept_.img && (up_kept_.w != ds.w || up_kept_.h != ds.h)) DropImage(up_kept_);
+    if (!up_kept_.img && !MakeImage(up_kept_, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, ds.w, ds.h, 1, 1, 1,
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        return;
+    End();
+    if (dirty_) Barrier();
+    VkViewport vp{0, 0, float(ds.w), float(ds.h), 0, 1};
+    VkRect2D sc{{0, 0}, {ds.w, ds.h}};
+    float c[4] = {};
+    FullScreen(pl, {up_kept_.att, VK_NULL_HANDLE, ds.w, ds.h}, vp, sc, c, 4, &ds.res.view, 1);
+    End();
+    Barrier();
+    up_keep_prev_ = up_kept_frame_ == presents_ + 1 ? up_keep_at_ : 0;
+    up_keep_at_ = up_draws_;
+    up_kept_frame_ = presents_ + 1;
+}
+
+// FSR 2 over the finished 3D scene before the HUD, from the smaller size to the target's; the result is the scene the
+// HUD and the passes at Present (ambient occlusion, depth of field, motion blur, light shafts, exposure, bloom) draw
+// over. Its depth and the camera's motion made first (kUpscaleHlsl); FSR 2's jitter is the one the scene's 3D draws
+// took (Draw's constants). The targets are at their full size afterwards, however it went.
+void VulkanBackend::UpscalePass(Target& rt, Target* ds) {
+    up_frame_ = presents_ + 1;
+    auto restore = [&](bool fill) {
+        UpscaleExpand(rt, fill);
+        if (ds) UpscaleExpand(*ds, true);
+    };
+    if (!rt.up_small || !ds || !ds->up_small || ds->w != rt.w || ds->h != rt.h) return restore(true);
+    if (!fsr_tried_) {
+        fsr_tried_ = true;
+        fsr_ok_ = fsr_.Init(instance_, pd_, dev_, vkGetInstanceProcAddr, vkGetDeviceProcAddr);
+        if (!fsr_ok_) LOGE("vulkan: FSR 2 could not find its Vulkan entry points; no upscaling");
+    }
+    uint64_t vh, dh, mh;
+    if (!fsr_ok_ || !Compile(kUpscaleHlsl, "vs", "vs_5_0", vh) || !Compile(kUpscaleHlsl, "depth", "ps_5_0", dh) ||
+        !Compile(kUpscaleHlsl, "motion", "ps_5_0", mh)) {
+        LOG_FIRST(1, "vulkan: the upscaler's depth and motion pass did not compile; no upscaling");
+        return restore(true);
+    }
+    VkPipeline pd = PassPipeline({vh, dh, VK_FORMAT_R32_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    VkPipeline pm = PassPipeline({vh, mh, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_UNDEFINED, 0, 0});
+    if (!pd || !pm) return restore(true);
+    const uint32_t dw = rt.alt_res.w, dhh = rt.alt_res.h;
+    auto ensure = [&](Image& im, VkFormat f, uint32_t w, uint32_t h, VkImageUsageFlags u) {
+        if (im.img && (im.w != w || im.h != h)) DropImage(im);
+        return im.img || MakeImage(im, VK_IMAGE_TYPE_2D, f, w, h, 1, 1, 1, u);
+    };
+    const VkImageUsageFlags in = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (!ensure(up_depth_, VK_FORMAT_R32_SFLOAT, rt.w, rt.h, in) || !ensure(up_motion_, VK_FORMAT_R16G16_SFLOAT, rt.w, rt.h, in) ||
+        !ensure(up_out_, VK_FORMAT_R8G8B8A8_UNORM, dw, dhh, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+        LOG_FIRST(1, "vulkan: no memory for the upscaler; none");
+        return restore(true);
+    }
+    static const int test = [] {
+        const char* e = std::getenv("XBE_UP_TEST");
+        return e ? std::atoi(e) : 0;
+    }();
+    const float near_z = 0.1f, far_z = 4096.0f;
+    float c[56]{};
+    bool cam = camera_frame_ == presents_ + 1 && Inverse4(camera_view_, c) && Inverse4(camera_projection_, c + 16);
+    for (int r = 0; r < 4; r++) for (int k = 0; k < 4; k++) {
+        float v = 0;
+        for (int j = 0; j < 4; j++) v += previous_view_[r * 4 + j] * previous_projection_[j * 4 + k];
+        c[32 + r * 4 + k] = v;
+    }
+    const bool last = cam && previous_camera_frame_ == presents_;
+    // the kept depth taken as the world's when fewer draws came after the clear (the weapon, hands) than before it (a
+    // clear after the sky alone, then the world, is not)
+    const uint32_t after = up_draws_ - up_keep_at_, before = up_keep_at_ - up_keep_prev_;
+    const bool kept = up_kept_frame_ == presents_ + 1 && up_kept_.w == rt.w && up_kept_.h == rt.h && after && after < before;
+    static const bool trace = std::getenv("XBE_UP_TRACE") != nullptr;
+    if (trace && presents_ % 60 == 0)
+        LOGR("upscaler: frame %llu, %u 3D draws, depth kept %s (%u before the last clear, %u after), camera %d, last %d",
+             (unsigned long long)presents_, up_draws_, kept ? "used" : up_kept_frame_ == presents_ + 1 ? "unused" : "none",
+             before, after, int(camera_frame_ == presents_ + 1), int(previous_camera_frame_ == presents_));
+    c[48] = up_wbuf_ ? 1.0f : 0.0f;
+    c[49] = last ? 1.0f : 0.0f;
+    c[50] = kept ? 1.0f : 0.0f;
+    c[51] = float(test);
+    c[52] = near_z, c[53] = far_z;
+    End();
+    if (dirty_) Barrier();
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView v[2] = {ds->res.view, kept ? up_kept_.view : ds->res.view};
+    FullScreen(pd, {up_depth_.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 56, v, 2);
+    FullScreen(pm, {up_motion_.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 56, v, 2);
+    End();
+    Barrier();
+    // a new context for new sizes: the frames in flight done with the old one first
+    if (!fsr_.Same(rt.w, rt.h, dw, dhh, false)) vkDeviceWaitIdle(dev_), fsr_.Destroy();
+    FsrDispatch d;
+    d.cmd = Cmd();
+    d.color = {rt.res.img, rt.res.view, rt.res.fmt, rt.w, rt.h};
+    d.depth = {up_depth_.img, up_depth_.view, up_depth_.fmt, rt.w, rt.h};
+    d.motion = {up_motion_.img, up_motion_.view, up_motion_.fmt, rt.w, rt.h};
+    d.output = {up_out_.img, up_out_.view, up_out_.fmt, dw, dhh};
+    d.render_w = rt.w, d.render_h = rt.h;
+    const int phases = std::max(1, FsrJitterPhases(rt.w, dw));
+    FsrJitterOffset(int(presents_ % uint64_t(phases)), phases, d.jitter_x, d.jitter_y);
+    d.sharpness = float(std::min<uint32_t>(app::Get().upscale_sharpness, 100)) / 100.0f;
+    const auto now = std::chrono::steady_clock::now();
+    d.frame_ms = up_ok_frame_ == presents_
+                     ? float(std::clamp(std::chrono::duration<double, std::milli>(now - up_time_).count(), 1.0, 100.0))
+                     : 16.7f;
+    up_time_ = now;
+    d.near_z = near_z, d.far_z = far_z;
+    d.fov_y = cam && std::abs(camera_projection_[5]) > 1e-4f ? 2.0f * std::atan(1.0f / std::abs(camera_projection_[5])) : 1.0472f;
+    d.reset = up_ok_frame_ != presents_ || !last;
+    const bool ok = fsr_.Dispatch(d, dw, dhh);
+    dirty_ = true;
+    Barrier();
+    ForgetDrawState();
+    // the full-sized images back for the HUD; FSR's picture into the colour one
+    restore(!ok);
+    if (!ok) return;
+    BlitWhole(up_out_.view, rt.res, {});
+    End();
+    Barrier();
+    up_ok_frame_ = presents_ + 1;
+    static uint64_t said = 0;
+    const uint64_t key = uint64_t(d.render_w) << 32 | dw;
+    if (said != key) {
+        said = key;
+        LOGR("vulkan: FSR 2 upscaling %ux%u -> %ux%u (sharpness %.2f, %s depth%s)", d.render_w, d.render_h, dw, dhh,
+             d.sharpness, up_wbuf_ ? "W-buffer" : "z-buffer", cam ? "" : ", no camera yet");
+    }
+}
+
 VkImageView VulkanBackend::UpscaleMovie(Tex& tx, const TextureDesc& d) {
     for (auto it = movie_up_.begin(); it != movie_up_.end();) {
         if (it->second.frame + 300 < presents_ + 1) {
@@ -3304,6 +3695,14 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
         }
         // pixels the CPU wrote before this clear go in first, a later upload would paint over the clear
         if (!t->depth && LatchCpuWrite(*t)) UploadTarget(*t, s.rt);
+        if (t == ds && (flags & kClearZ)) {
+            // the upscaler: the scene's depth cleared after its 3D draws (the weapon drawn next) kept first, so
+            // the weapon is told from the world (it moves with the view, not the camera); a smaller depth target
+            // starts from the last clear
+            if (t == up_ds_ && t->up_small && up_draws_) UpscaleKeep(*t);
+            t->clear_z = std::clamp(z, 0.0f, 1.0f);
+        }
+        if (t == ds && (flags & kClearStencil)) t->clear_stencil = stencil & 0xFF;
         ClearRects(*t, rs, flags, col, std::clamp(z, 0.0f, 1.0f), stencil);
         t->drawn = true;
     }
@@ -4162,6 +4561,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (draw_2d_ && app::Get().hide_2d) return;  // photo mode: no HUD, no menus
     for (int i = 0; i < 4; i++) stages.view[i] = BindTexture(s, i, stages);
     if (!BindTargets(s)) return;
+    // the upscaler: the scene's targets drawn smaller from its first 3D draw; the first 2D draw over them (the HUD)
+    // has FSR 2 bring the scene to its size first, so the HUD is drawn sharp over it and stays out of it
+    if (UpscaleWanted() && bound_rt_) {
+        if (!draw_2d_) UpscaleTargets();
+        else if (bound_rt_ == up_rt_ && up_rt_->up_small) UpscalePass(*up_rt_, up_ds_);
+        if (!BindTargets(s)) return;
+    }
     // the pixel shader made for the textures
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
@@ -4170,6 +4576,10 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         return !(e && *e == '0');
     }();
     pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
+    if (!draw_2d_ && bound_ds_ && bound_rt_ && bound_rt_ == up_rt_ && bound_rt_->up_small) {
+        up_wbuf_ = pk.wbuf != 0;
+        up_draws_++;
+    }
     const bool camera_ok = RememberCamera(s);
     sh.pkey = Hash(&pk, sizeof(pk));
     EnsurePixelShader(pk, sh);
@@ -4220,7 +4630,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         FillTransformConstants(s, size, c);
         FillLightConstants(s, sh.fk, c);
     }
-    if (camera_ok && app::Get().temporal_aa && !draw_2d_ && bound_rt_) {
+    if (camera_ok && TaaActive() && !draw_2d_ && bound_rt_) {
         auto halton = [](uint32_t i, uint32_t base) {
             float f = 1, r = 0;
             for (; i; i /= base) f /= float(base), r += f * float(i % base);
@@ -4229,6 +4639,18 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         const uint32_t n = uint32_t(presents_ % 8) + 1;
         c.taa[0] = (halton(n, 2) - 0.5f) * 2.0f / float(bound_rt_->w);
         c.taa[1] = (halton(n, 3) - 0.5f) * 2.0f / float(bound_rt_->h);
+    } else if (const Target* jt = bound_rt_ ? bound_rt_ : bound_ds_; !draw_2d_ && jt && jt->up_small) {
+        // the upscaler's: FSR 2's own sequence for the scene's size against the target's (UpscalePass hands FSR the
+        // same offset), D3D's way up
+        static const float flip = [] {
+            const char* e = std::getenv("XBE_UP_JITTER_FLIP");
+            return e && *e == '1' ? -1.0f : 1.0f;
+        }();
+        const int phases = std::max(1, FsrJitterPhases(jt->w, jt->alt_res.w));
+        float jx, jy;
+        FsrJitterOffset(int(presents_ % uint64_t(phases)), phases, jx, jy);
+        c.taa[0] = 2.0f * jx / float(jt->w);
+        c.taa[1] = -2.0f * jy / float(jt->h) * flip;
     }
     // samplers
     VkSampler smp[4];
@@ -4741,6 +5163,14 @@ void VulkanBackend::Present(const Surface& front) {
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (ramp_dirty_) UploadGammaRamp();
+    // the upscaler: a scene still drawn smaller (no 2D draw over it) upscaled now; every target at its size again
+    // for the passes below; the smaller images let go once it is off
+    if (up_rt_ && up_rt_->up_small) UpscalePass(*up_rt_, up_ds_);
+    for (auto& [k, x] : targets_) {
+        if (x.up_small) UpscaleExpand(x, true);
+        if (!UpscaleWanted() && x.alt_res.img) DropImage(x.alt_res), DropImage(x.alt_fb);
+    }
+    if (!UpscaleWanted()) up_rt_ = up_ds_ = nullptr;
     // at most kFramesInFlight frames ahead of the GPU
     Wait(frame_serial_[frame_slot_]);
     uint32_t index = 0;
@@ -4750,7 +5180,7 @@ void VulkanBackend::Present(const Surface& front) {
         acquired = Acquire(index);
     }
     VkImageView frame_source = t ? t->res.view : VK_NULL_HANDLE;
-    if (acquired && t && app::Get().smaa) frame_source = SmaaFrame(*t);
+    if (acquired && t && app::Get().smaa && !UpscaleWanted()) frame_source = SmaaFrame(*t);
     if (acquired) {
         End();
         BuildRtStructures();
@@ -4762,7 +5192,7 @@ void VulkanBackend::Present(const Surface& front) {
         if (t && app::Get().depth_of_field && scene_depth_frame_ == presents_ + 1 &&
             scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
             frame_source = DepthOfField(*t, frame_source, scene_depth_view_);
-        if (t && app::Get().temporal_aa && scene_depth_frame_ == presents_ + 1 &&
+        if (t && TaaActive() && scene_depth_frame_ == presents_ + 1 &&
             scene_color_data_ == t->data && scene_depth_view_ && scene_depth_w_ == t->w && scene_depth_h_ == t->h)
             frame_source = TemporalAA(*t, frame_source, scene_depth_view_);
         if (t && app::Get().motion_blur && scene_depth_frame_ == presents_ + 1 &&
@@ -4896,6 +5326,11 @@ void VulkanBackend::ApplySettings() {
 // a new render scale or shape: colour targets keep their pictures, scaled into new ones, depth targets start again
 void VulkanBackend::RescaleTargets() {
     Unbind();
+    for (auto& [k, x] : targets_) {
+        if (x.up_small) UpscaleExpand(x, true);
+        DropImage(x.alt_res), DropImage(x.alt_fb);
+    }
+    up_rt_ = up_ds_ = nullptr;
     for (auto it = targets_.begin(); it != targets_.end();) {
         Target& old = it->second;
         if (old.depth) {

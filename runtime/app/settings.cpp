@@ -223,6 +223,9 @@ void Load() {
     s.fxaa = t["fxaa"].value_or(s.fxaa);
     s.smaa = t["smaa"].value_or(s.smaa);
     s.temporal_aa = t["temporal_aa"].value_or(s.temporal_aa);
+    s.upscaler = std::min<uint32_t>(t["upscaler"].value_or(s.upscaler), 1);
+    s.upscale_quality = std::min<uint32_t>(t["upscale_quality"].value_or(s.upscale_quality), 3);
+    s.upscale_sharpness = std::min<uint32_t>(t["upscale_sharpness"].value_or(s.upscale_sharpness), 100);
     s.auto_exposure = t["auto_exposure"].value_or(s.auto_exposure);
     s.scale_filter = t["scale_filter"].value_or(s.scale_filter);
     s.alpha_coverage = t["alpha_coverage"].value_or(s.alpha_coverage);
@@ -340,6 +343,9 @@ toml::table Table() {
                   {"fxaa", s.fxaa},
                   {"smaa", s.smaa},
                   {"temporal_aa", s.temporal_aa},
+                  {"upscaler", int64_t(s.upscaler)},
+                  {"upscale_quality", int64_t(s.upscale_quality)},
+                  {"upscale_sharpness", int64_t(s.upscale_sharpness)},
                   {"auto_exposure", s.auto_exposure},
                   {"scale_filter", int64_t(s.scale_filter)},
                   {"alpha_coverage", s.alpha_coverage},

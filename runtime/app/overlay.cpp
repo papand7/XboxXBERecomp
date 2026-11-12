@@ -453,7 +453,26 @@ void Graphics(Settings& s) {
         Save();
     }
     if (RowCheck("Temporal AA", &s.temporal_aa,
-                 "Jitters 3D draws and reprojects depth-validated history. Fast-moving geometry and the weapon or HUD can ghost. Vulkan only.")) Save();
+                 "Jitters 3D draws and reprojects depth-validated history. Fast-moving geometry and the weapon or HUD can ghost. Vulkan only. Not used while an upscaler is on.")) Save();
+    int up = int(s.upscaler % 2);
+    const char* up_names[] = {"Off", "AMD FSR 2"};
+    if (RowChoice("Upscaler", &up, up_names, 2, "Draws the 3D scene smaller and rebuilds it over frames, the HUD kept sharp; replaces Temporal AA and SMAA while on. Moving characters and the weapon can ghost a little. Vulkan only.")) {
+        s.upscaler = uint32_t(up);
+        Save();
+    }
+    if (s.upscaler) {
+        int q = int(s.upscale_quality % 4);
+        const char* q_names[] = {"Quality (1.5x)", "Balanced (1.7x)", "Performance (2x)", "Ultra Performance (3x)"};
+        if (RowChoice("Upscale quality", &q, q_names, 4, "How much smaller the scene is drawn before FSR 2 rebuilds it.")) {
+            s.upscale_quality = uint32_t(q);
+            Save();
+        }
+        int sharp = int(s.upscale_sharpness);
+        if (RowSlider("Upscale sharpness", &sharp, 0, 100, 5, "%", "FSR 2's own sharpening (RCAS).")) {
+            s.upscale_sharpness = uint32_t(sharp);
+            Save();
+        }
+    }
     if (RowCheck("Automatic exposure", &s.auto_exposure,
                  "Meters scene brightness and eases exposure over time with an SDR tone curve. Vulkan only.")) Save();
     int filter = int(s.scale_filter % 2);
