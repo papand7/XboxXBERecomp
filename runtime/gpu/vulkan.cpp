@@ -946,6 +946,7 @@ private:
     std::vector<uint8_t> vsc_last_, dc_last_;
     Assembled asm_;  // kept between draws for its buffers
     bool draw_2d_ = false;  // the draw is 2D: its textures are sharpened (Sharpen2D)
+    bool movie_draw_ = false;  // the draw shows a movie's frame (YUY2): kept at 4:3 with Settings::movie_43
     Target* bound_rt_ = nullptr;
     Target* bound_ds_ = nullptr;
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
@@ -3952,6 +3953,7 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
     }
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
     // YUY2 (Xbox format 0x24) has already been converted to BGRA by UploadTexture.
+    if (d.format == 0x24 && d.width >= 320 && d.height >= 200 && !palette.va) movie_draw_ = true;
     if (d.format == 0x24 && d.width >= 320 && d.height >= 200 && app::Get().movie_upscale && !palette.va) {
         if (VkImageView v = UpscaleMovie(tx, d)) {
             stages.levels[stage] = 1;
@@ -4558,6 +4560,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     draw_rt_ = bound_rt_;
     draw_ds_ = bound_ds_;
     draw_2d_ = a.pretransformed || ScreenDraw(s);
+    movie_draw_ = false;
     if (draw_2d_ && app::Get().hide_2d) return;  // photo mode: no HUD, no menus
     for (int i = 0; i < 4; i++) stages.view[i] = BindTexture(s, i, stages);
     if (!BindTargets(s)) return;
@@ -4618,6 +4621,11 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (span == kSpanViewport) c.hud[0] = 1;
     }
     SqueezeBeyond(s, c.hud);
+    // a movie's frame on a wider screen: into the middle at 4:3, every corner (Settings::movie_43), not stretched
+    if (movie_draw_ && draw_2d_ && app::Get().movie_43) {
+        const float k = HudSqueeze(s, a, aspect_, stretch);
+        if (k != 1) c.hud[0] = -std::fabs(k);
+    }
     FillSurfaceConstants(s, size, c);
     if (k.topo == uint32_t(Topology::Points)) {
         const Target* t = bound_rt_ ? bound_rt_ : bound_ds_;

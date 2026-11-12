@@ -506,6 +506,7 @@ void Graphics(Settings& s) {
     if (RowCheck("Dump textures", &s.dump_textures, "Writes original game textures to mods/textures/dump so you can build a pack.")) Save();
     int style = int(s.color_style);
     if (RowCheck("Upscale movies", &s.movie_upscale, "Sharpens YUY2 movie frames with edge-safe Lanczos scaling before they are drawn.")) Save();
+    if (RowCheck("Movies at 4:3", &s.movie_43, "On a wide screen the movies stay at their 4:3 shape in the middle instead of stretching.")) Save();
     int exposure = int(s.exposure);
     if (RowSlider("Exposure", &exposure, 50, 150, 5, "%", "Adjusts screen brightness; it does not add HDR range.")) {
         s.exposure = uint32_t(exposure);

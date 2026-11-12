@@ -82,6 +82,7 @@ struct Settings {
     uint32_t motion_blur_limit = 8;  // maximum blur in pixels
     uint32_t vignette = 0;           // percent, darkens the screen edges
     uint32_t film_grain = 0;         // percent, animated screen-space noise
+    bool movie_43 = true;            // movies kept at 4:3 in the middle of a wider screen, not stretched
     bool movie_upscale = true;       // upscale YUY2 movie frames before drawing
     uint32_t exposure = 100;         // screen brightness in percent
     uint32_t contrast = 100;         // screen contrast in percent

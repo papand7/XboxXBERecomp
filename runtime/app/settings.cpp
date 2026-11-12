@@ -252,6 +252,7 @@ void Load() {
     s.vignette = std::min<uint32_t>(t["vignette"].value_or(s.vignette), 100);
     s.film_grain = std::min<uint32_t>(t["film_grain"].value_or(s.film_grain), 100);
     s.movie_upscale = t["movie_upscale"].value_or(s.movie_upscale);
+    s.movie_43 = t["movie_43"].value_or(s.movie_43);
     s.exposure = std::clamp<uint32_t>(t["exposure"].value_or(s.exposure), 50, 150);
     s.contrast = std::clamp<uint32_t>(t["contrast"].value_or(s.contrast), 50, 150);
     s.saturation = std::min<uint32_t>(t["saturation"].value_or(s.saturation), 200);
@@ -375,6 +376,7 @@ toml::table Table() {
                   {"vignette", int64_t(s.vignette)},
                   {"film_grain", int64_t(s.film_grain)},
                   {"movie_upscale", s.movie_upscale},
+                  {"movie_43", s.movie_43},
                   {"exposure", int64_t(s.exposure)},
                   {"contrast", int64_t(s.contrast)},
                   {"saturation", int64_t(s.saturation)},
