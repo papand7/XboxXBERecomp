@@ -141,6 +141,16 @@ set_source_files_properties(${XBE_SDK_DIR}/runtime/gpu/upscale_fsr.cpp PROPERTIE
 set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp PROPERTIES
     COMPILE_DEFINITIONS IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
 
+# hd_pack (tools/hd_pack, from NightFire): a texture pack upscaled on the player's PC by Real-ESRGAN (BSD-3; its ncnn
+# Vulkan build, MIT, with the realesrgan-x4plus models), copied beside each game exe in tools/
+FetchContent_Declare(realesrgan URL https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip
+    URL_HASH SHA256=abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d)
+FetchContent_MakeAvailable(realesrgan)
+add_executable(hd_pack ${XBE_SDK_DIR}/tools/hd_pack/main.cpp ${XBE_SDK_DIR}/runtime/app/image.cpp)
+target_include_directories(hd_pack PRIVATE ${XBE_SDK_DIR}/runtime)
+target_compile_definitions(hd_pack PRIVATE UNICODE _UNICODE)
+target_link_libraries(hd_pack PRIVATE windowscodecs ole32)
+
 file(GLOB XBE_RUNTIME_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/runtime/*/*.cpp)
 list(FILTER XBE_RUNTIME_SOURCES EXCLUDE REGEX "/runtime/gpu/d3d(11|12)\\.cpp$")
 # SDL's headers go to the input code alone (it is linked LINK_ONLY), so the generated sources' compile line stays the same
@@ -148,6 +158,21 @@ set_source_files_properties(${XBE_SDK_DIR}/runtime/core/input.cpp PROPERTIES INC
 
 # One executable per recompiled image: its code from config/<config> (partitions as that config sets them),
 # the SDK runtime, XBE_HOST_SOURCES shared by every image of the game, and src/<game_dir> hooks only this image has.
+# the texture pack tool and its upscaler, in tools\ beside a game exe
+function(xbe_copy_tools target)
+    add_dependencies(${target} hd_pack)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:hd_pack> $<TARGET_FILE_DIR:${target}>/tools
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${realesrgan_SOURCE_DIR}/realesrgan-ncnn-vulkan.exe
+                ${realesrgan_SOURCE_DIR}/vcomp140.dll $<TARGET_FILE_DIR:${target}>/tools/realesrgan
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.bin
+                ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus.param ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.bin
+                ${realesrgan_SOURCE_DIR}/models/realesrgan-x4plus-anime.param
+                ${realesrgan_SOURCE_DIR}/models/realesr-animevideov3-x2.bin
+                ${realesrgan_SOURCE_DIR}/models/realesr-animevideov3-x2.param $<TARGET_FILE_DIR:${target}>/tools/realesrgan/models)
+endfunction()
+
 function(add_xbe_image_dll target xbe config partitions game_dir)
     set(GEN ${CMAKE_CURRENT_SOURCE_DIR}/generated/${game_dir})
     set(GEN_SOURCES ${GEN}/x86_func_mapping.cpp)
@@ -186,6 +211,7 @@ function(add_xbe_image_dll target xbe config partitions game_dir)
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> xbe_fsr2 dinput8 dxguid xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
     target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
     target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
+    xbe_copy_tools(${target})
 
     # without a C runtime: the executable passes on what the code calls
     add_library(${target}_code SHARED ${GEN_SOURCES})
@@ -247,6 +273,7 @@ function(add_xbe_image target xbe config partitions game_dir)
     # the Vulkan renderer's shader compiler, beside the exe
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${dxc_SOURCE_DIR}/bin/x64/dxcompiler.dll $<TARGET_FILE_DIR:${target}>)
+    xbe_copy_tools(${target})
     # lld keeps the recompiled weak functions overridable by the host ones
     target_link_options(${target} PRIVATE -fuse-ld=lld -g)
 endfunction()

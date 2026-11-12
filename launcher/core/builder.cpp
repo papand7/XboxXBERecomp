@@ -443,6 +443,11 @@ bool Builder::Install(std::string& error) {
         }
         any = true;
     }
+    // the build's tools for the player (hd_pack and Real-ESRGAN, the texture pack's upscaler), when it made them
+    if (fs::is_directory(out / "tools", ec)) {
+        fs::copy(out / "tools", PlayDir() / "tools", fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+        if (ec) Log("tools not installed: " + ec.message());
+    }
     if (!any || !Built()) {
         error = "The build made no " + game_.exe + platform_.ExeSuffix();
         return false;
