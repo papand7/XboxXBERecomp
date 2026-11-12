@@ -260,4 +260,72 @@ float4 comp(O i) : SV_Target {
 }
 )";
 
+// ray traced reflections (RtReflectPass, NightFire's kRtReflectHlsl): from each pixel of a shiny triangle (its
+// material's strength: mods/reflections.toml, the game's environment-mapped surfaces, floors where they face up) a ray
+// mirrored about its slope. What it meets is the scene's colour where that point shows on screen, else its texture
+// lit as the game lights it (by its lightmap, or its diffuse colour where D3D lit it); a miss is the sky where the
+// direction shows sky on screen. Mixed in more at a grazing view. p[2]: strength, test (XBE_RT_TEST=4: green met on
+// screen, blue off it, red missed; 5: every surface reflects); p[3]: the world's up in the view.
+inline const char* kRtReflectHlsl = R"(
+float3 rt_lit(uint tri, float2 bary) {
+    float2 uv0, uv1;
+    float4 col;
+    float fog;
+    rt_attr(tri, bary, uv0, uv1, col, fog);
+    uint m0 = rt_mat(tri), m1 = rt_mat2(tri);
+    float3 c = rt_texel(m0, uv0).rgb;
+    if ((m0 >> 24) & 1) c *= col.rgb;
+    if ((m1 & 0xFFF) != 0xFFF) c *= rt_texel(m1, ((m1 >> 12) & 1) ? uv1 : uv0).rgb * float(1u << ((m1 >> 13) & 3));
+    return saturate(c);
+}
+float4 ps(O i) : SV_Target {
+    float2 uv = i.uv;
+    float3 c = scene.SampleLevel(pt, uv, 0).rgb;
+    int test = int(p[2].y);
+    float3 P;
+    uint tri;
+    float2 bary;
+    if (!rt_primary(uv, 0.03, P, tri, bary)) return float4(c, 1);
+    uint m0 = rt_mat(tri);
+    float m = float((m0 >> 26) & 63) / 63;
+    if (test == 5) m = max(m, 0.6);
+    if (m < 0.01) return float4(c, 1);
+    float3 N = rt_face(tri);
+    if (dot(N, P) > 0) N = -N;
+    if ((rt_mat2(tri) >> 15) & 1) m *= saturate((dot(N, p[3].xyz) - 0.8) * 5);  // a floor's: where it faces up
+    if (m < 0.01) return float4(c, 1);
+    float3 V = normalize(P);
+    float3 R = reflect(V, N);
+    RayDesc ray;
+    ray.Origin = rt_off(P, N);
+    ray.Direction = R;
+    ray.TMin = 0;
+    ray.TMax = 1e6;
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+    RT_PROCEED(q)
+    float3 hit;
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
+        float2 sq = screenuv(R);
+        if (R.z > 0.05 && all(sq > 0) && all(sq < 1) && sky(depthtex.SampleLevel(pt, sq, 0)))
+            hit = scene.SampleLevel(ls, sq, 0).rgb;
+        else
+            return float4(test == 4 ? float3(1, 0, 0) : c, 1);
+    } else {
+        float3 H = ray.Origin + R * q.CommittedRayT();
+        float2 hq = screenuv(H);
+        bool shown = false;
+        if (H.z > metres(0.05) && all(hq > 0) && all(hq < 1) && !aftertheclear(hq)) {
+            float hz = viewz(depthat(hq));
+            shown = abs(hz - H.z) < H.z * 0.03 + metres(0.05);
+        }
+        if (test == 4) return float4(shown ? float3(0, 1, 0) : float3(0, 0, 1), 1);
+        hit = shown ? scene.SampleLevel(ls, hq, 0).rgb
+                    : rt_lit(rt_tri(q.CommittedGeometryIndex(), q.CommittedPrimitiveIndex()), q.CommittedTriangleBarycentrics());
+    }
+    float fres = 0.3 + 0.7 * pow(1 - saturate(dot(-V, N)), 4);
+    return float4(lerp(c, hit, saturate(m * p[2].x * fres)), 1);
+}
+)";
+
 }  // namespace gpu

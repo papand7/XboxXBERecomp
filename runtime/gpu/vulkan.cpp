@@ -41,6 +41,7 @@
 #include <imgui.h>
 #include <backends/imgui_impl_vulkan.h>
 #include <backends/imgui_impl_win32.h>
+#include <toml++/toml.hpp>
 
 #include "app/app.h"
 #include "core/diag.h"
@@ -492,6 +493,7 @@ struct Tex {
     uint64_t frame = 0;
     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
     uint64_t faces = 0;    // a cube's frame its faces drawn on the GPU were last copied in
+    uint64_t content_key = 0;  // TextureKey (the texture pack's name), worked out when ray traced reflections ask
 };
 
 struct MovieUp {
@@ -841,6 +843,9 @@ private:
     void RtScenePass(Target& rt);
     bool RtCopyScene(Target& rt);
     void RtAoPass(Target& rt);
+    float RtReflectivity(const State& s, const DrawTextures& stages, bool& floor);
+    void RtReadReflections();
+    void RtReflectPass(Target& rt);
     void RtTimes();
     bool DrawGeometry(const Assembled& a);
     // visibility tests
@@ -941,6 +946,12 @@ private:
     Image rt_scene_;  // the scene the passes read (a copy), at the scene's size
     Image rt_ao_;     // the traced occlusion, half size
     uint64_t perf_rt_tris_ = 0, perf_rt_draws_ = 0;
+    // reflections: the draw's diffuse texture's key (BindGuestTexture; 0 unknown), mods/reflections.toml's list
+    uint64_t draw_tex_key_ = 0;
+    std::unordered_map<uint64_t, float> rt_reflect_list_;
+    std::filesystem::file_time_type rt_reflect_time_{};
+    uint64_t rt_reflect_checked_ = 0;
+    bool rt_reflect_read_ = false;
     bool null_descriptor_ = false;
     bool custom_border_ = false;
     bool mirror_once_ = false;
@@ -4039,8 +4050,14 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
         uint64_t sig = SurfaceSig(d.data, TotalSize(d)) ^ DirtyEpoch(d.data) ^ palette.hash;
         if (sig != tx.sig || !same) {
             tx.sig = sig;
+            tx.content_key = 0;
             UploadTexture(tx, d, guest, palette.va ? palette.colours : nullptr);
         }
+    }
+    // ray traced reflections: the diffuse texture's key, as mods/reflections.toml lists it
+    if (stage == 0 && !d.cube && guest && RtWanted() && app::Get().FxOf(app::kFxReflections)) {
+        if (!tx.content_key) tx.content_key = TextureKey(d, guest, palette.hash);
+        draw_tex_key_ = tx.content_key;
     }
     if (d.cube && !fi.depth) CopyCubeTargets(tx, d);
     // YUY2 (Xbox format 0x24) has already been converted to BGRA by UploadTexture.
@@ -4432,6 +4449,11 @@ bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShad
     if (op0 > 1 && op1 >= 4 && op1 <= 6 && stages.view[1]) {
         mat1 = RtSlot(stages.view[1]) | (s.tss[1][kTssTexCoordIndex] & 0xFFFF ? 1u : 0u) << 12 | (op1 - 4) << 13;
     }
+    // reflections: how shiny (6 bits << 26), a floor's only where it faces up (<< 15 of the second word)
+    bool floor = false;
+    const float refl = RtReflectivity(s, stages, floor);
+    mat0 |= uint32_t(std::clamp(refl, 0.0f, 1.0f) * 63 + 0.5f) << 26;
+    if (floor) mat1 |= 1u << 15;
     // the scene's camera, from the frame's first draw: the projection by the viewport (the target's clip space),
     // its half widths and depth to distance
     if (rt_tris_.empty() && rt_cut_.empty()) {
@@ -4840,6 +4862,100 @@ void VulkanBackend::RtAoPass(Target& rt) {
                                  st.FxOf(app::kFxRtRadius));
 }
 
+// mods/reflections.toml beside the exe, as NightFire's: [textures] "<the texture pack's 16 hex digit key>" = strength
+// (0 to 1); read again when it changes (looked at every two seconds)
+void VulkanBackend::RtReadReflections() {
+    if (rt_reflect_read_ && presents_ < rt_reflect_checked_ + 120) return;
+    rt_reflect_checked_ = presents_;
+    const std::filesystem::path f = app::ExeDir() / "mods" / "reflections.toml";
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(f, ec);
+    if (rt_reflect_read_ && (ec ? rt_reflect_list_.empty() : t == rt_reflect_time_)) return;
+    rt_reflect_read_ = true;
+    rt_reflect_time_ = ec ? std::filesystem::file_time_type{} : t;
+    rt_reflect_list_.clear();
+    if (ec) return;
+    try {
+        toml::table tb = toml::parse_file(f.string());
+        if (const toml::table* list = tb["textures"].as_table())
+            for (auto&& [k, v] : *list) {
+                const std::string name(k.str());
+                char* end = nullptr;
+                const uint64_t key = std::strtoull(name.c_str(), &end, 16);
+                const std::optional<double> s = v.value<double>();
+                if (name.size() != 16 || !end || *end || !s) {
+                    LOGR("vulkan: reflections.toml: '%s' is not a texture's 16 hex digits = a strength, ignored", name.c_str());
+                    continue;
+                }
+                rt_reflect_list_[key] = std::clamp(float(*s), 0.0f, 1.0f);
+            }
+        LOGR("vulkan: reflections.toml lists %zu textures", rt_reflect_list_.size());
+    } catch (const std::exception& e) {
+        LOGR("vulkan: reflections.toml could not be read: %s", e.what());
+    }
+}
+
+// how shiny a captured draw is (0 to 1): its diffuse texture's strength in mods/reflections.toml; else (the setting's
+// 1, auto) the game's own shiny surfaces, a stage reading a cube map or coordinates made from the reflection vector or
+// a sphere map (its environment map, shown over the real surroundings now); else (2) every floor, weaker (a wet or
+// polished look), where it faces up (floor)
+float VulkanBackend::RtReflectivity(const State& s, const DrawTextures& stages, bool& floor) {
+    floor = false;
+    const int mode = app::Get().FxOf(app::kFxReflections);
+    if (!mode) return 0;
+    RtReadReflections();
+    if (draw_tex_key_)
+        if (auto it = rt_reflect_list_.find(draw_tex_key_); it != rt_reflect_list_.end()) return it->second;
+    for (int i = 0; i < 4; i++) {
+        if (s.tss[i][kTssColorOp] <= 1) break;
+        const uint32_t tci = s.tss[i][kTssTexCoordIndex] & 0xFFFF0000u;
+        if (s.textures[i] && (stages.info[i].kind == kTexCube || tci == 0x30000 || tci == 0x40000)) return 0.5f;
+    }
+    if (mode >= 2) return floor = true, 0.3f;
+    return 0;
+}
+
+// ray traced reflections over the scene (kRtReflectHlsl): the shiny triangles' pixels (their material's strength)
+// mirror what a ray from them meets
+void VulkanBackend::RtReflectPass(Target& rt) {
+    static const std::string src = std::string("#define RT_P 4\n") + kRtCommonHlsl + kRtReflectHlsl;
+    uint64_t vh, ph;
+    if (!Compile(src, "vs", "vs_6_5", vh) || !Compile(src, "ps", "ps_6_5", ph)) {
+        LOG_FIRST(1, "vulkan: the ray traced reflections did not compile; not drawn");
+        return;
+    }
+    PassKey pk{vh, ph, kBgra, VK_FORMAT_UNDEFINED, 0, 0};
+    pk.rt = 1;
+    VkPipeline pipe = PassPipeline(pk);
+    if (!pipe || !RtCopyScene(rt)) return;
+    const bool kept = rt_ds_->rt_depth.img && rt_ds_->rt_depth_frame == presents_ + 1;
+    const int test = RtTest() == 4 || RtTest() == 5 ? RtTest() : 0;
+    // the world's up in the view (Quake III's z up; the view matrix's third row), then in the traced space
+    const float* V = rt_cam_.view;
+    const float* Pc = rt_cam_.proj;
+    float up[3] = {V[8], V[9], V[10]};
+    float cx = up[0] * Pc[0] + up[1] * Pc[4] + up[2] * Pc[8], cy = up[0] * Pc[1] + up[1] * Pc[5] + up[2] * Pc[9];
+    float cw = up[0] * Pc[3] + up[1] * Pc[7] + up[2] * Pc[11];
+    float ru[3] = {cx * rt_cam_.tanx, cy * rt_cam_.tany, cw};
+    const float ul = std::sqrt(ru[0] * ru[0] + ru[1] * ru[1] + ru[2] * ru[2]);
+    if (ul > 1e-6f) ru[0] /= ul, ru[1] /= ul, ru[2] /= ul;
+    const float c[16] = {1.0f / rt.w, 1.0f / rt.h, rt_cam_.tany, rt_cam_.tanx / rt_cam_.tany,
+                         rt_cam_.za, rt_cam_.zb, kept ? 1.0f : 0.0f, kRtUnitsPerMetre,
+                         float(app::Get().FxOf(app::kFxReflectionStrength)) / 100.0f, float(test), 0, 0,
+                         ru[0], ru[1], ru[2], 0};
+    const VkImageView keptv = kept ? rt_ds_->rt_depth.view : rt_ds_->res.view;
+    VkViewport vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    VkRect2D sc{{0, 0}, {rt.w, rt.h}};
+    VkImageView views[4] = {rt_scene_.view, rt_ds_->res.view, VK_NULL_HANDLE, keptv};
+    FullScreen(pipe, {rt.res.att, VK_NULL_HANDLE, rt.w, rt.h}, vp, sc, c, 16, views, 4, rt_[frame_slot_].tlas);
+    End();
+    Barrier();
+    static bool said = false;
+    if (!said) said = true, LOGR("vulkan: ray traced reflections drawn (mode %d, strength %d%%, %zu listed textures)",
+                                 app::Get().FxOf(app::kFxReflections), app::Get().FxOf(app::kFxReflectionStrength),
+                                 rt_reflect_list_.size());
+}
+
 // the ray traced passes over the finished 3D scene, once a frame: at the first 2D draw over it (before the HUD), or at
 // Present; the frame's capture built first
 void VulkanBackend::RtScenePass(Target& rt) {
@@ -4860,6 +4976,7 @@ void VulkanBackend::RtScenePass(Target& rt) {
     }();
     rt_built_ = skip != 1 && RtBuild();
     if (rt_built_ && skip != 2 && app::Get().FxOf(app::kFxRtAo) > 0) RtAoPass(rt);
+    if (rt_built_ && skip != 2 && app::Get().FxOf(app::kFxReflections) > 0) RtReflectPass(rt);
     End();
     if (rt_time_pool_) {
         vkCmdWriteTimestamp(Cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rt_time_pool_, frame_slot_ * 2 + 1);
@@ -4902,6 +5019,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     draw_2d_ = a.pretransformed || ScreenDraw(s);
     movie_draw_ = false;
     if (draw_2d_ && app::Get().hide_2d) return;  // photo mode: no HUD, no menus
+    draw_tex_key_ = 0;
     for (int i = 0; i < 4; i++) stages.view[i] = BindTexture(s, i, stages);
     if (!BindTargets(s)) return;
     // ray tracing: the first 2D draw over the finished scene has the traced passes drawn over it first, so the HUD
