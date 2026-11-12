@@ -68,6 +68,7 @@ struct Settings {
     bool mouse_invert_y = false;
     uint32_t monitor = 0;            // 0 the primary display, n the nth display Windows lists
     bool pause_unfocused = false;    // the game stands still, silent, while its window is not in front
+    bool occlusion_filter = true;    // sounds the title reports behind walls dulled by a low-pass (audio::SetOcclusion)
     bool show_fps = false;           // frames a second in a corner
     // Discord Rich Presence (discord.cpp): on, and the application's id from Discord's developer portal (empty: off)
     bool discord = true;

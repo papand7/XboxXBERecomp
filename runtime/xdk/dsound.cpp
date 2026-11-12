@@ -234,6 +234,10 @@ struct Voice {
     uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
     uint32_t out = 0;   // the submix buffer it plays into (SetOutputBuffer), 0 its own mix bins
     float p[3] = {}, min_dist = 1, max_dist = 1e9f;
+    // through a wall (audio::SetOcclusion): what the title asked (0 to 1), what is heard (eased toward it), the low-pass's
+    // state (two one-poles a side)
+    float occlusion = 0, occluded = 0;
+    float lp[2][2] = {};
     // ADPCM block cache
     int64_t block = -1;
     int16_t decoded[65 * 8];
@@ -448,12 +452,13 @@ void Render(float* out, uint32_t frames) {
             // a channel's left/right gains; a stereo voice's second channel too (its first is mostly left only)
             float sum = 0;
             for (uint32_t c = 0; c < std::min<uint32_t>(v.channels, 2); c++) sum = std::max(sum, g[c][0] + g[c][1]);
-            if (sum > 0.25f && top.size() < 900) {
+            if ((sum > 0.25f || v.occluded > 0.01f) && top.size() < 900) {  // a dulled voice whatever its level
                 char b[200];
                 int k = std::snprintf(b, sizeof b, " [%08X tag %X %uch %uHz freq %u vol %.2f head %.2f gain %.2f/%.2f", obj, v.tag,
                                       v.channels, v.rate, v.freq, v.volume, v.headroom, g[0][0], g[0][1]);
                 if (v.channels > 1) k += std::snprintf(b + k, sizeof b - k, " %.2f/%.2f", g[1][0], g[1][1]);
                 if (v.is3d) k += std::snprintf(b + k, sizeof b - k, " 3d mode %u at %.1f %.1f %.1f", v.mode, v.p[0], v.p[1], v.p[2]);
+                if (v.occluded > 0.01f) k += std::snprintf(b + k, sizeof b - k, " walled %.2f", v.occluded);
                 // into a 3D submix buffer: where it is, as the title gave it (mode 1 head relative: +x right, +z ahead)
                 if (const Voice* to = v.out ? Find(v.out) : nullptr)
                     k += std::snprintf(b + k, sizeof b - k, " into %08X mode %u at %.1f %.1f %.1f", v.out, to->mode, to->p[0],
@@ -489,12 +494,21 @@ void Render(float* out, uint32_t frames) {
         const char* e = std::getenv("XBE_DSOUND_SOLO");
         return e ? uint32_t(std::strtoul(e, nullptr, 16)) : 0u;
     }();
+    const bool filter = app::Get().occlusion_filter;
     for (auto& [obj, v] : g_voices) {
         if (v.paused || v.sync || (!v.stream && !v.playing)) continue;
         if (solo_tag >= 0 && long(v.tag) != solo_tag) continue;
         if (solo_obj && obj != solo_obj) continue;
         float g[kMixChannels][2];
         Levels(v, g);
+        // through a wall: a low-pass (two one-poles), 18 kHz clear to 600 Hz fully behind one
+        const float walled = filter ? v.occlusion : 0.0f;
+        v.occluded += (walled - v.occluded) * std::min(1.0f, frames / (0.1f * audio::kRate));
+        float lp = 1;
+        if (v.occluded > 0.005f) {
+            const float fc = 18000.0f * std::pow(600.0f / 18000.0f, v.occluded);
+            if (fc < 16000) lp = 1 - std::exp(-6.2831853f * fc / audio::kRate);
+        }
         const uint32_t nch = std::min<uint32_t>(std::max<uint32_t>(v.channels, 1), kMixChannels);
         uint32_t base = v.data + v.play_start;
         double step = double(v.freq ? v.freq : v.rate) / audio::kRate;
@@ -549,6 +563,12 @@ void Render(float* out, uint32_t frames) {
                 a += (a1 - a) * t;
                 l += a * g[c][0];
                 r += a * g[c][1];
+            }
+            if (lp < 1) {
+                v.lp[0][0] += (l - v.lp[0][0]) * lp, v.lp[0][1] += (v.lp[0][0] - v.lp[0][1]) * lp, l = v.lp[0][1];
+                v.lp[1][0] += (r - v.lp[1][0]) * lp, v.lp[1][1] += (v.lp[1][0] - v.lp[1][1]) * lp, r = v.lp[1][1];
+            } else {
+                v.lp[0][0] = v.lp[0][1] = l, v.lp[1][0] = v.lp[1][1] = r;  // ready for when it dulls
             }
             out[i * 2] += l;
             out[i * 2 + 1] += r;
@@ -945,6 +965,7 @@ BUFFER(SetBufferData, 3) {
 }
 BUFFER(Play, 4) {
     if (DsoundLog()) LOG_FIRST(8, "dsound: Play %08X flags %X", v.obj, a[3]);
+    if (!v.playing) v.occlusion = v.occluded = 0;  // another sound in a reused buffer: clear until the title says
     v.playing = true;
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
@@ -1301,3 +1322,14 @@ STREAM(SetPosition, 5) {
 }
 STREAM(SetVelocity, 5) { return 0; }
 STREAM(SetI3DL2Source, 3) { return 0; }
+
+// a title's sound through a wall (audio.h)
+namespace audio {
+void SetOcclusion(uint32_t buffer, float amount, bool instant) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto it = g_voices.find(buffer);
+    if (it == g_voices.end()) return;
+    it->second.occlusion = std::clamp(amount, 0.0f, 1.0f);
+    if (instant) it->second.occluded = it->second.occlusion;
+}
+}  // namespace audio

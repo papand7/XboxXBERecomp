@@ -218,6 +218,7 @@ void Load() {
     s.mouse_invert_y = t["mouse_invert_y"].value_or(s.mouse_invert_y);
     s.monitor = t["monitor"].value_or(s.monitor);
     s.pause_unfocused = t["pause_unfocused"].value_or(s.pause_unfocused);
+    s.occlusion_filter = t["occlusion_filter"].value_or(s.occlusion_filter);
     s.show_fps = t["show_fps"].value_or(s.show_fps);
     s.perf_overlay = t["perf_overlay"].value_or(s.perf_overlay);
     s.screenshot_key = t["screenshot_key"].value_or(s.screenshot_key);
@@ -352,6 +353,7 @@ toml::table Table() {
                   {"keyboard", s.keyboard},
                   {"monitor", int64_t(s.monitor)},
                   {"pause_unfocused", s.pause_unfocused},
+                  {"occlusion_filter", s.occlusion_filter},
                   {"show_fps", s.show_fps},
                   {"perf_overlay", s.perf_overlay},
                   {"screenshot_key", int64_t(s.screenshot_key)},
