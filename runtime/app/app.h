@@ -181,6 +181,8 @@ struct GameFiles {
     std::vector<uint8_t> xbe;
 };
 bool FindGame(GameFiles& game);
+// the game's folder (assets beside the exe, or where FindGame looks), for a title reading its files before boot mounts D:
+std::filesystem::path GameDir();
 std::string Sha1(const std::vector<uint8_t>& data);  // lower case hex
 // the recompiled code, <exe>.dll, built from the game in assets when missing or out of date (game_code.cpp) and
 // loaded; false after telling the player why the game cannot start, or when they chose not to start it yet

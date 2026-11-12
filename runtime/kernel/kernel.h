@@ -188,6 +188,8 @@ std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle);  //
 bool GameFileExists(const std::string& xbox_path);  // a file there, on the disc image or a host folder
 uint32_t FileObjectBody(const ObjectRef& o);  // the guest FILE_OBJECT of a file, made on first use
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
+// a part of one: len bytes from offset (fewer at its end); false when it is missing or the offset past its end
+bool ReadGameFileRange(const std::string& xbox_path, uint64_t offset, uint32_t len, std::vector<uint8_t>& out);
 
 // boot
 bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::string& game_dir, const std::string& data_dir);

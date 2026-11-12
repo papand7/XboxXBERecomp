@@ -61,6 +61,11 @@ std::string Sha1(const std::vector<uint8_t>& data) {
     return hex;
 }
 
+std::filesystem::path GameDir() {
+    static const std::filesystem::path dir = FindAssets();
+    return dir;
+}
+
 bool FindGame(GameFiles& game) {
     fs::path assets = FindAssets();
     std::vector<fs::path> isos;

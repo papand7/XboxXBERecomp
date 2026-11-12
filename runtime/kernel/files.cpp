@@ -397,6 +397,25 @@ bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
     return true;
 }
 
+bool ReadGameFileRange(const std::string& xbox_path, uint64_t offset, uint32_t len, std::vector<uint8_t>& out) {
+    Target t = Resolve(xbox_path, 0);
+    if (t.disc) {
+        if (!t.entry || t.entry->dir || offset >= t.entry->size) return false;
+        const uint32_t n = uint32_t(std::min<uint64_t>(len, t.entry->size - offset));
+        out.resize(n);
+        return MountedDisc()->Read(*t.entry, offset, out.data(), n) == n;
+    }
+    std::ifstream f(t.host, std::ios::binary);
+    if (!f) return false;
+    f.seekg(0, std::ios::end);
+    const uint64_t size = uint64_t(f.tellg());
+    if (offset >= size) return false;
+    const uint32_t n = uint32_t(std::min<uint64_t>(len, size - offset));
+    out.resize(n);
+    f.seekg(std::streamoff(offset));
+    return bool(f.read(reinterpret_cast<char*>(out.data()), n));
+}
+
 // a file the title hides (GameInfo::hide_file): opened, it is missing
 static bool Hidden(const std::string& name) {
     if (!app::kGame.hide_file || !app::kGame.hide_file(name)) return false;
