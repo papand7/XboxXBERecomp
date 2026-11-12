@@ -212,6 +212,7 @@ void Load() {
     s.monitor = t["monitor"].value_or(s.monitor);
     s.pause_unfocused = t["pause_unfocused"].value_or(s.pause_unfocused);
     s.show_fps = t["show_fps"].value_or(s.show_fps);
+    s.perf_overlay = t["perf_overlay"].value_or(s.perf_overlay);
     s.sharp_2d = t["sharp_2d"].value_or(s.sharp_2d);
     s.language = t["language"].value_or(s.language);
     // a settings file from when these were one choice: "antialiasing" off, fxaa, msaa2, msaa4 or msaa8
@@ -235,11 +236,13 @@ void Load() {
     s.low_latency = t["low_latency"].value_or(s.low_latency);
     s.sharpen = std::min<uint32_t>(t["sharpen"].value_or(s.sharpen), 100);
     s.hit_feedback = std::min<uint32_t>(t["hit_feedback"].value_or(s.hit_feedback), 2);
+    s.damage_numbers = t["damage_numbers"].value_or(s.damage_numbers);
     s.color_style = std::min<uint32_t>(t["color_style"].value_or(s.color_style), 4);
     s.bloom = std::min<uint32_t>(t["bloom"].value_or(s.bloom), 100);
     s.light_shafts = std::min<uint32_t>(t["light_shafts"].value_or(s.light_shafts), 100);
     s.atmospheric_fog = std::min<uint32_t>(t["atmospheric_fog"].value_or(s.atmospheric_fog), 100);
     s.ambient_occlusion = t["ambient_occlusion"].value_or(s.ambient_occlusion);
+    s.ao_radius = std::clamp<uint32_t>(t["ao_radius"].value_or(s.ao_radius), 25, 300);
     s.depth_of_field = t["depth_of_field"].value_or(s.depth_of_field);
     s.focus_distance = std::clamp<uint32_t>(t["focus_distance"].value_or(s.focus_distance), 1, 100);
     s.dof_blur = std::min<uint32_t>(t["dof_blur"].value_or(s.dof_blur), 12);
@@ -337,6 +340,7 @@ toml::table Table() {
                   {"monitor", int64_t(s.monitor)},
                   {"pause_unfocused", s.pause_unfocused},
                   {"show_fps", s.show_fps},
+                  {"perf_overlay", s.perf_overlay},
                   {"sharp_2d", s.sharp_2d},
                   {"language", int64_t(s.language)},
                   {"msaa", kMsaa[s.msaa % kMsaaCount]},
@@ -355,11 +359,13 @@ toml::table Table() {
                   {"low_latency", s.low_latency},
                   {"sharpen", int64_t(s.sharpen)},
                   {"hit_feedback", int64_t(s.hit_feedback)},
+                  {"damage_numbers", s.damage_numbers},
                   {"color_style", int64_t(s.color_style)},
                   {"bloom", int64_t(s.bloom)},
                   {"light_shafts", int64_t(s.light_shafts)},
                   {"atmospheric_fog", int64_t(s.atmospheric_fog)},
                   {"ambient_occlusion", s.ambient_occlusion},
+                  {"ao_radius", int64_t(s.ao_radius)},
                   {"depth_of_field", s.depth_of_field},
                   {"focus_distance", int64_t(s.focus_distance)},
                   {"dof_blur", int64_t(s.dof_blur)},

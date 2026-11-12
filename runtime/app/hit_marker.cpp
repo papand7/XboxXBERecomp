@@ -2,6 +2,7 @@
 // A mark of four strokes around that player's crosshair, drawn over the HUD in the ImGui frame (white a hit, amber
 // the head, red a kill), and a short tick made here (no sample of the game's), mixed into the sound the mixer hands
 // the output.
+#include <cstdio>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -109,6 +110,7 @@ void DrawHitMarkers() {
     for (auto it = g_marks.begin(); it != g_marks.end();) {
         float age = std::chrono::duration<float>(now - it->at).count();
         float life = it->kind == 2 ? 0.45f : 0.28f;
+        if (Get().damage_numbers && it->damage > 0) life = std::max(life, 0.9f);  // long enough to read the number
         if (age >= life) {
             it = g_marks.erase(it);
             continue;
@@ -116,6 +118,15 @@ void DrawHitMarkers() {
         float fade = 1.0f - std::pow(age / life, 2.0f);
         float pop = 1.0f + 0.35f * std::max(0.0f, 1.0f - age / 0.08f);  // a little larger at first
         float cx = fx + it->x * fw, cy = fy + it->y * fh;
+        if (Get().damage_numbers && it->damage > 0) {  // the damage, rising and fading from the mark
+            char text[16];
+            std::snprintf(text, sizeof text, "%.0f", it->damage);
+            const float rise = age * fh * 0.12f, size = fh * 0.035f * pop;
+            ImFont* font = ImGui::GetFont();
+            const ImVec2 at(cx + fh * 0.03f, cy - fh * 0.05f - rise);
+            dl->AddText(font, size, ImVec2(at.x + 1.5f, at.y + 1.5f), IM_COL32(0, 0, 0, int(200 * fade)), text);
+            dl->AddText(font, size, at, it->kind == 2 ? IM_COL32(255, 80, 60, int(255 * fade)) : IM_COL32(255, 255, 255, int(255 * fade)), text);
+        }
         float r0 = fh * 0.011f * pop, r1 = fh * (it->kind == 0 ? 0.024f : 0.030f) * pop;
         float th = std::max(1.5f, fh / 420.0f);
         ImU32 col = it->kind == 2   ? IM_COL32(235, 40, 30, int(255 * fade))

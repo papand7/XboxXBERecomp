@@ -2690,7 +2690,7 @@ float4 trace(O i) : SV_Target {
         return !(e && *e == '0');
     }();
     float constants[8] = {1.0f / t.w, 1.0f / t.h, 0.5774f, float(t.w) / float(t.h),
-                          wbuffer ? 1.0f : 0.0f, 0.75f, 0.85f, 0.0f};
+                          wbuffer ? 1.0f : 0.0f, 0.75f * float(app::Get().ao_radius) / 100.0f, 0.85f, 0.0f};  // the reach: Settings::ao_radius
     VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
     if (rt_ok_ && rt_capture_[frame_slot_].built) {
         uint64_t rv, rp;

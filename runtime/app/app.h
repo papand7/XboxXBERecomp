@@ -44,6 +44,7 @@ struct Settings {
     uint32_t monitor = 0;            // 0 the primary display, n the nth display Windows lists
     bool pause_unfocused = false;    // the game stands still, silent, while its window is not in front
     bool show_fps = false;           // frames a second in a corner
+    bool perf_overlay = false;       // a corner panel: frames a second, frame time and its graph, the render size
     bool hide_2d = false;            // a game's photo mode: every 2D draw (HUD, menus) is left out; never saved
     bool sharp_2d = true;            // GameInfo::sharpen_2d: the HUD's, menus' and text's pictures enlarged sharp
     uint32_t msaa = 0;               // 0 none, 1 2 3 MSAA 2x 4x 8x on the scene
@@ -66,10 +67,12 @@ struct Settings {
     bool low_latency = false;        // a waitable swap chain holding one frame, at the next start
     uint32_t sharpen = 0;            // percent, contrast adaptive sharpening of the finished frame
     uint32_t hit_feedback = 2;       // a player's shot hitting (HitMarker): 0 nothing, 1 a mark, 2 a mark and a tick
+    bool damage_numbers = false;     // the damage a hit did, a number floating up from the mark
     uint32_t color_style = 0;        // 0 original, 1 Enhanced Color, 2 Toon Screen, 3 Retro, 4 Noir
     uint32_t bloom = 0;              // percent, screen-space glow around bright pixels
     uint32_t light_shafts = 0;       // screen-space rays from bright scene regions; Vulkan only
     uint32_t atmospheric_fog = 0;    // optional depth fog tinted by the visible sky; Vulkan only
+    uint32_t ao_radius = 100;        // percent of ambient occlusion's reach
     bool ambient_occlusion = false;  // screen-space AO, upgraded to ray queries when available; Vulkan only
     bool depth_of_field = false;     // depth-based foreground/background blur; Vulkan only
     uint32_t focus_distance = 10;    // depth of field focus distance in metres
@@ -145,7 +148,7 @@ bool ScreenshotJustSaved();  // for a few seconds after one is written
 void DrawHud(double fps);         // the frame counter, inside the ImGui frame (overlay.cpp)
 // hit feedback (hit_marker.cpp): a game's hook when a local player's shot hits a character, at that player's
 // crosshair (x, y the shown frame's fractions); kind 0 a hit, 1 the head, 2 a kill
-void HitMarker(float x, float y, int kind, float damage = 0);
+void HitMarker(float x, float y, int kind, float damage = 0);  // damage > 0: a number shows (damage_numbers)
 void DrawHitMarkers();                          // inside the ImGui frame, from DrawHud
 void MixHitSound(float* out, uint32_t frames);  // the ticks into the mixer's stereo output
 void FeedPad();                   // controllers to the settings window's navigation, before each ImGui frame

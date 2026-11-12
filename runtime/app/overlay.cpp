@@ -414,7 +414,27 @@ void Display(Settings& s) {
     }
 }
 
+// the quality presets: filtering, edge smoothing, ambient occlusion and bloom together (NightFire's Low to Ultra)
+struct QualityPreset {
+    uint32_t aniso;
+    int edge;  // 0 off, 1 FXAA, 2 SMAA
+    bool ao;
+    uint32_t bloom;
+};
+constexpr QualityPreset kQuality[] = {{0, 0, false, 0}, {4, 1, false, 20}, {8, 2, true, 30}, {16, 2, true, 40}};
+
 void Graphics(Settings& s) {
+    int q = 4;  // Custom unless the values are a preset's
+    for (int i = 0; i < 4; i++) {
+        const QualityPreset& p = kQuality[i];
+        if (s.aniso == p.aniso && (s.smaa ? 2 : s.fxaa ? 1 : 0) == p.edge && s.ambient_occlusion == p.ao && s.bloom == p.bloom) q = i;
+    }
+    const char* q_names[] = {"Low", "Medium", "High", "Ultra", "Custom"};
+    if (RowChoice("Graphics quality", &q, q_names, 5, "Sets texture filtering, edge smoothing, ambient occlusion and bloom together. Changing one of them makes it Custom.") && q < 4) {
+        const QualityPreset& p = kQuality[q];
+        s.aniso = p.aniso, s.fxaa = p.edge == 1, s.smaa = p.edge == 2, s.ambient_occlusion = p.ao, s.bloom = p.bloom;
+        Save();
+    }
     int percent = int(s.render_percent);
     if (RowSlider("Render scale", &percent, 25, 200, 5, "%", "Percent of the screen; applies at once. Above 100% also smooths edges.")) {
         s.render_percent = uint32_t(percent);
@@ -523,6 +543,13 @@ void Graphics(Settings& s) {
     }
     if (RowCheck("Ambient occlusion", &s.ambient_occlusion,
                  "Darkens corners and nearby surfaces. Uses ray queries when supported, with screen-space depth AO as a fallback. Vulkan only.")) Save();
+    if (s.ambient_occlusion) {
+        int radius = int(s.ao_radius);
+        if (RowSlider("Occlusion radius", &radius, 25, 300, 25, "%", "How far each surface looks for what darkens it: wider reaches round larger shapes.")) {
+            s.ao_radius = uint32_t(radius);
+            Save();
+        }
+    }
     if (RowCheck("Depth of field", &s.depth_of_field,
                  "Blurs surfaces away from the selected focus distance using scene depth. The first-person weapon may blur too. Vulkan only.")) Save();
     if (s.depth_of_field) {
@@ -573,6 +600,7 @@ void Graphics(Settings& s) {
     }
     if (RowCheck("Low latency", &s.low_latency, "Applies at the next start. Holds one finished frame instead of several: less input lag, but a slow frame costs more.")) Save();
     if (RowCheck("Show frames a second", &s.show_fps)) Save();
+    if (RowCheck("Performance overlay", &s.perf_overlay, "A corner panel: frames a second, the frame time and a graph of the last two seconds, the size the 3D scene is drawn at.")) Save();
     if (kGame.sharpen_2d && RowCheck("Sharp text and HUD", &s.sharp_2d)) Save();
 }
 
@@ -587,7 +615,9 @@ void General(Settings& s) {
             s.hit_feedback = uint32_t(hit);
             Save();
         }
+        if (s.hit_feedback && RowCheck("Damage numbers", &s.damage_numbers, "The damage of each hit, floating up from the mark.")) Save();
     }
+
 }
 
 void Language(Settings& s) {
@@ -960,6 +990,47 @@ void DrawHud(double fps) {
                                                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav))
             ImGui::TextUnformatted("Screenshot saved in the screenshots folder");
         ImGui::End();
+    }
+    if (Get().perf_overlay) {  // the panel: frames a second, the frame time and its graph, the render size
+        constexpr int kN = 120;
+        static float times[kN] = {};
+        static int at = 0;
+        ImGuiIO& io = ImGui::GetIO();
+        times[at] = io.DeltaTime * 1000.0f;
+        at = (at + 1) % kN;
+        const float s = io.DisplaySize.y / 1080.0f, w = 340 * s, gh = 64 * s, x0 = io.DisplaySize.x - w - 20 * s, y0 = 20 * s;
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        ImFont* font = ImGui::GetFont();
+        const float fs = 22 * s, fb = 40 * s;
+        char line[96];
+        const Settings& st = Get();
+        const float scale = float(st.render_percent) / 100.0f;
+        static const float kUp[] = {1.5f, 1.7f, 2.0f, 3.0f};
+        const float up = st.upscaler ? kUp[std::min<uint32_t>(st.upscale_quality, 3)] : 1.0f;
+        const float h = 14 * s + fb + 10 * s + gh + 12 * s + 2 * (fs + 6 * s) + 10 * s;
+        dl->AddRectFilled({x0, y0}, {x0 + w, y0 + h}, IM_COL32(5, 14, 36, 215), 12 * s);
+        dl->AddRectFilled({x0, y0}, {x0 + 5 * s, y0 + h}, IM_COL32(40, 120, 255, 255), 12 * s, ImDrawFlags_RoundCornersLeft);
+        float y = y0 + 12 * s;
+        std::snprintf(line, sizeof line, "%.0f", fps);
+        dl->AddText(font, fb, {x0 + 22 * s, y}, IM_COL32_WHITE, line);
+        const ImVec2 ns = font->CalcTextSizeA(fb, 1e9f, 0, line);
+        dl->AddText(font, fs, {x0 + 30 * s + ns.x, y + fb - fs - 4 * s}, IM_COL32(255, 200, 70, 255), "FPS");
+        y += fb + 10 * s;
+        const float gx = x0 + 22 * s, gw = w - 44 * s, bw = gw / kN;  // 0 to 33 ms, over 16.7 ms brighter
+        dl->AddRectFilled({gx, y}, {gx + gw, y + gh}, IM_COL32(9, 30, 78, 160), 6 * s);
+        for (int i = 0; i < kN; i++) {
+            const float ms = times[(at + i) % kN], bh = std::min(ms / 33.3f, 1.0f) * gh;
+            dl->AddRectFilled({gx + i * bw, y + gh - bh}, {gx + (i + 1) * bw, y + gh},
+                              ms > 17.5f ? IM_COL32(255, 170, 80, 230) : IM_COL32(80, 160, 255, 220));
+        }
+        dl->AddLine({gx, y + gh * 0.5f}, {gx + gw, y + gh * 0.5f}, IM_COL32(205, 228, 255, 90), 1.5f * s);
+        y += gh + 12 * s;
+        std::snprintf(line, sizeof line, "Frame  %.1f ms", 1000.0 / std::max(fps, 1.0));
+        dl->AddText(font, fs, {x0 + 22 * s, y}, IM_COL32(205, 228, 255, 255), line);
+        y += fs + 6 * s;
+        if (st.upscaler) std::snprintf(line, sizeof line, "3D %.0f%%, FSR 2 x%.1f", scale * 100 / up, up);
+        else std::snprintf(line, sizeof line, "3D %.0f%% of the screen", scale * 100);
+        dl->AddText(font, fs, {x0 + 22 * s, y}, IM_COL32(205, 228, 255, 255), line);
     }
     if (!Get().show_fps) return;
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 8, vp->WorkPos.y + 8));
