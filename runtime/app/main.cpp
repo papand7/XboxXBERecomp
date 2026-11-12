@@ -241,7 +241,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 LOGR("F8: experiments set to start now begin");
                 diag::g_f8_pressed = true;
             }
-            if (wp == VK_F12 && !(lp & (1 << 30))) RequestScreenshot();
+            if (wp == WPARAM(Get().screenshot_key) && !(lp & (1 << 30))) RequestScreenshot();
             if (wp == VK_F4) {
                 LOGR("F4: frame log requested");
                 diag::g_framelog_request = true;

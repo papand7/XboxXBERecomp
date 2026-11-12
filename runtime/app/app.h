@@ -44,6 +44,10 @@ struct Settings {
     uint32_t monitor = 0;            // 0 the primary display, n the nth display Windows lists
     bool pause_unfocused = false;    // the game stands still, silent, while its window is not in front
     bool show_fps = false;           // frames a second in a corner
+    // Discord Rich Presence (discord.cpp): on, and the application's id from Discord's developer portal (empty: off)
+    bool discord = true;
+    std::string discord_app_id;
+    uint32_t screenshot_key = 0x7B;  // the Windows key that saves a screenshot (F12)
     bool perf_overlay = false;       // a corner panel: frames a second, frame time and its graph, the render size
     bool hide_2d = false;            // a game's photo mode: every 2D draw (HUD, menus) is left out; never saved
     bool sharp_2d = true;            // GameInfo::sharpen_2d: the HUD's, menus' and text's pictures enlarged sharp
@@ -150,6 +154,11 @@ void DrawHud(double fps);         // the frame counter, inside the ImGui frame (
 // hit feedback (hit_marker.cpp): a game's hook when a local player's shot hits a character, at that player's
 // crosshair (x, y the shown frame's fractions); kind 0 a hit, 1 the head, 2 a kill
 void HitMarker(float x, float y, int kind, float damage = 0);  // damage > 0: a number shows (damage_numbers)
+// Discord Rich Presence (discord.cpp): what the player is doing, on their Discord profile while Discord runs on this
+// PC (its local IPC, a background thread; nothing without Discord, Settings::discord off or no discord_app_id).
+// details the first line ("Playing Cold Reception"), state the second (may be empty), start the Unix time the elapsed
+// time counts from (0 none). Any thread; sent when it changes
+void SetPresence(const std::string& details, const std::string& state, int64_t start);
 void DrawHitMarkers();                          // inside the ImGui frame, from DrawHud
 void MixHitSound(float* out, uint32_t frames);  // the ticks into the mixer's stereo output
 void FeedPad();                   // controllers to the settings window's navigation, before each ImGui frame

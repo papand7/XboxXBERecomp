@@ -213,6 +213,9 @@ void Load() {
     s.pause_unfocused = t["pause_unfocused"].value_or(s.pause_unfocused);
     s.show_fps = t["show_fps"].value_or(s.show_fps);
     s.perf_overlay = t["perf_overlay"].value_or(s.perf_overlay);
+    s.screenshot_key = t["screenshot_key"].value_or(s.screenshot_key);
+    s.discord = t["discord"].value_or(s.discord);
+    s.discord_app_id = t["discord_app_id"].value_or(s.discord_app_id);
     s.sharp_2d = t["sharp_2d"].value_or(s.sharp_2d);
     s.language = t["language"].value_or(s.language);
     // a settings file from when these were one choice: "antialiasing" off, fxaa, msaa2, msaa4 or msaa8
@@ -342,6 +345,9 @@ toml::table Table() {
                   {"pause_unfocused", s.pause_unfocused},
                   {"show_fps", s.show_fps},
                   {"perf_overlay", s.perf_overlay},
+                  {"screenshot_key", int64_t(s.screenshot_key)},
+                  {"discord", s.discord},
+                  {"discord_app_id", s.discord_app_id},
                   {"sharp_2d", s.sharp_2d},
                   {"language", int64_t(s.language)},
                   {"msaa", kMsaa[s.msaa % kMsaaCount]},

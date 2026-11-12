@@ -601,6 +601,18 @@ void Graphics(Settings& s) {
     }
     if (RowCheck("Low latency", &s.low_latency, "Applies at the next start. Holds one finished frame instead of several: less input lag, but a slow frame costs more.")) Save();
     if (RowCheck("Show frames a second", &s.show_fps)) Save();
+    {
+        static const uint32_t keys[] = {0x7B, 0x7A, 0x79, 0x78, 0x2C, 0x13};
+        static const char* const key_names[] = {"F12", "F11", "F10", "F9", "Print Screen", "Pause"};
+        int k = 0;
+        for (int i = 0; i < 6; i++)
+            if (s.screenshot_key == keys[i]) k = i;
+        if (RowChoice("Screenshot key", &k, key_names, 6, "Saves the frame as a PNG in the screenshots folder.")) {
+            s.screenshot_key = keys[k];
+            Save();
+        }
+    }
+    if (RowCheck("Discord status", &s.discord, "Shows the mission you play on your Discord profile while Discord runs on this PC.")) Save();
     if (RowCheck("Performance overlay", &s.perf_overlay, "A corner panel: frames a second, the frame time and a graph of the last two seconds, the size the 3D scene is drawn at.")) Save();
     if (kGame.sharpen_2d && RowCheck("Sharp text and HUD", &s.sharp_2d)) Save();
 }
