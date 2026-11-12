@@ -209,6 +209,9 @@ void Load() {
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    s.netplay = t["netplay"].value_or(s.netplay);
+    s.netplay_players = std::clamp<uint32_t>(t["netplay_players"].value_or(s.netplay_players), 2, 4);
+    s.netplay_delay = std::min<uint32_t>(t["netplay_delay"].value_or(s.netplay_delay), 30);
     std::string aspect = t["aspect"].value_or(std::string(kAspects[s.aspect % kAspectCount]));
     for (uint32_t i = 0; i < kAspectCount; i++)
         if (aspect == kAspects[i]) s.aspect = i;
@@ -349,6 +352,9 @@ toml::table Table() {
                   {"vsync", s.vsync},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"join_ip", s.join_ip},
+                  {"netplay", s.netplay},
+                  {"netplay_players", int64_t(s.netplay_players)},
+                  {"netplay_delay", int64_t(s.netplay_delay)},
                   {"aspect", kAspects[s.aspect % kAspectCount]},
                   {"keyboard", s.keyboard},
                   {"monitor", int64_t(s.monitor)},

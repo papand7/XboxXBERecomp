@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "core/log.h"
+#include "core/netplay.h"
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
 
@@ -278,6 +279,7 @@ void x86_priv(X86Context& ctx, uint32_t va, const char* what) {
 
 // the guest measured time against a 733.33 MHz time stamp counter
 uint64_t x86_rdtsc() {
+    if (netplay::Active()) return netplay::Clock(733333333);  // LAN play: frames, the same on every copy
     using namespace std::chrono;
     static const auto start = steady_clock::now();
     auto ns = duration_cast<nanoseconds>(steady_clock::now() - start).count();

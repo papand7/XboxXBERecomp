@@ -53,6 +53,10 @@ struct Settings {
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
+    // LAN play in lockstep (core/netplay.h; XBE_NETPLAY first): "" off, "host", "join" (join_ip) or an address
+    std::string netplay;
+    uint32_t netplay_players = 2;          // the players a host waits for, 2 to 4
+    uint32_t netplay_delay = 2;            // frames of input delay
     // 0 from the output's shape, 1 4:3, 2 16:9 (the console's TV setting, at boot), 3 widescreen filling the screen's
     // shape (ultrawide: the title's 3D views widened by its GameInfo code, the frame shown at the screen's shape)
     uint32_t aspect = 0;

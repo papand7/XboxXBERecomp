@@ -26,6 +26,7 @@
 #include "core/diag.h"
 #include "core/input.h"
 #include "core/log.h"
+#include "core/netplay.h"
 #include "gpu/backend.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
@@ -324,7 +325,7 @@ void Quit() {
 }
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
 
-bool Paused() { return Get().pause_unfocused && !g_active && g_hwnd && IsWindowVisible(g_hwnd); }
+bool Paused() { return !netplay::Active() && Get().pause_unfocused && !g_active && g_hwnd && IsWindowVisible(g_hwnd); }
 
 void Pace(uint32_t vblanks) {
     using clock = std::chrono::steady_clock;
@@ -337,12 +338,14 @@ void Pace(uint32_t vblanks) {
         LOGR("resumed");
         next = clock::now();
     }
-    uint32_t cap = PaceRate(Get().fps_cap, vblanks);
+    // LAN play: every copy at 60 a second whatever its cap, as the frames are the title's clocks (netplay::Frame)
+    uint32_t cap = PaceRate(netplay::Active() ? 60 : Get().fps_cap, vblanks);
     auto now = clock::now();
     if (!cap) {
         next = now;
         return;
     }
+        netplay::Frame(60);
     auto period = std::chrono::nanoseconds(1000000000ull / cap);
     // stutter: frames that took more than one and a half periods, a line every 10 seconds that had any (loading
     // screens count too)
@@ -370,6 +373,7 @@ void Pace(uint32_t vblanks) {
     while (clock::now() < next) std::this_thread::yield();
 }
 
+    netplay::Frame(cap);  // LAN play: the next frame's controllers of every player
 }  // namespace app
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {

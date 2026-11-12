@@ -24,6 +24,7 @@
 
 #include "app/app.h"
 #include "core/log.h"
+#include "core/netplay.h"
 
 namespace input {
 
@@ -183,7 +184,9 @@ void MouseMoved(int dx, int dy) {
     if ((g_mouse_travel += std::abs(dx) + std::abs(dy)) > kMouseTravel) g_keyboard = true;
 }
 
-bool UsingKeyboard() { return g_keyboard; }
+// LAN play: the game's own keyboard and mouse handling is controller 1's on one copy only, so off; the mouse plays the
+// right stick, which travels with the controller
+bool UsingKeyboard() { return g_keyboard && !netplay::Active(); }
 
 std::atomic<int> g_wheel{0};  // WHEEL_DELTA units
 
@@ -326,7 +329,7 @@ Pad Poll(int port) {
     p.rx = Stick(out[kRSLeft], out[kRSRight]);
     p.ry = Stick(out[kRSDown], out[kRSUp]);
     if (port == 0 && MouseLooking()) {
-        if (!app::kGame.mouse_direct) MouseStick(s, p.rx, p.ry);
+        if (!app::kGame.mouse_direct || netplay::Active()) MouseStick(s, p.rx, p.ry);
     } else if (port == 0) {  // nothing kept from before (the settings window, another window in front)
         g_mouse_dx = 0;
         g_mouse_dy = 0;

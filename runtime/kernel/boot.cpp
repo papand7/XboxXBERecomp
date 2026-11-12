@@ -2,8 +2,10 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <thread>
 
 #include "app/app.h"
+#include "core/netplay.h"
 #include "kernel/kernel.h"
 
 #ifdef _WIN32
@@ -151,6 +153,14 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     uint32_t tls = 0;
     if (img.tls_addr) tls = ((img.tls.data_end - img.tls.data_start + img.tls.zero_fill + 15) & ~15u) + 4;
     ThreadRef t = CreateThread(std::max<uint32_t>(img.stack_commit, 0x10000), tls, 0, img.entry, 0, false);
+    // LAN play: the title starts once every player has joined, on every copy together (the window meanwhile answers)
+    if (netplay::Configured()) {
+        std::thread([t] {
+            netplay::Start();
+            StartThread(t);
+        }).detach();
+        return true;
+    }
     StartThread(t);
     return true;
 }
@@ -171,6 +181,7 @@ std::wstring HandoverEvent(unsigned long process) {
 }
 
 void Relaunch(const char* exe) {
+    netplay::Stop();  // the port free for the new process, which meets the other copies again
     logx::Flush();
 #ifdef _WIN32
     wchar_t self[MAX_PATH];

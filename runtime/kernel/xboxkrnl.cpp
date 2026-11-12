@@ -3,8 +3,11 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <mutex>
+#include <thread>
 
 #include "app/app.h"
+#include "core/netplay.h"
 #include "kernel/crypto.h"
 #include "kernel/exports.h"
 #include "xbe/xbe.h"
@@ -67,7 +70,11 @@ void PutSystemTime(uint32_t va, uint64_t t) {
     W32(va + 4, uint32_t(t >> 32));
 }
 
+// LAN play (core/netplay.h): the date every copy shows, 1 January 2003, plus the frames played
+constexpr uint64_t kNetplayDate = 126866880000000000ull;
+
 uint64_t InterruptTime() {
+    if (netplay::Active()) return netplay::Clock(10000000);  // LAN play: frames, the same on every copy
     using namespace std::chrono;
     static const auto start = steady_clock::now();
     return uint64_t(duration_cast<nanoseconds>(steady_clock::now() - start).count() / 100);
@@ -103,16 +110,30 @@ void InitKernelData() {
     G<uint8_t>(DataAddress(89)) = 1;
     W32(DataAddress(157), 10000);  // 1 ms in 100 ns units
     // the start of the clock
+    static std::mutex time_lock;  // LAN play takes the records over between two of the thread's writes
     std::thread([] {
         auto start = std::chrono::steady_clock::now();
         for (;;) {
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-            W32(g_tick_count_va, uint32_t(ms));
-            PutSystemTime(DataAddress(120), InterruptTime());
-            PutSystemTime(DataAddress(154), uint64_t(Now100ns()));
+            {
+                std::lock_guard lock(time_lock);
+                if (!netplay::Active()) {
+                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+                    W32(g_tick_count_va, uint32_t(ms));
+                    PutSystemTime(DataAddress(120), InterruptTime());
+                    PutSystemTime(DataAddress(154), uint64_t(Now100ns()));
+                }
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }).detach();
+    // LAN play: the records move with the frames, written on the title's thread as each starts (the same on every
+    // copy, whenever the title reads them)
+    netplay::OnFrame([] {
+        std::lock_guard lock(time_lock);
+        W32(g_tick_count_va, uint32_t(netplay::FrameClock(1000)));
+        PutSystemTime(DataAddress(120), netplay::FrameClock(10000000));
+        PutSystemTime(DataAddress(154), kNetplayDate + netplay::FrameClock(10000000));
+    });
 }
 
 // critical sections
@@ -223,7 +244,8 @@ KERNEL_EXPORT(125, KeQueryInterruptTime, 0) {
 }
 
 KERNEL_EXPORT(128, KeQuerySystemTime, 1) {
-    W64(a[0], uint64_t(Now100ns()));
+    // LAN play: the same date on every copy
+    W64(a[0], netplay::Active() ? kNetplayDate + netplay::Clock(10000000) : uint64_t(Now100ns()));
     return 0;
 }
 
@@ -236,6 +258,11 @@ KERNEL_EXPORT(228, NtSetSystemTime, 2) {
 constexpr uint64_t kPerfFrequency = 3375000;
 
 KERNEL_EXPORT(126, KeQueryPerformanceCounter, 0) {
+    if (netplay::Active()) {  // LAN play: frames, the same on every copy
+        uint64_t v = netplay::Clock(kPerfFrequency);
+        ctx.edx = uint32_t(v >> 32);
+        return uint32_t(v);
+    }
     using namespace std::chrono;
     static const auto start = steady_clock::now();
     uint64_t ns = uint64_t(duration_cast<nanoseconds>(steady_clock::now() - start).count());
