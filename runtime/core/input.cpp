@@ -184,6 +184,16 @@ void MouseMoved(int dx, int dy) {
     if ((g_mouse_travel += std::abs(dx) + std::abs(dy)) > kMouseTravel) g_keyboard = true;
 }
 
+std::atomic<bool> g_free{false};
+void MouseFree(bool free) {
+    if (g_free.exchange(free) != free && free) ClipCursor(nullptr);  // let go at once, not at the next move
+}
+bool MouseIsFree() { return g_free; }
+
+void PointerTravel(int pixels) {
+    if ((g_mouse_travel += std::abs(pixels)) > kMouseTravel) g_keyboard = true;
+}
+
 // LAN play: the game's own keyboard and mouse handling is controller 1's on one copy only, so off; the mouse plays the
 // right stick, which travels with the controller
 bool UsingKeyboard() { return g_keyboard && !netplay::Active(); }

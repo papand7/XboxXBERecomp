@@ -6,6 +6,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <windowsx.h>
 #include <dbghelp.h>
 #include <timeapi.h>
 
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <cstdio>
 #include <cwchar>
 #include <filesystem>
@@ -159,10 +161,12 @@ void ApplyNow() {
     }
 }
 
-// mouse look (Settings::mouse_look): the cursor hidden and held in the window while the mouse plays the right stick
+// mouse look (Settings::mouse_look): the cursor hidden and held in the window while the mouse plays the right stick, in
+// play only: never while a title's menus have the pointer free (input::MouseFree), the settings window is open or the
+// window is not in front
 void HoldCursor(HWND hwnd) {
     static bool held = false;
-    bool want = input::MouseLooking();
+    bool want = input::MouseLooking() && !input::MouseIsFree() && GetForegroundWindow() == hwnd && !IsIconic(hwnd);
     if (want) {
         RECT r;
         GetClientRect(hwnd, &r);
@@ -183,11 +187,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UINT size = sizeof(ri);
         if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != UINT(-1) &&
             ri.header.dwType == RIM_TYPEMOUSE && input::MouseLooking()) {
-            if (!(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) input::MouseMoved(ri.data.mouse.lLastX, ri.data.mouse.lLastY);
+            const RAWMOUSE& m = ri.data.mouse;
+            if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                input::MouseMoved(m.lLastX, m.lLastY);
+            } else {
+                // Remote Desktop (and VMs, tablets) send where the pointer is, 0 to 65535 across the screen or the
+                // virtual desktop: its moves from the last, in pixels (none from a stale one, a moment old)
+                static LONG last_x = 0, last_y = 0;
+                static DWORD last_t = 0;
+                const bool virt = m.usFlags & MOUSE_VIRTUAL_DESKTOP;
+                const int w = GetSystemMetrics(virt ? SM_CXVIRTUALSCREEN : SM_CXSCREEN),
+                          h = GetSystemMetrics(virt ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
+                const LONG x = LONG(int64_t(m.lLastX) * w / 65536), y = LONG(int64_t(m.lLastY) * h / 65536);
+                const DWORD now = GetTickCount();
+                if (last_t && now - last_t < 250) input::MouseMoved(x - last_x, y - last_y);
+                last_x = x, last_y = y, last_t = now;
+            }
             if (ri.data.mouse.usButtonFlags & RI_MOUSE_WHEEL) input::MouseWheel(short(ri.data.mouse.usButtonData));
         }
         HoldCursor(hwnd);
         return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    // the pointer moved over the window: the mouse is in use, raw input or not (a Remote Desktop session's may be none)
+    if (msg == WM_MOUSEMOVE) {
+        static LPARAM last = -1;
+        if (last != -1 && lp != last)
+            input::PointerTravel(std::abs(GET_X_LPARAM(lp) - GET_X_LPARAM(last)) + std::abs(GET_Y_LPARAM(lp) - GET_Y_LPARAM(last)));
+        last = lp;
     }
     // no pointer over the game, only over the settings window: the game has none. Windows asks only when the mouse
     // moves, so a timer takes it away from one left standing there
@@ -196,8 +222,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         cursor_timer = true;
         SetTimer(hwnd, kCursorTimer, 500, nullptr);
     }
+    // focus lost (alt-tab, another window clicked): the cursor let go at once
+    if ((msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE) || (msg == WM_ACTIVATEAPP && !wp) || msg == WM_KILLFOCUS) {
+        ClipCursor(nullptr);
+        HoldCursor(hwnd);
+    }
     if (msg == WM_TIMER && wp == kCursorTimer) {
-        if (GetForegroundWindow() == hwnd && !OverlayOpen()) {
+        if (kGame.mouse_look) HoldCursor(hwnd);  // a menu opened or the focus gone with the mouse standing still
+        if (GetForegroundWindow() == hwnd && !OverlayOpen() && !input::MouseIsFree()) {
             POINT p;
             RECT r;
             if (GetCursorPos(&p) && ScreenToClient(hwnd, &p) && GetClientRect(hwnd, &r) && PtInRect(&r, p)) SetCursor(nullptr);
@@ -207,7 +239,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT) {
         if (kGame.mouse_look) HoldCursor(hwnd);
         if (!OverlayOpen()) {
-            SetCursor(nullptr);
+            // a title's menus with the pointer free: the arrow
+            SetCursor(input::MouseIsFree() ? LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW)) : nullptr);
             return TRUE;
         }
     }
@@ -281,7 +314,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             CloseSplash();
             if (wp) ApplyNow();
             ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
+            // to the front only on a first launch, or when the instance handing over was in front: a relaunch (between
+            // the front end and a level) with the player in another window leaves that window in front
+            if (const wchar_t* arg = std::wcsstr(GetCommandLineW(), L"--handover=")) {
+                const DWORD previous = std::wcstoul(arg + 11, nullptr, 10);
+                DWORD owner = 0;
+                if (HWND fg = GetForegroundWindow()) GetWindowThreadProcessId(fg, &owner);
+                if (owner == previous || owner == GetCurrentProcessId()) SetForegroundWindow(hwnd);
+            } else {
+                SetForegroundWindow(hwnd);
+            }
             return 0;
         case WM_CLOSE:
             // who closes it (a relaunched instance once ended at once, before its handover, with no quit asked for)
