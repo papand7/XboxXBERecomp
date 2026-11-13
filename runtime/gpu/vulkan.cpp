@@ -1579,6 +1579,7 @@ bool VulkanBackend::CreateFixed() {
         if (!made || vkCreatePipelineLayout(dev_, &rpl, nullptr, &rt_layout_) != VK_SUCCESS) {
             LOGW("vulkan: the ray traced passes' layout could not be made; no ray tracing");
             rt_layout_ = VK_NULL_HANDLE;
+            app::ray_query_ok = false;  // the settings pages stop offering it
         }
         VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -4483,13 +4484,14 @@ bool VulkanBackend::RtCapture(const State& s, const Assembled& a, const DrawShad
     const bool cut = SimpleState(s, kMAlphaTestEnable) && SimpleState(s, kMAlphaFunc) != kGlAlways;
     if (!cut && !Opaque(k)) return false;  // blended: glass, smoke
     const uint32_t op0 = s.tss[0][kTssColorOp], op1 = s.tss[1][kTssColorOp];
-    const uint32_t diffuse = op0 > 1 ? RtSlot(stages.view[0]) : 0xFFF;
+    // only 2D views go in the shaders' Texture2D array (a cube or volume view there breaks the view-type rule)
+    const uint32_t diffuse = op0 > 1 && stages.info[0].kind == kTex2D ? RtSlot(stages.view[0]) : 0xFFF;
     if (cut && diffuse == 0xFFF) return false;
     uint32_t mat0 = diffuse | (SimpleState(s, kMAlphaRef) & 0xFF) << 12 |
                     ((uint32_t(Cmp(SimpleState(s, kMAlphaFunc))) - 1) & 7) << 20 | (cut ? 1u << 23 : 0u) |
                     (op0 == 4 ? 1u << 24 : 0u) | (s.rs[kRsLighting] ? 1u << 25 : 0u);
     uint32_t mat1 = 0xFFF;
-    if (op0 > 1 && op1 >= 4 && op1 <= 6 && stages.view[1]) {
+    if (op0 > 1 && op1 >= 4 && op1 <= 6 && stages.view[1] && stages.info[1].kind == kTex2D) {
         mat1 = RtSlot(stages.view[1]) | (s.tss[1][kTssTexCoordIndex] & 0xFFFF ? 1u : 0u) << 12 | (op1 - 4) << 13;
     }
     // reflections: how shiny (6 bits << 26), a floor's only where it faces up (<< 15 of the second word)
@@ -6105,11 +6107,12 @@ void VulkanBackend::Present(const Surface& front) {
         acquired = Acquire(index);
     }
     VkImageView frame_source = t ? t->res.view : VK_NULL_HANDLE;
-    if (acquired && t && app::Get().smaa && !UpscaleWanted()) frame_source = SmaaFrame(*t);
     if (acquired) {
         End();
         if (t && rt_pass_frame_ != presents_ + 1 && rt_frame_ == presents_ + 1 && t->data == scene_color_data_)
             RtScenePass(*t);  // no 2D draw over the scene this frame
+        // SMAA after the traced scene is in t.res (before it, the frame showed the untraced scene smoothed)
+        if (t && app::Get().smaa && !UpscaleWanted()) frame_source = SmaaFrame(*t);
         VkCommandBuffer cb = Cmd();
         if (dirty_) Barrier();
         if (t && app::Get().ambient_occlusion && scene_depth_frame_ == presents_ + 1 &&
