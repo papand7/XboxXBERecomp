@@ -122,6 +122,7 @@ struct File : Object {
     size_t next = 0;
     bool listed = false;
     bool delete_on_close = false;
+    bool discard_writes = false;  // a save file while saving is blocked (BlockSaveWrites): writes accepted, dropped
     int partition = 0;  // a hard disk partition opened whole: raw volume I/O, 1 to 5
     bool cdrom = false;  // on the disc, as an image or a folder
     std::mutex io;  // threads sharing a handle: seek and transfer stay together
@@ -423,6 +424,16 @@ static bool Hidden(const std::string& name) {
     return true;
 }
 
+// BlockSaveWrites(true): the title's saved games (UDATA, TDATA) are not written: a file there opens as it is, read only, and
+// takes writes into nowhere; one it makes or empties is an anonymous temporary file. (LAN play: the profile is not saved.)
+static std::atomic<bool> g_block_saves{false};
+void BlockSaveWrites(bool on) { g_block_saves.store(on, std::memory_order_relaxed); }
+static bool IsSaveFile(const std::string& host) {
+    std::string low = host;
+    for (char& c : low) c = c == '\\' ? '/' : char(std::tolower(uint8_t(c)));
+    return low.find("/udata/") != std::string::npos || low.find("/tdata/") != std::string::npos;
+}
+
 // exports
 
 KERNEL_EXPORT(190, NtCreateFile, 9) {
@@ -515,9 +526,18 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
         IoStatus(iosb, kObjectPathNotFound, 0);
         return kObjectPathNotFound;
     }
-    if (exists && (disposition == 0 || disposition == 4 || disposition == 5)) KeepStale(host);
-    FILE* fp = std::fopen(host.c_str(), mode);
-    if (!fp && std::string(mode) == "r+b") fp = std::fopen(host.c_str(), "rb");  // read only media
+    const bool blocked = g_block_saves.load(std::memory_order_relaxed) && IsSaveFile(host);
+    if (!blocked && exists && (disposition == 0 || disposition == 4 || disposition == 5)) KeepStale(host);
+    FILE* fp = nullptr;
+    if (blocked) {
+        // opened as it is when it exists and is not to be emptied, else a throwaway
+        const bool as_is = exists && (disposition == 1 || disposition == 3);
+        fp = as_is ? std::fopen(host.c_str(), "rb") : std::tmpfile();
+        if (!fp) fp = std::tmpfile();
+    } else {
+        fp = std::fopen(host.c_str(), mode);
+        if (!fp && std::string(mode) == "r+b") fp = std::fopen(host.c_str(), "rb");  // read only media
+    }
     if (!fp) {
         LOGW("NtCreateFile: cannot open %s", host.c_str());
         IoStatus(iosb, kAccessDenied, 0);
@@ -528,7 +548,8 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     f->xbox = Normalize(name);
     f->fp = fp;
     f->cdrom = t.cdrom;
-    f->delete_on_close = options & 0x1000;  // FILE_DELETE_ON_CLOSE
+    f->discard_writes = blocked;
+    f->delete_on_close = !blocked && (options & 0x1000);  // FILE_DELETE_ON_CLOSE
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, info);
     FILE_LOG(400, "open %s", name.c_str());
@@ -560,7 +581,9 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     f->partition = t.partition;
     f->cdrom = t.cdrom;
     if (!f->dir) {
-        f->fp = std::fopen(host.c_str(), "r+b");
+        const bool blocked = g_block_saves.load(std::memory_order_relaxed) && IsSaveFile(host);
+        f->discard_writes = blocked;
+        if (!blocked) f->fp = std::fopen(host.c_str(), "r+b");
         if (!f->fp) f->fp = std::fopen(host.c_str(), "rb");
         if (!f->fp) return kAccessDenied;
     }
@@ -640,6 +663,11 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     }
     if (!f || (!f->fp && !f->entry)) return kInvalidHandle;
     if (write && f->entry) return kAccessDenied;
+    if (write && f->discard_writes) {  // a save while saving is blocked: taken, not kept
+        ResetEvent(*f);
+        f->pos = Offset(*f, off) + len;
+        return Finish(*f, kSuccess, len, event, apc, apc_ctx, iosb);
+    }
     ResetEvent(*f);
     std::lock_guard<std::mutex> lock(f->io);
     uint64_t pos = Offset(*f, off);
@@ -955,6 +983,7 @@ KERNEL_EXPORT(210, NtQueryFullAttributesFile, 2) {
 KERNEL_EXPORT(195, NtDeleteFile, 1) {
     std::string host = ResolvePath(ReadAnsiString(R32(a[0] + 4)), R32(a[0]));
     std::error_code ec;
+    if (!host.empty() && g_block_saves.load(std::memory_order_relaxed) && IsSaveFile(host)) return kSuccess;  // kept
     if (host.empty() || !fs::remove(host, ec)) return kObjectNameNotFound;
     LOGI("files: %s deleted", host.c_str());
     return kSuccess;

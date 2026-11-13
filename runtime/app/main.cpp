@@ -164,13 +164,21 @@ void ApplyNow() {
 // mouse look (Settings::mouse_look): the cursor hidden and held in the window while the mouse plays the right stick, in
 // play only: never while a title's menus have the pointer free (input::MouseFree), the settings window is open or the
 // window is not in front
+bool g_moving = false;  // the window being dragged or sized (WM_ENTERSIZEMOVE to WM_EXITSIZEMOVE, or its title pressed)
+
 void HoldCursor(HWND hwnd) {
     static bool held = false;
-    bool want = input::MouseLooking() && !input::MouseIsFree() && GetForegroundWindow() == hwnd && !IsIconic(hwnd);
+    // never while the window is moved or sized, nor with Alt or a Windows key held (to reach the title bar, the taskbar)
+    const bool keys = (GetAsyncKeyState(VK_MENU) | GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000;
+    bool want = input::MouseLooking() && !input::MouseIsFree() && GetForegroundWindow() == hwnd && !IsIconic(hwnd) &&
+                !g_moving && !keys;
+    RECT r;
+    GetClientRect(hwnd, &r);
+    MapWindowPoints(hwnd, nullptr, reinterpret_cast<POINT*>(&r), 2);
+    // taken only from inside the picture: a pointer on the title bar or a border is left there
+    POINT c;
+    if (want && !held && (!GetCursorPos(&c) || !PtInRect(&r, c))) want = false;
     if (want) {
-        RECT r;
-        GetClientRect(hwnd, &r);
-        MapWindowPoints(hwnd, nullptr, reinterpret_cast<POINT*>(&r), 2);
         ClipCursor(&r);
     } else if (held) {
         ClipCursor(nullptr);
@@ -222,6 +230,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         cursor_timer = true;
         SetTimer(hwnd, kCursorTimer, 500, nullptr);
     }
+    // the window dragged or sized: the cursor free until it is let go
+    if (msg == WM_ENTERSIZEMOVE || (msg == WM_NCLBUTTONDOWN && wp != HTCLIENT)) {
+        g_moving = true;
+        ClipCursor(nullptr);
+        HoldCursor(hwnd);
+    }
+    if (msg == WM_EXITSIZEMOVE || msg == WM_NCLBUTTONUP || msg == WM_LBUTTONDOWN) g_moving = false;
     // focus lost (alt-tab, another window clicked): the cursor let go at once
     if ((msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE) || (msg == WM_ACTIVATEAPP && !wp) || msg == WM_KILLFOCUS) {
         ClipCursor(nullptr);

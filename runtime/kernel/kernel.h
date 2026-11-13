@@ -78,6 +78,8 @@ inline uint64_t R64(uint32_t va) {
 }
 inline void W64(uint32_t va, uint64_t v) { std::memcpy(g_base + va, &v, 8); }
 inline void* HostPtr(uint32_t va) { return g_base + va; }
+// the title's saved games are not written while on (their files open read only, writes taken and dropped)
+void BlockSaveWrites(bool on);
 
 // ANSI_STRING / OBJECT_STRING: USHORT Length, USHORT MaximumLength, PCHAR Buffer
 std::string ReadAnsiString(uint32_t str);
