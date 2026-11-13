@@ -212,6 +212,8 @@ void Load() {
     s.netplay = t["netplay"].value_or(s.netplay);
     s.netplay_players = std::clamp<uint32_t>(t["netplay_players"].value_or(s.netplay_players), 2, 4);
     s.netplay_delay = std::min<uint32_t>(t["netplay_delay"].value_or(s.netplay_delay), 30);
+    s.publish_server = t["publish_server"].value_or(s.publish_server);
+    s.master_url = t["master_url"].value_or(s.master_url);
     std::string aspect = t["aspect"].value_or(std::string(kAspects[s.aspect % kAspectCount]));
     for (uint32_t i = 0; i < kAspectCount; i++)
         if (aspect == kAspects[i]) s.aspect = i;
@@ -355,6 +357,8 @@ toml::table Table() {
                   {"netplay", s.netplay},
                   {"netplay_players", int64_t(s.netplay_players)},
                   {"netplay_delay", int64_t(s.netplay_delay)},
+                  {"publish_server", s.publish_server},
+                  {"master_url", s.master_url},
                   {"aspect", kAspects[s.aspect % kAspectCount]},
                   {"keyboard", s.keyboard},
                   {"monitor", int64_t(s.monitor)},

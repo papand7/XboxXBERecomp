@@ -63,5 +63,28 @@ void OnStart(void (*fn)());
 // a title's hash of its game state, compared between the copies once a second (a desync is logged)
 void SetStateHash(uint64_t (*hash)());
 bool Desynced();  // the copies' hashes have differed once
+// a title whose loading presents frames of its own (a number that is each PC's): it calls Tick once a game frame (its
+// main loop), and from the first Tick only the first present after each Tick is a lockstep frame; presents between
+// (while a level loads) neither wait for the others nor move the clocks
+void Tick();
+
+// The online list (the master server, app::Settings::master_url): the title's id there and the version it reports.
+// A host whose settings have publish_server announces its lobby every 30 s while it waits for players (api.php?
+// a=announce&game=<id>&port=...; the master asks the lobby itself, the LAN discovery's question) and removes it as the
+// lobby closes; only the first lobby of a session (not again after a relaunch into another image).
+void SetMasterGame(const char* id, const char* version);
+struct OnlineServer {
+    std::string address, name, map, mode, version;
+    uint16_t port = kPort;
+    int players = 0, max = 0;
+};
+void OnlineRefresh();  // fetch the list again (a thread of its own)
+std::vector<OnlineServer> OnlineServers();
+bool OnlineSearching();
+
+// restart the whole game (its first image) as a host ("host"), joining an address ("a.b.c.d[:port]"), or alone
+// ("off"): every copy then starts from the same boot, the lobby before its first frame
+[[noreturn]] void Restart(const std::string& spec);
+std::string Spec();  // what this copy was started as: "host", an address, or "" alone
 
 }  // namespace netplay

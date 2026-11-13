@@ -57,6 +57,8 @@ struct Settings {
     std::string netplay;
     uint32_t netplay_players = 2;          // the players a host waits for, 2 to 4
     uint32_t netplay_delay = 2;            // frames of input delay
+    bool publish_server = false;           // a host's lobby listed on the master server (the online list)
+    std::string master_url = "https://masterserver.dankelsoft.dk/api.php";  // the online list's master server
     // 0 from the output's shape, 1 4:3, 2 16:9 (the console's TV setting, at boot), 3 widescreen filling the screen's
     // shape (ultrawide: the title's 3D views widened by its GameInfo code, the frame shown at the screen's shape)
     uint32_t aspect = 0;

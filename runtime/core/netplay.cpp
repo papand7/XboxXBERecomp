@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -34,7 +35,9 @@
 #include "core/netplay.h"
 #include "app/app.h"
 #include "core/input.h"
+#include "core/http.h"
 #include "core/log.h"
+#include "kernel/kernel.h"
 
 #ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
@@ -117,6 +120,7 @@ bool g_dead[kMaxPlayers] = {};
 uint64_t (*g_hash)() = nullptr;
 void (*g_on_frame)() = nullptr;
 void (*g_on_start)() = nullptr;
+std::atomic<bool> g_tick_mode{false}, g_ticked{false};  // Tick: the title marks its game frames
 struct Hashes {
     uint32_t frame = ~0u;
     uint64_t mine = 0, theirs = 0;
@@ -146,6 +150,15 @@ Hashes& HashSlot(uint32_t frame) {
 std::string Env(const char* name) {
     const char* e = std::getenv(name);
     return e ? e : "";
+}
+// for this process and those it starts (a relaunch); empty removes it
+void SetEnv(const char* name, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    if (value.empty()) unsetenv(name);
+    else setenv(name, value.c_str(), 1);
+#endif
 }
 
 Header Head(uint8_t type) { return {kMagic, type, uint8_t(g_me), uint8_t(g_players), uint8_t(g_delay)}; }
@@ -438,7 +451,7 @@ std::wstring HostAddressText() {
     for (const std::string& a : LocalAddresses()) ips += (ips.empty() ? L"" : L" or ") + std::wstring(a.begin(), a.end());
     if (ips.empty()) ips = L"(no network found)";
     return L"Your address: " + ips + L" (port " + std::to_wstring(ntohs(g_bound_port)) +
-           L").\nPlayers on this network join this address (or find this game in the launcher). Friends over the internet need "
+           L").\nPlayers on this network find this game in Netplay (or join this address). Friends over the internet need "
            L"your public address and the port (UDP) forwarded to this PC.";
 }
 
@@ -468,11 +481,51 @@ void AnswerFind(const sockaddr_in& to, int joined) {
     if (said++ < 3) LOGR("netplay: a search from %s:%u answered", Dotted(to.sin_addr).c_str(), ntohs(to.sin_port));
 }
 
+// the online list: while a host's first lobby waits (publish_server), the master server is told every 30 s that it is
+// open, and told to remove it as the lobby closes; on a thread of its own (a request can take up to 8 s)
+std::string g_master_game, g_master_version;
+std::string MasterUrl(const char* action) {
+    const std::string base = app::Get().master_url;
+    if (base.empty() || g_master_game.empty()) return "";
+    std::string url = base + "?a=" + action + "&game=" + g_master_game + "&port=" + std::to_string(ntohs(g_bound_port));
+    if (!std::strcmp(action, "announce"))
+        url += "&max=" + std::to_string(g_players) + "&mode=Lobby" + (g_master_version.empty() ? "" : "&v=" + g_master_version);
+    return url;
+}
+struct Publisher {
+    std::shared_ptr<std::atomic<bool>> on;
+    Publisher() {
+        // a relaunch into another image meets the same players again: not a new game to list
+        if (!app::Get().publish_server || !Env("XBE_NETPLAY_MET").empty() || MasterUrl("announce").empty()) return;
+        on = std::make_shared<std::atomic<bool>>(true);
+        const std::string announce = MasterUrl("announce"), remove = MasterUrl("remove");
+        std::thread([flag = on, announce, remove] {
+            std::string body;
+            auto next = std::chrono::steady_clock::now();
+            while (flag->load()) {
+                if (std::chrono::steady_clock::now() >= next) {
+                    next = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                    if (!http::Get(announce, &body)) LOGR("netplay: online list: the master server did not answer");
+                    else LOGR("netplay: online list: announced (%s)", body.substr(0, 80).c_str());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            http::Get(remove, &body);
+            LOGR("netplay: online list: removed");
+        }).detach();
+        LOGR("netplay: online list: publishing this lobby to %s", app::Get().master_url.c_str());
+    }
+    ~Publisher() {
+        if (on) on->store(false);
+    }
+};
+
 bool Lobby() {
     char buf[1500];
     sockaddr_in from{};
     auto said = std::chrono::steady_clock::now() - std::chrono::seconds(10);
     if (g_host) {
+        Publisher publish;
         int joined = 1;
         while (joined < g_players) {
             static const std::wstring where = HostAddressText();
@@ -540,6 +593,7 @@ std::string Trim(std::string s) {
     while (i < s.size() && std::isspace(uint8_t(s[i]))) i++;
     return s.substr(i);
 }
+}  // namespace
 
 // "host[:port]", "address[:port]", or "" off: XBE_NETPLAY, else the settings' netplay, its "join[:port]" the
 // settings' join_ip
@@ -558,7 +612,6 @@ std::string Spec() {
     if (lower == "host" || lower.rfind("host:", 0) == 0) spec = "host" + spec.substr(4);
     return spec;
 }
-}  // namespace
 
 bool Configured() {
     static const bool on = !Spec().empty();
@@ -611,6 +664,7 @@ bool Start() {
              ips.empty() ? "no network" : ips.c_str(), g_players);
     }
     else LOGR("netplay: joining %s:%u", addr.c_str(), port);
+    LOGR("netplay: protocol %08X", kMagic);
     const bool joined = Lobby();
     WaitOver();
     if (!joined) return false;
@@ -628,6 +682,7 @@ bool Start() {
 #endif
     LOGR("netplay: started as player %d of %d, %d frames of input delay, host rules %08X",
          g_me + 1, g_players, g_delay, g_session_rules);
+    SetEnv("XBE_NETPLAY_MET", "1");  // the next image's lobby (a relaunch) meets the same players: not listed again
     return true;
 }
 
@@ -657,8 +712,19 @@ bool Desynced() { return g_desync; }
 void OnFrame(void (*fn)()) { g_on_frame = fn; }
 void OnStart(void (*fn)()) { g_on_start = fn; }
 
+void Tick() {
+    g_tick_mode.store(true, std::memory_order_relaxed);
+    g_ticked.store(true, std::memory_order_relaxed);
+}
+
 void Frame(uint32_t rate) {
     if (!Active()) return;
+    // a present of the title's own between two of its game frames (a level loading): no lockstep frame
+    if (g_tick_mode.load(std::memory_order_relaxed) && !g_ticked.exchange(false)) {
+        static uint32_t loose = 0;
+        if (++loose % 600 == 1) LOGR("netplay: %u presents outside the game frames so far (loading)", loose);
+        return;
+    }
     uint64_t f = g_frame.load();  // the frame that just ended
     if (g_hash && f % 60 == 0) {
         Hashes& h = HashSlot(uint32_t(f));
@@ -836,6 +902,80 @@ uint64_t Clock(uint64_t freq) {
     prev = s;
     constexpr uint64_t kSecond = kTimeUnits * 4096;
     return s / kSecond * freq + s % kSecond * freq / kSecond;
+}
+
+// ---- the online list (api.php?a=list&game=<id>&format=lines: address, port, name, map, players, max, mode, version,
+// tab-separated, a line a game), fetched on a thread of its own
+namespace {
+std::mutex g_online_lock;
+std::vector<OnlineServer> g_online;
+std::atomic<bool> g_online_busy{false};
+std::atomic<uint32_t> g_online_gen{0};  // a refresh's number: an older one's answer is dropped
+
+std::vector<std::string> Split(const std::string& s, char sep) {
+    std::vector<std::string> out;
+    for (size_t at = 0;;) {
+        const size_t e = s.find(sep, at);
+        out.push_back(s.substr(at, e == std::string::npos ? std::string::npos : e - at));
+        if (e == std::string::npos) return out;
+        at = e + 1;
+    }
+}
+}  // namespace
+
+void SetMasterGame(const char* id, const char* version) {
+    g_master_game = id ? id : "";
+    g_master_version = version ? version : "";
+}
+
+void OnlineRefresh() {
+    const std::string base = app::Get().master_url;
+    if (base.empty() || g_master_game.empty() || g_online_busy.exchange(true)) return;
+    const uint32_t gen = ++g_online_gen;
+    const std::string url = base + "?a=list&game=" + g_master_game + "&format=lines";
+    std::thread([url, gen] {
+        std::string body;
+        std::vector<OnlineServer> found;
+        if (http::Get(url, &body)) {
+            for (std::string line : Split(body, '\n')) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                const auto f = Split(line, '\t');
+                if (f.size() < 8) continue;
+                in_addr a{};
+                if (inet_pton(AF_INET, f[0].c_str(), &a) != 1) continue;  // not an IPv4 address: skipped
+                OnlineServer sv;
+                sv.address = f[0];
+                sv.port = uint16_t(std::atoi(f[1].c_str()));
+                sv.name = f[2], sv.map = f[3];
+                sv.players = std::atoi(f[4].c_str()), sv.max = std::atoi(f[5].c_str());
+                sv.mode = f[6], sv.version = f[7];
+                found.push_back(sv);
+            }
+            LOGR("netplay: online list: %zu games listed", found.size());
+        } else {
+            LOGR("netplay: online list: the master server did not answer");
+        }
+        if (gen == g_online_gen.load()) {
+            std::lock_guard lock(g_online_lock);
+            g_online = found;
+        }
+        g_online_busy = false;
+    }).detach();
+}
+
+std::vector<OnlineServer> OnlineServers() {
+    std::lock_guard lock(g_online_lock);
+    return g_online;
+}
+
+bool OnlineSearching() { return g_online_busy.load(); }
+
+void Restart(const std::string& spec) {
+    SetEnv("XBE_NETPLAY", spec.empty() ? "off" : spec);
+    SetEnv("XBE_NETPLAY_MET", "");
+    LOGR("netplay: restarting the game as %s", spec.empty() || spec == "off" ? "a lone copy" : spec.c_str());
+    Stop();
+    kernel::Relaunch(app::kGame.images.empty() ? "" : app::kGame.images.front().second);
 }
 
 }  // namespace netplay
