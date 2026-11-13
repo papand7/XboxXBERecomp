@@ -4242,6 +4242,7 @@ void D3D12Backend::RenderUi() {
     app::DrawHud(fps_);
     app::DrawOverlay();
     if (app::kGame.ui) app::kGame.ui(fps_);
+    app::DrawTouch();
     ImGui::Render();
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
     CLAt(__func__)->SetDescriptorHeaps(1, uh);
@@ -5136,7 +5137,9 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
     } else {
         for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * pitch, &px[size_t(y) * t.gw * 4], t.gw * 4);
     }
-    t.read = std::move(px);
+    // compared against guest memory row by row, so only a linear surface keeps its pixels
+    if (t.swizzled32) t.read.clear();
+    else t.read = std::move(px);
     t.drawn = false;
     t.sig = MemSig(t.data, t.bytes);
 }

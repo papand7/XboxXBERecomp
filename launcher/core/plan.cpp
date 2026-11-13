@@ -90,10 +90,15 @@ std::vector<std::string> MsiCabs(const std::vector<uint8_t>& msi) {
     return {found.begin(), found.end()};
 }
 
-bool LoadPlan(const std::string& toolchain_json, Plan& plan, std::string& error) {
-    json j = json::parse(toolchain_json, nullptr, false);
-    if (j.is_discarded() || !j.contains("tools")) {
+bool LoadPlan(const std::string& toolchain_json, Plan& plan, std::string& error, const std::string& os) {
+    json top = json::parse(toolchain_json, nullptr, false);
+    if (top.is_discarded() || !top.is_object()) {
         error = "toolchain.json is not readable";
+        return false;
+    }
+    const json& j = os == "windows" ? top : top.contains(os) ? top[os] : json::object();
+    if (!j.contains("tools")) {
+        error = os == "windows" ? "toolchain.json is not readable" : "toolchain.json lists no tools for " + os;
         return false;
     }
     for (const json& t : j["tools"]) {
@@ -105,6 +110,9 @@ bool LoadPlan(const std::string& toolchain_json, Plan& plan, std::string& error)
         tool.optional = t.value("optional", false);
         if (t.contains("keep"))
             for (const json& k : t["keep"]) tool.keep.push_back(k.get<std::string>());
+        if (t.contains("system"))
+            for (const json& k : t["system"]) tool.system.push_back(k.get<std::string>());
+        tool.system_min = t.value("system_min", "");
         FileRef f;
         f.url = t.value("url", "");
         f.sha256 = Lower(t.value("sha256", ""));

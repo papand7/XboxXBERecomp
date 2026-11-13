@@ -142,7 +142,9 @@ struct DrawConstants {
     float vattr[16][4];  // State::vattr
     float zclip[4];      // the depth clip planes, near and far, as depth from 0 to 1 (-2 and 2: none); [2] and [3] a
                          // pretransformed picture's vertical scale and its centre (State::pillar_fill, Pillarbox), 0 none
-    float taa[4];        // subpixel projection jitter in clip units; zero for 2D and when temporal AA is off
+    float style[4];      // graphics styles (style.h): xy the vertex snapping grid in clip units per half screen, 0 off
+    float pbr[4];        // materials (Vulkan): 1 / target width and height, tan of half the vertical view, strength
+    float taa[4];        // TAA (Vulkan): xy the frame's sub-pixel jitter in clip units, 0 for 2D draws and with it off
 };
 
 }  // namespace gpu

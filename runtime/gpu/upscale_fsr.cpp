@@ -1,5 +1,5 @@
 // AMD FSR 2 (FidelityFX Super Resolution 2.2.1, MIT) for the Vulkan renderer: its context made for the scene's render
-// and display sizes, dispatched into the frame's command buffer (gpu/upscale_fsr.h). The library and its Vulkan backend
+// and display sizes, dispatched into the frame's command buffer (gpu/upscale.h). The library and its Vulkan backend
 // are built from the fetched FidelityFX-FSR2 sources (cmake/XbeRecomp.cmake), their shaders by tools/fsr2_shaders.
 #include <vulkan/vulkan.h>
 
@@ -10,7 +10,7 @@
 #include "ffx_fsr2_vk.h"
 
 #include "core/log.h"
-#include "gpu/upscale_fsr.h"
+#include "gpu/upscale.h"
 
 // FSR 2's Vulkan backend calls these few instance-level entry points by name (the device's it loads through
 // vkGetDeviceProcAddr). The runtime links no vulkan-1.lib (it loads vulkan-1.dll at run time), so they are defined
@@ -52,12 +52,17 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev, const
 
 namespace gpu {
 
-float UpscaleRatio(uint32_t quality) {
+bool UpscalerAvailable(int upscaler) {
+    return upscaler == kUpscalerOff || upscaler == kUpscalerFsr || (upscaler == kUpscalerDlss && DlssAvailable());
+}
+
+float UpscaleRatio(int quality) {
     switch (quality) {
-        case 0: return 1.5f;
-        case 1: return 1.7f;
-        case 2: return 2.0f;
-        default: return 3.0f;
+        case kUpscaleQuality: return 1.5f;
+        case kUpscaleBalanced: return 1.7f;
+        case kUpscalePerformance: return 2.0f;
+        case kUpscaleUltraPerformance: return 3.0f;
+        default: return 1.0f;
     }
 }
 

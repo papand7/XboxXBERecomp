@@ -1,4 +1,5 @@
 // the settings file beside the exe
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -6,6 +7,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include "core/vk_codes.h"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -27,14 +31,16 @@ namespace {
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
 
 std::filesystem::path File() { return ExeDir() / kGame.settings; }
+bool g_unread = false;  // the file is there but did not parse: kept as .bak before the first save
 
 const char* kAspects[] = {"auto", "4:3", "16:9", "screen"};
 constexpr uint32_t kAspectCount = 4;
 const char* kMsaa[] = {"off", "msaa2", "msaa4", "msaa8"};
 constexpr uint32_t kMsaaCount = 4;
-const char* kRenderers[] = {"vulkan"};
-constexpr uint32_t kRendererCount = 1;
+const char* kRenderers[] = {"d3d12", "d3d11", "vulkan"};
+constexpr uint32_t kRendererCount = 3;
 
+#ifdef _WIN32
 // the displays in Windows' order
 std::vector<HMONITOR> MonitorList() {
     std::vector<HMONITOR> list;
@@ -44,6 +50,7 @@ std::vector<HMONITOR> MonitorList() {
     }, reinterpret_cast<LPARAM>(&list));
     return list;
 }
+#endif
 
 // keys by name in the settings file: letters, digits and these
 struct KeyName {
@@ -194,9 +201,20 @@ Settings& Get() {
 void Load() {
     Settings& s = Get();
     toml::table t;
+    std::error_code ec;
+    if (!std::filesystem::exists(File(), ec)) return;  // the first run: the defaults
     try {
         t = toml::parse_file(File().string());
+    } catch (const toml::parse_error& e) {
+        // the defaults kept; the player's file is kept as .bak before the first save writes over it
+        const auto& at = e.source().begin;
+        LOGR("settings: %s not read (line %u, column %u: %.*s), the defaults used; it is kept as %s.bak at the first save",
+             File().string().c_str(), unsigned(at.line), unsigned(at.column), int(e.description().size()),
+             e.description().data(), kGame.settings);
+        g_unread = true;
+        return;
     } catch (...) {
+        LOGR("settings: %s not read, the defaults used", File().string().c_str());
         return;
     }
     std::string mode = t["display_mode"].value_or(std::string(kModes[uint32_t(s.display_mode)]));
@@ -204,21 +222,40 @@ void Load() {
         if (mode == kModes[i]) s.display_mode = DisplayMode(i);
     s.width = t["width"].value_or(s.width);
     s.height = t["height"].value_or(s.height);
-    s.render_percent = t["render_percent"].value_or(s.render_percent);
+    // a hand edited size kept sane: 0 is the desktop's, else 320 x 240 to 16384 x 16384 (both or neither)
+    if (s.width || s.height) {
+        if (s.width < 320 || s.height < 240 || s.width > 16384 || s.height > 16384) {
+            LOGR("settings: width %u, height %u out of range, the desktop's size used", s.width, s.height);
+            s.width = s.height = 0;
+        }
+    }
+    s.render_percent = std::clamp<uint32_t>(t["render_percent"].value_or(s.render_percent), 25, 200);
     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
     s.vsync = t["vsync"].value_or(s.vsync);
+    s.hdr = t["hdr"].value_or(s.hdr);
+    s.hdr_peak = std::min<uint32_t>(t["hdr_peak_nits"].value_or(s.hdr_peak), 10000);
+    s.hdr_paper = std::min<uint32_t>(t["hdr_paper_white_nits"].value_or(s.hdr_paper), 600);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     s.netplay = t["netplay"].value_or(s.netplay);
     s.netplay_players = std::clamp<uint32_t>(t["netplay_players"].value_or(s.netplay_players), 2, 4);
     s.netplay_delay = std::min<uint32_t>(t["netplay_delay"].value_or(s.netplay_delay), 30);
     s.publish_server = t["publish_server"].value_or(s.publish_server);
+    s.hurt_effects = t["hurt_effects"].value_or(s.hurt_effects);
+    s.audio_3d = t["audio_3d"].value_or(s.audio_3d);
+    s.crosshair_style = uint32_t(t["crosshair_style"].value_or(int64_t(s.crosshair_style)));
+    s.crosshair_color = uint32_t(t["crosshair_color"].value_or(int64_t(s.crosshair_color)));
+    s.crosshair_size = uint32_t(t["crosshair_size"].value_or(int64_t(s.crosshair_size)));
+    s.crosshair_gap = uint32_t(t["crosshair_gap"].value_or(int64_t(s.crosshair_gap)));
+    s.crosshair_thickness = uint32_t(t["crosshair_thickness"].value_or(int64_t(s.crosshair_thickness)));
     s.master_url = t["master_url"].value_or(s.master_url);
     std::string aspect = t["aspect"].value_or(std::string(kAspects[s.aspect % kAspectCount]));
     for (uint32_t i = 0; i < kAspectCount; i++)
         if (aspect == kAspects[i]) s.aspect = i;
     s.keyboard = t["keyboard"].value_or(s.keyboard);
+    s.keyboard_alone = t["keyboard_alone"].value_or(s.keyboard_alone);
     s.mouse_look = t["mouse_look"].value_or(s.mouse_look);
+    s.touch_controls = t["touch_controls"].value_or(s.touch_controls);
     s.mouse_sensitivity = std::clamp<uint32_t>(t["mouse_sensitivity"].value_or(s.mouse_sensitivity), 10, 1000);
     s.mouse_invert_y = t["mouse_invert_y"].value_or(s.mouse_invert_y);
     s.monitor = t["monitor"].value_or(s.monitor);
@@ -229,8 +266,18 @@ void Load() {
     s.screenshot_key = t["screenshot_key"].value_or(s.screenshot_key);
     s.discord = t["discord"].value_or(s.discord);
     s.discord_app_id = t["discord_app_id"].value_or(s.discord_app_id);
+    s.hit_feedback = std::min<uint32_t>(t["hit_feedback"].value_or(s.hit_feedback), 2);
+    s.damage_numbers = t["damage_numbers"].value_or(s.damage_numbers);
+    s.aim_sight_x_mm = int(t["aim_sight_x_mm"].value_or(int64_t(s.aim_sight_x_mm)));
+    s.aim_sight_y_mm = int(t["aim_sight_y_mm"].value_or(int64_t(s.aim_sight_y_mm)));
     s.sharp_2d = t["sharp_2d"].value_or(s.sharp_2d);
-    s.language = t["language"].value_or(s.language);
+    s.menu_colors = std::min<uint32_t>(t["menu_colors"].value_or(s.menu_colors), 1);
+    // only a language the title has (GameInfo::languages): the console's setting goes to the guest as it is
+    if (uint32_t l = t["language"].value_or(s.language); !kGame.languages.empty()) {
+        const auto& ls = kGame.languages;
+        if (std::find(ls.begin(), ls.end(), l) != ls.end()) s.language = l;
+        else if (std::find(ls.begin(), ls.end(), s.language) == ls.end()) s.language = ls.front();
+    }
     // a settings file from when these were one choice: "antialiasing" off, fxaa, msaa2, msaa4 or msaa8
     std::string aa = t["antialiasing"].value_or(std::string());
     if (aa == "fxaa") s.fxaa = true;
@@ -251,8 +298,6 @@ void Load() {
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.low_latency = t["low_latency"].value_or(s.low_latency);
     s.sharpen = std::min<uint32_t>(t["sharpen"].value_or(s.sharpen), 100);
-    s.hit_feedback = std::min<uint32_t>(t["hit_feedback"].value_or(s.hit_feedback), 2);
-    s.damage_numbers = t["damage_numbers"].value_or(s.damage_numbers);
     s.color_style = std::min<uint32_t>(t["color_style"].value_or(s.color_style), 4);
     for (int i = 0; i < kFxCount; i++)
         s.fx[i] = std::clamp<int32_t>(t[kFxTable[i].key].value_or<int64_t>(s.fx[i]), kFxTable[i].lo, kFxTable[i].hi);
@@ -278,6 +323,7 @@ void Load() {
     std::string renderer = t["renderer"].value_or(std::string(kRenderers[s.renderer % kRendererCount]));
     for (uint32_t i = 0; i < kRendererCount; i++)
         if (renderer == kRenderers[i]) s.renderer = i;
+    if (kGame.vulkan_only) s.renderer = 2;
     // the steering wheel: each control a table { device, guid, axis or button, rest, full, invert }; older files gave
     // the wheel's own axes as wheel_steer_axis, pedals as [axis, rest, full] and buttons as numbers
     s.wheel_steer.axis = int32_t(t["wheel_steer_axis"].value_or(int64_t(s.wheel_steer.axis)));
@@ -352,15 +398,26 @@ toml::table Table() {
                   {"render_percent", int64_t(s.render_percent)},
                   {"fps_cap", int64_t(s.fps_cap)},
                   {"vsync", s.vsync},
+                  {"hdr", s.hdr},
+                  {"hdr_peak_nits", int64_t(s.hdr_peak)},
+                  {"hdr_paper_white_nits", int64_t(s.hdr_paper)},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"join_ip", s.join_ip},
                   {"netplay", s.netplay},
                   {"netplay_players", int64_t(s.netplay_players)},
                   {"netplay_delay", int64_t(s.netplay_delay)},
                   {"publish_server", s.publish_server},
+                  {"hurt_effects", s.hurt_effects},
+                  {"audio_3d", s.audio_3d},
+                  {"crosshair_style", int64_t(s.crosshair_style)},
+                  {"crosshair_color", int64_t(s.crosshair_color)},
+                  {"crosshair_size", int64_t(s.crosshair_size)},
+                  {"crosshair_gap", int64_t(s.crosshair_gap)},
+                  {"crosshair_thickness", int64_t(s.crosshair_thickness)},
                   {"master_url", s.master_url},
                   {"aspect", kAspects[s.aspect % kAspectCount]},
                   {"keyboard", s.keyboard},
+                  {"keyboard_alone", s.keyboard_alone},
                   {"monitor", int64_t(s.monitor)},
                   {"pause_unfocused", s.pause_unfocused},
                   {"occlusion_filter", s.occlusion_filter},
@@ -369,7 +426,12 @@ toml::table Table() {
                   {"screenshot_key", int64_t(s.screenshot_key)},
                   {"discord", s.discord},
                   {"discord_app_id", s.discord_app_id},
+                  {"hit_feedback", int64_t(s.hit_feedback)},
+                  {"damage_numbers", s.damage_numbers},
+                  {"aim_sight_x_mm", int64_t(s.aim_sight_x_mm)},
+                  {"aim_sight_y_mm", int64_t(s.aim_sight_y_mm)},
                   {"sharp_2d", s.sharp_2d},
+                  {"menu_colors", int64_t(s.menu_colors)},
                   {"language", int64_t(s.language)},
                   {"msaa", kMsaa[s.msaa % kMsaaCount]},
                   {"fxaa", s.fxaa},
@@ -386,8 +448,6 @@ toml::table Table() {
                   {"dump_textures", s.dump_textures},
                   {"low_latency", s.low_latency},
                   {"sharpen", int64_t(s.sharpen)},
-                  {"hit_feedback", int64_t(s.hit_feedback)},
-                  {"damage_numbers", s.damage_numbers},
                   {"color_style", int64_t(s.color_style)},
                   {"bloom", int64_t(s.bloom)},
                   {"light_shafts", int64_t(s.light_shafts)},
@@ -438,6 +498,7 @@ toml::table Table() {
         t.insert("mouse_sensitivity", int64_t(s.mouse_sensitivity));
         t.insert("mouse_invert_y", s.mouse_invert_y);
     }
+    t.insert("touch_controls", s.touch_controls);
     if (!pad.empty()) t.insert("gamepad", pad);
     for (int i = 0; i < kFxCount; i++) t.insert(kFxTable[i].key, int64_t(s.fx[i]));
     for (const Option& o : kGame.options) {
@@ -451,8 +512,48 @@ toml::table Table() {
 }  // namespace
 
 void Save() {
-    std::ofstream f(File());
-    f << Table() << "\n";
+    const std::filesystem::path file = File();
+    // a file that did not parse is the player's: kept once beside it before it is written over
+    if (g_unread) {
+        g_unread = false;
+        std::filesystem::path bak = file;
+        bak += ".bak";
+#ifdef _WIN32
+        if (!CopyFileW(file.c_str(), bak.c_str(), FALSE))
+            LOGR("settings: %s not kept as .bak (%lu)", file.string().c_str(), GetLastError());
+#else
+        std::error_code ec;
+        if (!std::filesystem::copy_file(file, bak, std::filesystem::copy_options::overwrite_existing, ec))
+            LOGR("settings: %s not kept as .bak (%s)", file.string().c_str(), ec.message().c_str());
+#endif
+    }
+    // written beside it and moved over it: a failed write leaves the old file
+    std::filesystem::path tmp = file;
+    tmp += ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        f << Table() << "\n";
+        f.close();
+        if (!f) {
+            LOGR("settings: %s could not be written", tmp.string().c_str());
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+    }
+#ifdef _WIN32
+    if (!MoveFileExW(tmp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        LOGR("settings: %s could not be replaced (%lu)", file.string().c_str(), GetLastError());
+        DeleteFileW(tmp.c_str());
+    }
+#else
+    std::error_code ec;
+    std::filesystem::rename(tmp, file, ec);  // rename(2) replaces it in one step
+    if (ec) {
+        LOGR("settings: %s could not be replaced (%s)", file.string().c_str(), ec.message().c_str());
+        std::filesystem::remove(tmp, ec);
+    }
+#endif
 }
 
 void LogSettings() {
@@ -464,6 +565,7 @@ void LogSettings() {
         if (!line.empty()) LOGR("  %s", line.c_str());
 }
 
+#ifdef _WIN32  // off Windows: SDL's displays, app/main_sdl.cpp
 void* Monitor() {
     uint32_t n = Get().monitor;
     if (n) {
@@ -496,10 +598,19 @@ Mode Desktop() {
     mi.cbSize = sizeof(mi);
     DEVMODEW dm{};
     dm.dmSize = sizeof(dm);
-    if (GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &dm))
+    // the registry's mode, else the current one, else the monitor's size: over Remote Desktop the registry's reads
+    // 0 x 0 (a window of no size, and Vulkan with no surface to draw on)
+    const bool info = GetMonitorInfoW(mon, &mi) != 0;
+    if (info && EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &dm) && dm.dmPelsWidth && dm.dmPelsHeight)
         return {dm.dmPelsWidth, dm.dmPelsHeight};
-    return {uint32_t(GetSystemMetrics(SM_CXSCREEN)), uint32_t(GetSystemMetrics(SM_CYSCREEN))};
+    if (info && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth && dm.dmPelsHeight)
+        return {dm.dmPelsWidth, dm.dmPelsHeight};
+    if (info && mi.rcMonitor.right > mi.rcMonitor.left && mi.rcMonitor.bottom > mi.rcMonitor.top)
+        return {uint32_t(mi.rcMonitor.right - mi.rcMonitor.left), uint32_t(mi.rcMonitor.bottom - mi.rcMonitor.top)};
+    const int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+    return w > 0 && h > 0 ? Mode{uint32_t(w), uint32_t(h)} : Mode{1920, 1080};
 }
+#endif
 
 Mode Output() {
     const Settings& s = Get();
@@ -573,7 +684,7 @@ float FrameAspect() {
 float HudAspect() { return Widescreen() ? kGame.hud_aspect : std::min(kGame.hud_aspect, 4.0f / 3.0f); }
 
 float RenderScale(uint32_t guest_height) {
-    float h = Output().height * (Get().render_percent / 100.0f);
+    float h = Output().height * (std::clamp<uint32_t>(Get().render_percent, 25, 200) / 100.0f);
     return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
 }
 

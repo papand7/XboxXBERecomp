@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Configure for Linux and build the recompiler tools. The game exe itself only builds on Windows.
-# SDL3 is configured without X11/Wayland so it works on a headless VM.
+# Configure for Linux and build the recompiler tools (into build/linux). SDL3 is configured without X11/Wayland so it
+# works on a headless VM; the game's own Linux exes build with its CMakePresets instead (cmake --preset release, X11
+# and Wayland on: the development packages in the game's BUILDING.md).
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 [ -f "assets/$GAME_XBE" ] || { echo "assets/$GAME_XBE missing: extract the game first" >&2; exit 1; }

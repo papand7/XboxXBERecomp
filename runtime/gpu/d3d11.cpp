@@ -821,7 +821,9 @@ void D3D11Backend::Sync(uint32_t data, uint32_t) {
     } else {
         for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * pitch, &px[size_t(y) * t.gw * 4], t.gw * 4);
     }
-    t.read = std::move(px);
+    // compared against guest memory row by row, so only a linear surface keeps its pixels
+    if (t.swizzled32) t.read.clear();
+    else t.read = std::move(px);
     t.drawn = false;
     t.sig = SurfaceSig(t.data, t.bytes);
 }
@@ -2084,6 +2086,7 @@ void D3D11Backend::RenderUi() {
     app::DrawHud(fps_);
     app::DrawOverlay();
     if (app::kGame.ui) app::kGame.ui(fps_);
+    app::DrawTouch();
     ImGui::Render();
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     ForgetDrawState();

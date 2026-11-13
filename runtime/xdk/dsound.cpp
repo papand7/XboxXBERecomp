@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -12,6 +13,7 @@
 
 #include "app/app.h"
 #include "audio/audio.h"
+#include "audio/reverb.h"
 #include "xbe/xbe.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
@@ -234,9 +236,10 @@ struct Voice {
     uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
     uint32_t out = 0;   // the submix buffer it plays into (SetOutputBuffer), 0 its own mix bins
     float p[3] = {}, min_dist = 1, max_dist = 1e9f;
-    // through a wall (audio::SetOcclusion): what the title asked (0 to 1), what is heard (eased toward it), the low-pass's
-    // state (two one-poles a side)
-    float occlusion = 0, occluded = 0;
+    // 3D sound (Settings::audio_3d): the occlusion the title asked (0 to 1) and the one heard, eased toward it; how far
+    // behind the listener (0 to 1); the gain its place gave (distance, behind, wall) and the distance's alone; the
+    // low-pass's state, a side
+    float occlusion = 0, occluded = 0, behind = 0, placed = 1, att = 1;
     float lp[2][2] = {};
     // ADPCM block cache
     int64_t block = -1;
@@ -251,6 +254,8 @@ std::recursive_mutex g_lock;
 std::map<uint32_t, Voice> g_voices;
 float g_listener[3] = {}, g_front[3] = {0, 0, 1}, g_top[3] = {0, 1, 0};
 float g_rolloff = 1;  // the listener's rolloff factor (IDirectSound_SetRolloffFactor): 1 halves the level each doubling
+// 3D sound: the room the title reports (audio::SetRoom), and the one heard, eased toward it
+float g_room_indoor = 0, g_room_size = 0, g_heard_indoor = 0, g_heard_size = 0;
 // Completed packets' callbacks, run as the XDK runs them: in DirectSoundDoWork on the title's thread, so they never
 // overlap the title's own stream code. A stream flushed or released runs its own at once, before it is gone.
 std::deque<Done> g_done;
@@ -414,9 +419,23 @@ void Levels(Voice& v, float g[kMixChannels][2]) {
     float side = rel ? d[0] : d[0] * right[0] + d[1] * right[1] + d[2] * right[2];
     float pan = dist > 1e-3f ? side / dist : 0.0f;
     if (app::kGame.sound_x_left) pan = -pan;
+    v.att = att;
+    if (!app::Get().audio_3d) {
+        for (uint32_t c = 0; c < kMixChannels; c++) {
+            g[c][0] *= att * std::min(1.0f, 1.0f - pan);
+            g[c][1] *= att * std::min(1.0f, 1.0f + pan);
+        }
+        return;
+    }
+    // 3D sound: equal power across the two sides (the far ear never quite silent: the head shades it), a little
+    // quieter behind (duller too, in Render), quieter through a wall
+    const float ahead = rel ? d[2] : d[0] * g_front[0] + d[1] * g_front[1] + d[2] * g_front[2];
+    v.behind = dist > 1e-3f ? std::clamp(-ahead / dist, 0.0f, 1.0f) : 0.0f;
+    const float k = 0.85f * std::clamp(pan, -1.0f, 1.0f), left_ear = std::sqrt(1 - k), right_ear = std::sqrt(1 + k);
+    v.placed = att * (1 - 0.15f * v.behind) * (1 - 0.45f * v.occluded);
     for (uint32_t c = 0; c < kMixChannels; c++) {
-        g[c][0] *= att * std::min(1.0f, 1.0f - pan);
-        g[c][1] *= att * std::min(1.0f, 1.0f + pan);
+        g[c][0] *= v.placed * left_ear;
+        g[c][1] *= v.placed * right_ear;
     }
 }
 
@@ -433,6 +452,32 @@ bool DsoundLog() {
         return e && *e && *e != '0';
     }();
     return on;
+}
+
+// XBE_AUDIO_RECORD=<file.wav> (diagnostic): the mix as it goes out, 32-bit float stereo, its header brought up to date
+// each second (the run may be ended at any point)
+void Record(const float* out, uint32_t frames) {
+    static FILE* f = [] {
+        const char* e = std::getenv("XBE_AUDIO_RECORD");
+        return e && *e ? std::fopen(e, "wb") : nullptr;
+    }();
+    if (!f) return;
+    static uint32_t bytes = 0, since = 0;
+    auto header = [] {
+        std::fseek(f, 0, SEEK_SET);
+        const uint32_t rate = audio::kRate, riff = 36 + bytes, fmt_size = 16, block = 8, rate_bytes = rate * 8;
+        const uint16_t format = 3, channels = 2, bits = 32;
+        std::fwrite("RIFF", 1, 4, f), std::fwrite(&riff, 4, 1, f), std::fwrite("WAVEfmt ", 1, 8, f);
+        std::fwrite(&fmt_size, 4, 1, f), std::fwrite(&format, 2, 1, f), std::fwrite(&channels, 2, 1, f);
+        std::fwrite(&rate, 4, 1, f), std::fwrite(&rate_bytes, 4, 1, f);
+        const uint16_t block16 = uint16_t(block);
+        std::fwrite(&block16, 2, 1, f), std::fwrite(&bits, 2, 1, f), std::fwrite("data", 1, 4, f), std::fwrite(&bytes, 4, 1, f);
+        std::fseek(f, 0, SEEK_END);
+    };
+    if (bytes == 0) header();
+    std::fwrite(out, 8, frames, f);
+    bytes += frames * 8;
+    if ((since += frames) >= audio::kRate) since = 0, header(), std::fflush(f);
 }
 
 void Render(float* out, uint32_t frames) {
@@ -458,7 +503,8 @@ void Render(float* out, uint32_t frames) {
                                       v.channels, v.rate, v.freq, v.volume, v.headroom, g[0][0], g[0][1]);
                 if (v.channels > 1) k += std::snprintf(b + k, sizeof b - k, " %.2f/%.2f", g[1][0], g[1][1]);
                 if (v.is3d) k += std::snprintf(b + k, sizeof b - k, " 3d mode %u at %.1f %.1f %.1f", v.mode, v.p[0], v.p[1], v.p[2]);
-                if (v.occluded > 0.01f) k += std::snprintf(b + k, sizeof b - k, " walled %.2f", v.occluded);
+                if (v.occluded > 0.01f || v.behind > 0.05f)
+                    k += std::snprintf(b + k, sizeof b - k, " walled %.2f behind %.1f", v.occluded, v.behind);
                 // into a 3D submix buffer: where it is, as the title gave it (mode 1 head relative: +x right, +z ahead)
                 if (const Voice* to = v.out ? Find(v.out) : nullptr)
                     k += std::snprintf(b + k, sizeof b - k, " into %08X mode %u at %.1f %.1f %.1f", v.out, to->mode, to->p[0],
@@ -467,7 +513,7 @@ void Render(float* out, uint32_t frames) {
                 top += b;
             }
         }
-        LOGR("dsound: %u voices playing, loud:%s", n, top.c_str());  // asked for: in release logs too
+        LOGR("dsound: %u voices playing, room %.2f indoor %.1f big, loud:%s", n, g_heard_indoor, g_heard_size, top.c_str());
         // XBE_DSOUND_LOG=2: every stream holding packets, whatever its level (a stream that plays nothing audible)
         static const bool all = [] {
             const char* e = std::getenv("XBE_DSOUND_LOG");
@@ -494,21 +540,49 @@ void Render(float* out, uint32_t frames) {
         const char* e = std::getenv("XBE_DSOUND_SOLO");
         return e ? uint32_t(std::strtoul(e, nullptr, 16)) : 0u;
     }();
-    const bool filter = app::Get().occlusion_filter;
+    // 3D sound: the room eased toward the title's (half a second), its reverb fed by the sound effects (the buffers and
+    // the 3D voices, not the music and speech streams), each 3D voice by its level before the distance and walls took
+    // their part, square-rooted (the room carries a far sound on); the voices dulled behind the listener and through
+    // walls
+    const bool spatial = app::Get().audio_3d;
+    static audio::Reverb reverb(audio::kRate);
+    static std::vector<float> send;
+    const float ease = std::min(1.0f, frames / (0.5f * audio::kRate));
+    g_heard_indoor += ((spatial ? g_room_indoor : 0.0f) - g_heard_indoor) * ease;
+    g_heard_size += (g_room_size - g_heard_size) * ease;
+    const float room = std::clamp(g_heard_size / 25.0f, 0.0f, 1.0f);
+    // wet: the reverb gives back 0.3 of what it takes, so 3 is about the dry sound's level; a little out in the open
+    // (none without a room: the menus)
+    const float wet = spatial ? (g_heard_indoor * (0.22f + 0.13f * room) + (1 - g_heard_indoor) * 0.04f) * 3.0f *
+                                    std::clamp(g_heard_size, 0.0f, 1.0f)
+                              : 0.0f;
+    const bool reverb_on = wet > 0.003f;
+    static bool had_reverb = false;
+    if (had_reverb && !reverb_on) reverb.Clear();
+    had_reverb = reverb_on;
+    if (reverb_on) {
+        reverb.Set(0.6f + 0.3f * room * g_heard_indoor, 0.25f + 0.25f * room, 0.003f + 0.025f * room);
+        send.assign(frames, 0.0f);
+    }
+    const bool filter = app::Get().occlusion_filter;  // a wall's low-pass (Settings::occlusion_filter)
     for (auto& [obj, v] : g_voices) {
         if (v.paused || v.sync || (!v.stream && !v.playing)) continue;
         if (solo_tag >= 0 && long(v.tag) != solo_tag) continue;
         if (solo_obj && obj != solo_obj) continue;
+        const bool placed = spatial && v.is3d && v.mode != 2;
+        // a wall (audio::SetOcclusion, Settings::occlusion_filter): eased in, for any voice a title tells, placed or not
+        v.occluded += ((filter ? v.occlusion : 0.0f) - v.occluded) * std::min(1.0f, frames / (0.12f * audio::kRate));
         float g[kMixChannels][2];
         Levels(v, g);
-        // through a wall: a low-pass (two one-poles), 18 kHz clear to 600 Hz fully behind one
-        const float walled = filter ? v.occlusion : 0.0f;
-        v.occluded += (walled - v.occluded) * std::min(1.0f, frames / (0.1f * audio::kRate));
+        // the low-pass (two one-poles): 18 kHz clear, 700 Hz behind a wall, lower still behind the listener
         float lp = 1;
-        if (v.occluded > 0.005f) {
-            const float fc = 18000.0f * std::pow(600.0f / 18000.0f, v.occluded);
+        if (placed || v.occluded > 0.005f) {
+            const float fc = 18000.0f * std::pow(700.0f / 18000.0f, v.occluded) * (1 - 0.6f * (placed ? v.behind : 0.0f));
             if (fc < 16000) lp = 1 - std::exp(-6.2831853f * fc / audio::kRate);
         }
+        float to_room = 0;
+        if (reverb_on && (v.is3d || !v.stream))
+            to_room = placed && v.placed > 1e-6f ? std::min(8.0f, std::sqrt(v.att) / v.placed) : 1.0f;
         const uint32_t nch = std::min<uint32_t>(std::max<uint32_t>(v.channels, 1), kMixChannels);
         uint32_t base = v.data + v.play_start;
         double step = double(v.freq ? v.freq : v.rate) / audio::kRate;
@@ -564,6 +638,7 @@ void Render(float* out, uint32_t frames) {
                 l += a * g[c][0];
                 r += a * g[c][1];
             }
+            if (to_room > 0) send[i] += (l + r) * 0.5f * to_room;
             if (lp < 1) {
                 v.lp[0][0] += (l - v.lp[0][0]) * lp, v.lp[0][1] += (v.lp[0][0] - v.lp[0][1]) * lp, l = v.lp[0][1];
                 v.lp[1][0] += (r - v.lp[1][0]) * lp, v.lp[1][1] += (v.lp[1][0] - v.lp[1][1]) * lp, r = v.lp[1][1];
@@ -575,8 +650,10 @@ void Render(float* out, uint32_t frames) {
             v.pos += step;
         }
     }
+    if (reverb_on) reverb.Process(send.data(), out, frames, wet);
     app::MixHitSound(out, frames);
     for (uint32_t i = 0; i < frames * 2; i++) out[i] = std::clamp(out[i], -1.0f, 1.0f);
+    Record(out, frames);
 }
 
 int64_t NowMs() {
@@ -831,6 +908,27 @@ HLE_STDCALL(IDirectSound_SetRolloffFactor, 3) {
 HLE_STDCALL(IDirectSound_SetDistanceFactor, 3) { return 0; }
 HLE_STDCALL(IDirectSound_SetVelocity, 5) { return 0; }
 HLE_STDCALL(IDirectSound_SetI3DL2Listener, 3) { return 0; }
+// 3D sound, from the title (audio.h)
+namespace audio {
+bool Sources(float listener[3], std::vector<Source>& out) {
+    out.clear();
+    if (!app::Get().audio_3d) return false;
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    for (int i = 0; i < 3; i++) listener[i] = g_listener[i];
+    for (auto& [obj, v] : g_voices) {
+        if (!v.is3d || v.mode != 0 || v.paused || v.sync || (!v.stream && !v.playing) || (v.stream && v.packets.empty()))
+            continue;
+        out.push_back({obj, {v.p[0], v.p[1], v.p[2]}});
+    }
+    return true;
+}
+void SetRoom(float indoor, float size) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    g_room_indoor = std::clamp(indoor, 0.0f, 1.0f);
+    g_room_size = std::max(size, 0.0f);
+}
+}  // namespace audio
+
 HLE_STDCALL(IDirectSound_SetPosition, 5) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     for (int i = 0; i < 3; i++) g_listener[i] = F32(a[1 + i]);

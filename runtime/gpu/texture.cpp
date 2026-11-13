@@ -1,5 +1,5 @@
 #include "gpu/texture.h"
-#include "gpu/upscale.h"
+#include "gpu/upscale_edge.h"
 
 #include <algorithm>
 #include <atomic>
@@ -481,7 +481,8 @@ static void RegisterReplacement(std::shared_ptr<Replacement> r) {
     g_replace_count = g_replace.size();
 }
 
-void SetReplacement(uint32_t data, uint32_t guest_bytes, uint32_t width, uint32_t height, std::vector<uint32_t> bgra) {
+void SetReplacement(uint32_t data, uint32_t guest_bytes, uint32_t width, uint32_t height, std::vector<uint32_t> bgra,
+                    bool movie) {
     if (!width || !height || bgra.size() != size_t(width) * height || !guest_bytes) return;
     auto r = std::make_shared<Replacement>();
     r->data = data;
@@ -490,6 +491,7 @@ void SetReplacement(uint32_t data, uint32_t guest_bytes, uint32_t width, uint32_
     r->width = width;
     r->height = height;
     r->bgra = std::move(bgra);
+    r->movie = movie;
     RegisterReplacement(std::move(r));
 }
 
@@ -544,7 +546,7 @@ bool ReplacementHolds(const Replacement& r) {
     if (it != g_replace.end() && it->second->version == r.version) {
         g_replace.erase(it);
         g_replace_count = g_replace.size();
-        LOGR("gpu: the picture for texture %08X dropped, the game's bytes there changed", r.data);
+        if (!r.movie) LOGR("gpu: the picture for texture %08X dropped, the game's bytes there changed", r.data);
     }
     return false;
 }
@@ -658,12 +660,13 @@ float Cubic(float t, int i) {  // Catmull-Rom weight of tap i (0..3) around t
 }
 }  // namespace
 
-bool DecodeBgra(const TextureDesc& d, uint32_t level, const uint8_t* guest, std::vector<uint32_t>& out) {
+bool DecodeBgra(const TextureDesc& d, uint32_t level, const uint8_t* guest, std::vector<uint32_t>& out,
+                const uint32_t* palette) {
     const FormatInfo& fi = Format(d.format);
     if (fi.depth || fi.host == Host::None || fi.host == Host::R32F || fi.host == Host::R16Unorm) return false;
     std::vector<uint8_t> px;
     uint32_t pitch = 0;
-    DecodeLevel(d, level, 0, guest, nullptr, px, pitch);
+    DecodeLevel(d, level, 0, guest, palette, px, pitch);
     uint32_t w = std::max(1u, d.width >> level), h = std::max(1u, d.height >> level);
     if (fi.compressed) {
         DecodeBlocks(fi.host, w, h, px, pitch, out);
@@ -889,7 +892,9 @@ void SharpenWorld(const TextureDesc& d, bool wrap_u, bool wrap_v) {
 
 std::vector<std::vector<uint32_t>> ReplacementLevels(const Replacement& r) {
     std::vector<std::vector<uint32_t>> levels{r.bgra};
-    std::vector<std::vector<uint32_t>> below = r.mips.empty() ? MakeMips(r.bgra, r.width, r.height) : r.mips;
+    // a movie pack's frame: one level (replaced every frame)
+    std::vector<std::vector<uint32_t>> below;
+    if (!r.movie) below = r.mips.empty() ? MakeMips(r.bgra, r.width, r.height) : r.mips;
     for (auto& m : below) levels.push_back(std::move(m));
     return levels;
 }

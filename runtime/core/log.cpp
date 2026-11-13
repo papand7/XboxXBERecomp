@@ -11,6 +11,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace logx {
@@ -127,6 +131,11 @@ void Write(Level lv, const char* fmt, ...) {
         g_pending.append(line, size_t(n));
         if (lv == Level::Warn || lv == Level::Error) g_urgent = true;
     }
+#ifdef __ANDROID__
+    // Android has no console: logcat (adb logcat -s xbe) has what stderr would, at once (logcat does not block)
+    __android_log_write(lv == Level::Error ? ANDROID_LOG_ERROR : lv == Level::Warn ? ANDROID_LOG_WARN : ANDROID_LOG_INFO,
+                        "xbe", line);
+#endif
     if (sync) return WriteOut();
     if (lv == Level::Warn || lv == Level::Error) g_cv.notify_one();
 }

@@ -1,10 +1,11 @@
-// The launcher core's platform on Linux, for its test tool: programs through fork and exec, downloads through the
-// curl program. .msi files cannot be extracted here.
+// The launcher core's platform on Linux (the launcher service and the test tool): programs through fork and exec,
+// downloads through the curl program. .msi files cannot be extracted here (Linux builds need none).
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,6 +32,8 @@ public:
             dup2(fd[1], 2);
             close(fd[0]);
             close(fd[1]);
+            // nothing reads the service's own input (its commands): no prompt waits for an answer that never comes
+            if (int null = open("/dev/null", O_RDONLY); null >= 0) dup2(null, 0), close(null);
             if (chdir(cwd.c_str()) != 0) _exit(127);
             for (const auto& [k, v] : env) setenv(k.c_str(), v.c_str(), 1);
             std::vector<char*> argv;
@@ -77,18 +80,42 @@ public:
         return !ec;
     }
     bool Start(const std::filesystem::path& exe, const std::filesystem::path& cwd, std::string& error) override {
+        // the game outlives this process, and its output is not the service's (its JSON lines): its log is its own
+        if (access(exe.c_str(), X_OK) != 0) {
+            error = "Could not start the game: " + exe.string() + " " + std::strerror(errno);
+            return false;
+        }
         pid_t pid = fork();
         if (pid == 0) {
             setsid();
+            if (int null = open("/dev/null", O_RDWR); null >= 0) {
+                dup2(null, 0), dup2(null, 1), dup2(null, 2);
+                if (null > 2) close(null);
+            }
             if (chdir(cwd.c_str()) != 0) _exit(127);
+            // a second fork: the game is no child of the service, so it leaves no zombie behind when it ends
+            if (fork() != 0) _exit(0);
             execl(exe.c_str(), exe.c_str(), nullptr);
             _exit(127);
         }
-        if (pid < 0) error = "fork failed";
-        return pid > 0;
+        if (pid < 0) {
+            error = "fork failed";
+            return false;
+        }
+        waitpid(pid, nullptr, 0);
+        return true;
     }
     std::string ExeSuffix() const override { return ""; }
     char PathSeparator() const override { return ':'; }
+    // LAUNCHER_OS=windows lets the test tool resolve and fetch Windows' tools (the msi parts aside)
+    std::string Os() const override {
+        const char* e = std::getenv("LAUNCHER_OS");
+#ifdef __APPLE__
+        return e && *e ? e : "macos";
+#else
+        return e && *e ? e : "linux";
+#endif
+    }
     std::string GetEnv(const std::string& name) const override {
         const char* v = std::getenv(name.c_str());
         return v ? v : "";
@@ -112,9 +139,9 @@ public:
         bool go = true;
         while (go && (n = fread(buf.data(), 1, buf.size(), p)) > 0) go = sink(buf.data(), n);
         int status = pclose(p);
-        if (total && *total == 0) *total = 0;
         if (go && status != 0) {
-            error = "curl failed for " + url;
+            error = WIFEXITED(status) && WEXITSTATUS(status) == 127 ? "curl is not installed (it downloads the tools)"
+                                                                     : "curl failed for " + url;
             return false;
         }
         return go;

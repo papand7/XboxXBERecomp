@@ -1,5 +1,7 @@
 #pragma once
-// harness only: the Win32 names portable runtime and game files touch
+// off Windows (the headless harness, the Linux build): the few Win32 names portable runtime and game files touch. This
+// folder is on the include path only off Windows, so <windows.h> finds this there and Windows' own on Windows.
+#include <cstddef>
 #include <cstdint>
 
 typedef long HRESULT;
@@ -10,10 +12,30 @@ typedef void* HCURSOR;
 typedef const wchar_t* PCWSTR;
 typedef unsigned int UINT;
 typedef int BOOL;
+typedef int32_t LONG;
+typedef uint32_t DWORD;
+typedef uint16_t WORD;
+typedef uint8_t BYTE;
+typedef float FLOAT;
 #define WINAPI
 #ifndef TRUE
 #define TRUE 1
 #endif
+#define S_OK ((HRESULT)0)
+#define E_FAIL ((HRESULT)0x80004005L)
+#define SUCCEEDED(hr) (((HRESULT)(hr)) >= 0)
+#define FAILED(hr) (((HRESULT)(hr)) < 0)
+
+struct RECT {
+    LONG left;
+    LONG top;
+    LONG right;
+    LONG bottom;
+};
+struct POINT {
+    LONG x;
+    LONG y;
+};
 
 inline HMODULE GetModuleHandleW(const wchar_t*) { return nullptr; }
 inline void* GetProcAddress(HMODULE, const char*) { return nullptr; }
@@ -25,7 +47,7 @@ enum : uint32_t {
     WM_LBUTTONUP = 0x0202,
 };
 enum { WA_INACTIVE = 0, HTCLIENT = 1 };
-enum { VK_RETURN = 0x0D, VK_ESCAPE = 0x1B, VK_F3 = 0x72, VK_F10 = 0x79, VK_OEM_3 = 0xC0 };
+#include "core/vk_codes.h"  // the virtual key codes
 #define LOWORD(v) ((uint16_t)((uintptr_t)(v) & 0xFFFF))
 #define MAKEINTRESOURCEW(i) ((const wchar_t*)(uintptr_t)(uint16_t)(i))
 inline HCURSOR LoadCursorW(void*, const wchar_t*) { return nullptr; }

@@ -1,5 +1,6 @@
 #pragma once
-// What differs between Windows (the launcher) and Linux (its test tool): running programs, .msi extraction, links
+// What differs between Windows and Linux (the launcher service there, and the test tool): running programs, .msi
+// extraction, links
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -29,6 +30,8 @@ public:
     virtual std::string ExeSuffix() const = 0;  // ".exe" on Windows
     virtual char PathSeparator() const = 0;     // between PATH entries
     virtual std::string GetEnv(const std::string& name) const = 0;
+    // "windows" or "linux": toolchain.json's section, and what the build needs of the system
+    virtual std::string Os() const = 0;
 };
 
 std::unique_ptr<Platform> MakePlatform();

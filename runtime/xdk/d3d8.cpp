@@ -26,6 +26,11 @@ namespace dispatch {
 bool InCode(uint32_t va);  // cpu/dispatch.cpp
 }
 
+#ifdef _WIN32
+// user32's, as windows.h declares it (not included here: its macros meet this file's names)
+extern "C" __declspec(dllimport) int __stdcall MessageBoxW(struct HWND__*, const wchar_t*, const wchar_t*, unsigned int);
+#endif
+
 using namespace kernel;
 
 // configs written before the SDK knew the name
@@ -586,12 +591,44 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     ScratchPush();
 
     if (!g_backend) {
+        app::SetMidFrame([] {
+            if (g_backend) g_backend->MidFrame();
+        });
         g_backend = gpu::CreateBackend();
         if (!g_backend || !g_backend->Init(w, h)) {
-            LOGE("d3d: Vulkan renderer init failed");
+            // the others in turn (Direct3D 12, Vulkan, Direct3D 11), each made by CreateBackend under its setting, which
+            // is put back after: the chosen one stays the player's for the next start. The failed one goes first: it
+            // may hold the window's swap chain
+            static const char* kNames[] = {"Direct3D 12", "Direct3D 11", "Vulkan"};
+            app::Settings& s = app::Get();
+            const uint32_t chosen = s.renderer;
             g_backend.reset();
-            app::Quit();
-            return 0;
+            for (uint32_t r : {0u, 2u, 1u}) {
+                if (r == chosen % 3) continue;
+                s.renderer = r;
+                g_backend = gpu::CreateBackend();
+                if (g_backend && g_backend->Init(w, h)) {
+                    LOGR("d3d: the chosen renderer (%s) could not start, running on %s", kNames[chosen % 3], kNames[r]);
+                    break;
+                }
+                g_backend.reset();
+            }
+            s.renderer = chosen;
+            if (!g_backend) {
+                // nothing to draw with: say so and leave, rather than run on a renderer that never started
+                LOGE("d3d: no renderer could start (Direct3D 12, Direct3D 11 and Vulkan all failed)");
+#ifdef _WIN32
+                MessageBoxW(nullptr, L"No renderer could start (Direct3D 12, Direct3D 11 and Vulkan all failed). "
+                            L"Update the graphics driver, see the log in the logs folder.", app::kGame.short_title,
+                            0x10 /*MB_ICONERROR*/);
+#else
+                // macOS and Linux: Vulkan is the only renderer (MoltenVK on a Mac), so say why nothing draws
+                app::MessageBox(L"The renderer could not start: Vulkan did not open on this computer. On a Mac it needs "
+                                L"MoltenVK (libMoltenVK.dylib, beside the game) and a GPU with Vulkan 1.3 through it; on "
+                                L"Linux a Vulkan 1.3 driver. The log in the logs folder says what failed.", true);
+#endif
+                kernel::Shutdown(1);
+            }
         }
         if (RenderThread()) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
         if (app::kGame.step_interpolation) g_backend = gpu::CreateInterpolating(std::move(g_backend));

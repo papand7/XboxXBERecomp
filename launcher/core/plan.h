@@ -28,6 +28,10 @@ struct Tool {
     int strip = 0;               // leading path components dropped
     std::vector<std::string> keep;  // after strip: "dir/" a folder and all in it, else a path ("*" within a name); empty: all
     bool optional = false;          // not part of the build: fetched when a feature asks (ffmpeg, for the music)
+    // off Windows: programs that, all on the PATH (and the first's --version at least system_min), make the download
+    // unneeded ("clang++", "ld.lld"): the system's own are used
+    std::vector<std::string> system;
+    std::string system_min;
     uint64_t Bytes() const;
 };
 
@@ -36,8 +40,9 @@ struct Plan {
     std::string sdk_version;  // "10.0.26100.0"
 };
 
-// toolchain.json: {"tools": [...], "msvc": {...}, "sdk": {...}}; false with the reason
-bool LoadPlan(const std::string& toolchain_json, Plan& plan, std::string& error);
+// toolchain.json: {"tools": [...], "msvc": {...}, "sdk": {...}, "linux": {"tools": [...]}}: os "windows" reads the
+// top level's tools, another os its own section's (launchers before it read only the top level); false with the reason
+bool LoadPlan(const std::string& toolchain_json, Plan& plan, std::string& error, const std::string& os = "windows");
 // the Microsoft parts: the channel's manifest fetched and the msvc and sdk entries of toolchain.json turned into
 // tools with their files
 bool ResolveMicrosoft(Http& http, const std::string& toolchain_json, Plan& plan, std::string& error);

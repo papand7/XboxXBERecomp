@@ -5,6 +5,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef WINVER
+#define WINVER 0x0A00  // the touch screen's WM_POINTER messages (Windows 8.1 and up)
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #include <windows.h>
 #include <windowsx.h>
 #include <dbghelp.h>
@@ -16,15 +22,18 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <imgui.h>
 #include <backends/imgui_impl_win32.h>
 
 #include "app/app.h"
+#include "core/netplay.h"
 #include "core/diag.h"
 #include "core/input.h"
 #include "core/log.h"
@@ -43,6 +52,7 @@ namespace {
 HWND g_hwnd = nullptr;
 constexpr UINT kApplyDisplay = WM_APP + 1, kOpenWindow = WM_APP + 2;
 bool g_mode_changed = false;
+wchar_t g_mode_device[32] = {};  // the display whose mode was changed (MONITORINFOEXW::szDevice), restored by name
 bool g_apply_posted = false;  // a display apply is waiting in the queue or running
 std::atomic<bool> g_active{true};  // the game window is in front (WM_ACTIVATE)
 
@@ -126,8 +136,9 @@ void ApplyNow() {
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
+    // the display the mode was changed on, which need not be the monitor setting's now
     if (g_mode_changed) {
-        ChangeDisplaySettingsExW(mi.szDevice, nullptr, nullptr, 0, nullptr);
+        ChangeDisplaySettingsExW(g_mode_device, nullptr, nullptr, 0, nullptr);
         g_mode_changed = false;
     }
     Mode out = Output();
@@ -143,7 +154,10 @@ void ApplyNow() {
         dm.dmPelsWidth = s.width;
         dm.dmPelsHeight = s.height;
         dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
-        g_mode_changed = ChangeDisplaySettingsExW(mi.szDevice, &dm, nullptr, CDS_FULLSCREEN, nullptr) == DISP_CHANGE_SUCCESSFUL;
+        LONG r = ChangeDisplaySettingsExW(mi.szDevice, &dm, nullptr, CDS_FULLSCREEN, nullptr);
+        g_mode_changed = r == DISP_CHANGE_SUCCESSFUL;
+        if (g_mode_changed) wcsncpy_s(g_mode_device, mi.szDevice, _TRUNCATE);
+        else LOGR("display: %ux%u on %ls not set (%ld), the desktop's mode kept", s.width, s.height, mi.szDevice, r);
         GetMonitorInfoW(mon, &mi);
     }
     if (s.display_mode == DisplayMode::Windowed) {
@@ -159,6 +173,50 @@ void ApplyNow() {
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | visible);
         SetWindowPos(g_hwnd, HWND_NOTOPMOST, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED);
     }
+}
+
+// the title's pointer for its menus (GameInfo::menu_cursor), made again when the window's height asks another size
+HCURSOR MenuCursor(HWND hwnd) {
+    static HCURSOR made = nullptr;
+    static int made_size = 0;
+    if (!kGame.menu_cursor) return nullptr;
+    RECT r;
+    GetClientRect(hwnd, &r);
+    int size = std::clamp(int(r.bottom - r.top) / 24, 16, 96);
+    if (made && size == made_size) return made;
+    std::vector<uint32_t> px;
+    int hx = 0, hy = 0;
+    kGame.menu_cursor(size, px, hx, hy);
+    if (px.size() != size_t(size) * size) return made;
+    BITMAPV5HEADER bh{};
+    bh.bV5Size = sizeof(bh);
+    bh.bV5Width = size;
+    bh.bV5Height = -size;
+    bh.bV5Planes = 1;
+    bh.bV5BitCount = 32;
+    bh.bV5Compression = BI_BITFIELDS;
+    bh.bV5RedMask = 0x00FF0000;
+    bh.bV5GreenMask = 0x0000FF00;
+    bh.bV5BlueMask = 0x000000FF;
+    bh.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HDC dc = GetDC(nullptr);
+    HBITMAP color = CreateDIBSection(dc, reinterpret_cast<BITMAPINFO*>(&bh), DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, dc);
+    if (!color) return made;
+    std::memcpy(bits, px.data(), px.size() * 4);
+    // the alpha does the masking, the mask all zero (a monochrome bitmap's rows are WORD aligned)
+    std::vector<uint8_t> zeros(size_t((size + 15) / 16 * 2) * size);
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, zeros.data());
+    ICONINFO ii{FALSE, DWORD(hx), DWORD(hy), mask, color};
+    HCURSOR c = CreateIconIndirect(&ii);
+    DeleteObject(color);
+    DeleteObject(mask);
+    if (!c) return made;
+    if (made) DestroyCursor(made);
+    made = c;
+    made_size = size;
+    return made;
 }
 
 // mouse look (Settings::mouse_look): the cursor hidden and held in the window while the mouse plays the right stick, in
@@ -194,9 +252,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RAWINPUT ri;
         UINT size = sizeof(ri);
         if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != UINT(-1) &&
-            ri.header.dwType == RIM_TYPEMOUSE && input::MouseLooking()) {
+            ri.header.dwType == RIM_TYPEMOUSE && (input::MouseLooking() || input::MousePointing())) {
             const RAWMOUSE& m = ri.data.mouse;
-            if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            if (!input::MouseLooking()) {
+                // the menus' pointer: the cursor's own place is read (FramePoint)
+            } else if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE)) {
                 input::MouseMoved(m.lLastX, m.lLastY);
             } else {
                 // Remote Desktop (and VMs, tablets) send where the pointer is, 0 to 65535 across the screen or the
@@ -258,6 +318,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetCursor(input::MouseIsFree() ? LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW)) : nullptr);
             return TRUE;
         }
+        if (HCURSOR c = kGame.menu_up && kGame.menu_up() && !OverlayOpen() ? MenuCursor(hwnd) : nullptr) {
+            SetCursor(c);
+            return TRUE;
+        }
+    }
+    // a touch screen's fingers (WM_POINTER), for the on-screen touch controls when they are on (app/touch.cpp)
+    if (msg == WM_POINTERDOWN || msg == WM_POINTERUPDATE || msg == WM_POINTERUP) {
+        POINTER_INFO pi{};
+        const uint32_t id = GET_POINTERID_WPARAM(wp);
+        if (app::Get().touch_controls && GetPointerInfo(id, &pi) && pi.pointerType == PT_TOUCH) {
+            POINT pt = pi.ptPixelLocation;
+            ScreenToClient(hwnd, &pt);
+            app::TouchPoint(id, msg == WM_POINTERDOWN ? 0 : msg == WM_POINTERUPDATE ? 1 : 2, float(pt.x), float(pt.y));
+        }
     }
     // a key binding the settings window waits for takes the next mouse button too
     if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN) {
@@ -304,10 +378,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // a changed display mode steps aside for the desktop, minimized, and comes back on return; not while
                 // handing over to the next instance, which runs in the same mode
                 if (g_mode_changed && !kernel::g_relaunching) {
-                    MONITORINFOEXW mi{};
-                    mi.cbSize = sizeof(mi);
-                    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
-                    ChangeDisplaySettingsExW(mi.szDevice, nullptr, nullptr, 0, nullptr);
+                    ChangeDisplaySettingsExW(g_mode_device, nullptr, nullptr, 0, nullptr);
                     g_mode_changed = false;
                     ShowWindow(hwnd, SW_MINIMIZE);
                 }
@@ -372,6 +443,37 @@ int Instance() {
 
 void* Window() { return g_hwnd; }
 
+namespace {
+std::atomic<bool> g_point_override{false};
+std::atomic<float> g_point_u{0}, g_point_v{0};
+}  // namespace
+void SetFramePointOverride(float u, float v) {
+    g_point_u = u, g_point_v = v;
+    g_point_override = true;
+}
+
+bool FramePoint(float& u, float& v) {
+    if (g_point_override) {
+        u = g_point_u, v = g_point_v;
+        return true;
+    }
+    if (!g_hwnd) return false;
+    POINT pt;
+    GetCursorPos(&pt);
+    ScreenToClient(g_hwnd, &pt);
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    float w = float(rc.right - rc.left), h = float(rc.bottom - rc.top);
+    if (w <= 0 || h <= 0 || pt.x < 0 || pt.y < 0 || pt.x >= rc.right || pt.y >= rc.bottom) return false;
+    // the frame at its shape, centred (the renderers' BlitFrame), then the 2D's own shape in its middle
+    float aspect = FrameAspect();
+    float vw = std::min(w, h * aspect), vh = vw / aspect;
+    u = (pt.x - (w - vw) / 2) / vw;
+    v = (pt.y - (h - vh) / 2) / vh;
+    if (aspect > kGame.hud_aspect + 1e-3f) u = 0.5f + (u - 0.5f) * aspect / kGame.hud_aspect;
+    return true;
+}
+
 std::recursive_mutex& UiLock() {
     static std::recursive_mutex m;
     return m;
@@ -385,6 +487,9 @@ void Quit() {
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
 
 bool Paused() { return !netplay::Active() && Get().pause_unfocused && !g_active && g_hwnd && IsWindowVisible(g_hwnd); }
+
+static void (*g_mid_frame)() = nullptr;
+void SetMidFrame(void (*fn)()) { g_mid_frame = fn; }
 
 void Pace(uint32_t vblanks) {
     using clock = std::chrono::steady_clock;
@@ -400,7 +505,16 @@ void Pace(uint32_t vblanks) {
     // LAN play: every copy at 60 a second whatever its cap, as the frames are the title's clocks (netplay::Frame)
     uint32_t cap = PaceRate(netplay::Active() ? 60 : Get().fps_cap, vblanks);
     auto now = clock::now();
-    if (!cap) {
+    if (!cap) {  // NF_UNCAPPED=1 (diagnostic): the frame's work time, averaged over 10 s
+        static clock::time_point last_u = now, report_u = now + std::chrono::seconds(10);
+        static double work_u = 0;
+        static uint32_t n_u = 0;
+        work_u += std::chrono::duration<double, std::milli>(now - last_u).count(), n_u++;
+        last_u = now;
+        if (now >= report_u && n_u) {
+            LOGR("frames uncapped: %.2f ms a frame on average (%.0f a second)", work_u / n_u, 1000.0 * n_u / work_u);
+            work_u = 0, n_u = 0, report_u = now + std::chrono::seconds(10);
+        }
         next = now;
         netplay::Frame(60);
         return;
@@ -428,8 +542,21 @@ void Pace(uint32_t vblanks) {
     }
     next += period;
     if (next < now - period) next = now;
+    // the renderer's frame in between (smooth turning): asked for now, drawn by it half way to the next present
+    if (g_mid_frame) g_mid_frame();
+    // NF_PERF_WORK (the capped run): the frame's work, the period less the time this frame's pacing waits
+    static double waited_last = 0, work_sum = 0;
+    static uint32_t work_n = 0;
+    static clock::time_point work_report = now + std::chrono::seconds(10);
+    work_sum += took - waited_last, work_n++;
+    if (now >= work_report && work_n) {
+        LOGR("frame work: %.2f ms a frame on average (paced at %u a second)", work_sum / work_n, cap);
+        work_sum = 0, work_n = 0, work_report = now + std::chrono::seconds(10);
+    }
+    const auto wait_from = clock::now();
     while (clock::now() + std::chrono::milliseconds(2) < next) Sleep(1);
     while (clock::now() < next) std::this_thread::yield();
+    waited_last = std::chrono::duration<double, std::milli>(clock::now() - wait_from).count();
     netplay::Frame(cap);  // LAN play: the next frame's controllers of every player
 }
 

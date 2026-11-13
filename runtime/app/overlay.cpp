@@ -2,6 +2,7 @@
 // settings file at once; display mode, resolution and render scale apply at once, aspect at the next start.
 // A section list on the left and one full-width row per setting, in classic Steam's dark olive. Made for a controller:
 // LB/RB change section, up/down rows, left/right change a row's value, A presses, Y clears a binding, B or Start closes.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -9,8 +10,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -28,6 +31,8 @@
 #include "app/classic_theme.h"
 #include "core/input.h"
 #include "core/log.h"
+#include "core/vk_codes.h"
+#include "gpu/style.h"
 
 namespace app {
 
@@ -320,8 +325,11 @@ void Note(const char* text) {
     ImGui::PopStyleColor();
 }
 
-// the monitor's modes, widest first, each size once
+// the monitor's modes, widest first, each size once (off Windows SDL's, app/main_sdl.cpp)
 std::vector<Mode> Modes() {
+#ifndef _WIN32
+    return DisplayModes();
+#else
     std::vector<Mode> modes;
     HMONITOR mon = static_cast<HMONITOR>(Monitor());
     MONITORINFOEXW mi{};
@@ -339,6 +347,7 @@ std::vector<Mode> Modes() {
         return a.width != b.width ? a.width > b.width : a.height > b.height;
     });
     return modes;
+#endif
 }
 
 void Display(Settings& s) {
@@ -401,6 +410,18 @@ void Display(Settings& s) {
         ImGui::EndPopup();
     }
     if (RowCheck("Vertical sync", &s.vsync)) Save();
+    if (RowCheck("HDR", &s.hdr, "The Vulkan renderer on a screen in Windows' HDR mode: the picture at Windows' SDR white, the 3D scene's highlights raised toward the screen's peak.")) Save();
+    if (s.hdr) {
+        int peak = int(s.hdr_peak), paper = int(s.hdr_paper);
+        if (RowSlider("HDR peak", &peak, 0, 4000, 50, " nits", "0: the screen's own.")) {
+            s.hdr_peak = uint32_t(peak);
+            Save();
+        }
+        if (RowSlider("HDR SDR white", &paper, 0, 600, 10, " nits", "0: Windows' SDR content brightness.")) {
+            s.hdr_paper = uint32_t(paper);
+            Save();
+        }
+    }
     if (changed) {
         Save();
         ApplyDisplay();
@@ -498,6 +519,9 @@ void Graphics(Settings& s) {
         s.smaa = edge == 2;
         Save();
     }
+    // the look rows: a title whose settings drive the Vulkan renderer's style (GameInfo::style_from_settings); the
+    // others have the Graphics Style page
+    if (kGame.style_from_settings) {
     if (RowCheck("Temporal AA", &s.temporal_aa,
                  "Jitters 3D draws and reprojects depth-validated history. Fast-moving geometry and the weapon or HUD can ghost. Vulkan only. Not used while an upscaler is on.")) Save();
     int up = int(s.upscaler % 2);
@@ -527,9 +551,11 @@ void Graphics(Settings& s) {
         s.scale_filter = uint32_t(filter);
         Save();
     }
+    }
     if (RowCheck("Enhanced world textures", &s.world_textures, "Doubles the 3D scene's textures in the background as they appear. Uses more video memory; textures may sharpen a moment after they show. Can cause hitches of a quarter of a second as new scenery appears.")) Save();
     if (RowCheck("HD texture pack", &s.texture_pack, "Loads matching PNGs from mods/textures beside the game executable. Texture packs are not included.")) Save();
     if (RowCheck("Dump textures", &s.dump_textures, "Writes original game textures to mods/textures/dump so you can build a pack.")) Save();
+    if (kGame.style_from_settings) {
     int style = int(s.color_style);
     if (RowCheck("Upscale movies", &s.movie_upscale, "Sharpens YUY2 movie frames with edge-safe Lanczos scaling before they are drawn.")) Save();
     if (RowCheck("Movies at 4:3", &s.movie_43, "On a wide screen the movies stay at their 4:3 shape in the middle instead of stretching.")) Save();
@@ -620,6 +646,7 @@ void Graphics(Settings& s) {
         s.color_style = uint32_t(style);
         Save();
     }
+    }
     int sharp = int(s.sharpen);
     if (RowSlider("Sharpening", &sharp, 0, 100, 5, "%")) {
         s.sharpen = uint32_t(sharp);
@@ -637,11 +664,22 @@ void Graphics(Settings& s) {
             s.screenshot_key = keys[k];
             Save();
         }
+#ifndef __ANDROID__  // Android always has the touch buttons
+    if (RowCheck("On-screen touch controls", &s.touch_controls, "For a touch screen: a finger on the screen plays controller 1.")) Save();
+#endif
     }
     if (RowCheck("Discord status", &s.discord, "Shows the mission you play on your Discord profile while Discord runs on this PC.")) Save();
     if (RowCheck("Performance overlay", &s.perf_overlay, "A corner panel: frames a second, the frame time and a graph of the last two seconds, the size the 3D scene is drawn at.")) Save();
     if (kGame.sharpen_2d && RowCheck("Sharp text and HUD", &s.sharp_2d)) Save();
-    FxRows(s);
+    if (kGame.style_from_settings) FxRows(s);
+    if (!kGame.vulkan_only) {
+        int renderer = int(s.renderer % 3);
+        const char* renderers[] = {"Direct3D 12", "Direct3D 11", "Vulkan (experimental)"};
+        if (RowChoice("Renderer", &renderer, renderers, 3, "Applies at the next start; Direct3D 11 for GPUs or drivers where 12 runs badly; Vulkan falls back to Direct3D 12 when it cannot start.")) {
+            s.renderer = uint32_t(renderer);
+            Save();
+        }
+    }
 }
 
 void General(Settings& s) {
@@ -658,6 +696,18 @@ void General(Settings& s) {
         if (s.hit_feedback && RowCheck("Damage numbers", &s.damage_numbers, "The damage of each hit, floating up from the mark.")) Save();
     }
 
+    if (RowCheck("3D sound", &s.audio_3d, "Sounds placed by their direction (duller behind you), muffled through walls, and echoing indoors.")) Save();
+    {
+        Note("Host address (network play): the PC to join, its address on your network or the internet (UDP port 27015 open there).");
+        char host[64] = {};
+        std::strncpy(host, s.join_ip.c_str(), sizeof(host) - 1);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetStyle().FramePadding.x);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x);
+        if (ImGui::InputText("##host", host, sizeof(host))) {
+            s.join_ip = host;
+            Save();
+        }
+    }
 }
 
 void Language(Settings& s) {
@@ -701,71 +751,13 @@ void GameOptions() {
 
 // the wheel and the rest of a rig (core/wheel.cpp): the devices found, and each control bound by moving or pressing it
 // on any of them (the binding names the device)
-const char* kAxisNames[8] = {"X", "Y", "Z", "Rx", "Ry", "Rz", "Slider 1", "Slider 2"};
-// a binding being detected (WheelDetectStart): what, for which binding, every device's state as it began; under g_detect_lock
-struct Detection {
-    WheelDetect kind = WheelDetect::None;
-    Settings::WheelBind* bind = nullptr;
-    std::vector<input::WheelDevice> start;  // every device's state when it began
-} g_detect;
-std::recursive_mutex g_detect_lock;
-bool g_detect_taken = false;                     // the last one ended with a binding (WheelDetectPoll)
-std::chrono::steady_clock::time_point g_quiet_until;  // the rig quiet until the control taken is let go
-
-std::string BindText(const Settings::WheelBind& b) { return WheelBindText(b); }
-
-void Bound(Settings::WheelBind& b, const input::WheelDevice& d) {
-    b.device = d.name;
-    b.guid = d.guid;
-    Save();
-    input::WheelSetup();
-    g_detect_taken = true;
-    g_quiet_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
-}
-
-// what moved or was pressed since the detection began, on any device
-void Detect(const input::WheelInfo& w) {
-    std::lock_guard lock(g_detect_lock);
-    if (g_detect.kind == WheelDetect::None) return;
-    for (size_t i = 0; i < w.devices.size() && i < g_detect.start.size(); i++) {
-        const input::WheelDevice& d = w.devices[i];
-        const input::WheelDevice& was = g_detect.start[i];
-        if (d.guid != was.guid) continue;
-        if (g_detect.kind == WheelDetect::Button) {
-            for (int b : d.pressed)
-                if (std::find(was.pressed.begin(), was.pressed.end(), b) == was.pressed.end()) {
-                    *g_detect.bind = {.button = b};
-                    Bound(*g_detect.bind, d);
-                    g_detect = {};
-                    return;
-                }
-            continue;
-        }
-        int32_t need = g_detect.kind == WheelDetect::Steer ? 8000 : 20000;
-        for (int a = 0; a < 8; a++) {
-            if (!(d.axis_mask >> a & 1)) continue;  // the axes the device has, wherever they are (Z, Rz, a slider ...)
-            int32_t moved = d.axes[a] - was.axes[a];
-            if (std::abs(moved) <= need) continue;
-            Settings::WheelBind& b = *g_detect.bind;
-            if (g_detect.kind == WheelDetect::Steer) {
-                b = {.axis = a, .invert = moved < 0};  // turned right
-            } else {
-                b = {.axis = a, .rest = was.axes[a], .full = moved > 0 ? 32767 : -32768};
-            }
-            Bound(b, d);
-            g_detect = {};
-            return;
-        }
-    }
-}
-
-// a binding's row: press it, then move or press the control; Y or the x clears it
-void BindRow(const char* label, Settings::WheelBind& b, WheelDetect kind, const input::WheelInfo& w,
-             const char* prompt, const char* help = nullptr) {
-    bool waiting = g_detect.kind == kind && g_detect.bind == &b;
-    Bind out = RowBind(label, waiting ? prompt : BindText(b), waiting, help);
-    if (out == Bind::Press) g_detect = {.kind = kind, .bind = &b, .start = w.devices};
+// a binding's row: press it, then move or press the control (app::WheelDetectStart); Y or the x clears it
+void BindRow(const char* label, Settings::WheelBind& b, WheelDetect kind, const char* prompt, const char* help = nullptr) {
+    bool waiting = WheelDetecting(&b) == kind;
+    Bind out = RowBind(label, waiting ? prompt : WheelBindText(b), waiting, help);
+    if (out == Bind::Press) WheelDetectStart(kind, b);
     if (out == Bind::Clear) {
+        if (waiting) WheelDetectCancel();
         b = {};
         Save();
         input::WheelSetup();
@@ -773,14 +765,14 @@ void BindRow(const char* label, Settings::WheelBind& b, WheelDetect kind, const 
 }
 
 void Wheel(Settings& s) {
+    WheelDetectPoll();
     input::WheelInfo w = input::Wheel();
-    Detect(w);
     Section("Devices");
     if (w.devices.empty()) {
         Note("No wheel, pedals, shifter or button box found.");
         Note("Every DirectInput game controller is listed here (Xbox pads are under Controls).");
         Note("One plugged in later is found within two seconds.");
-        g_detect = {};
+        WheelDetectCancel();
         return;
     }
     for (const input::WheelDevice& d : w.devices) {
@@ -793,7 +785,7 @@ void Wheel(Settings& s) {
     Section("Steering");
     float degrees = w.steer * float(s.wheel_lock) * 0.5f;
     RowMeter("Steering", 0.5f + w.steer * 0.5f, (std::to_string(int(std::lround(degrees))) + " degrees").c_str());
-    BindRow("Steering axis", s.wheel_steer, WheelDetect::Steer, w, "turn the wheel to the right...", bind_help);
+    BindRow("Steering axis", s.wheel_steer, WheelDetect::Steer, "turn the wheel to the right...", bind_help);
     if (RowCheck("Invert steering", &s.wheel_steer.invert)) Save(), input::WheelSetup();
     int range = int(s.wheel_range), lock = int(s.wheel_lock), dz = int(s.wheel_deadzone);
     if (RowSlider("Wheel rotation", &range, 180, 2880, 10, " degrees", "As set in the wheel's software."))
@@ -812,7 +804,7 @@ void Wheel(Settings& s) {
     for (Pedal& r : rows) {
         ImGui::PushID(r.name);
         RowMeter(r.name, r.value, (std::to_string(int(std::lround(r.value * 100))) + "%").c_str());
-        BindRow("Bind##pedal", *r.bind, WheelDetect::Pedal, w, "press the pedal fully...", "Let the pedal rest, press this, then press the pedal all the way.");
+        BindRow("Bind##pedal", *r.bind, WheelDetect::Pedal, "press the pedal fully...", "Let the pedal rest, press this, then press the pedal all the way.");
         ImGui::PopID();
     }
 
@@ -838,7 +830,7 @@ void Wheel(Settings& s) {
     // the d-pad first (a wheel without a hat binds it to buttons), then the buttons
     for (int c = input::kUp; c <= input::kWhite; c++) {
         if (c == input::kLT || c == input::kRT) continue;
-        BindRow(input::ControlLabel(c), s.wheel_buttons[c], WheelDetect::Button, w, "press a button...",
+        BindRow(input::ControlLabel(c), s.wheel_buttons[c], WheelDetect::Button, "press a button...",
                 "The steering device's hat is the d-pad too, with any d-pad buttons bound here.");
     }
 
@@ -848,7 +840,7 @@ void Wheel(Settings& s) {
     };
     for (int i = 0; i < kGears; i++) {
         std::string name = i == 0 ? "Reverse" : "Gear " + std::string(GearName(i));
-        BindRow(name.c_str(), s.wheel_gears[i], WheelDetect::Button, w, "select the gear...");
+        BindRow(name.c_str(), s.wheel_gears[i], WheelDetect::Button, "select the gear...");
     }
     Note(("Shifter " + gear(w.gear_selected) + ", car " + gear(w.gear_game) + ". With a manual gearbox the game's shift up and down are pressed until they match.").c_str());
 
@@ -856,7 +848,7 @@ void Wheel(Settings& s) {
     for (const input::WheelDevice& d : w.devices) {
         Note(d.name.c_str());
         for (int a = 0; a < 8; a++)
-            if (d.axis_mask >> a & 1) RowMeter(kAxisNames[a], (d.axes[a] + 32768) / 65535.0f, std::to_string(d.axes[a]).c_str());
+            if (d.axis_mask >> a & 1) RowMeter(WheelAxisName(a), (d.axes[a] + 32768) / 65535.0f, std::to_string(d.axes[a]).c_str());
         std::string held;
         for (int b : d.pressed) held += (held.empty() ? "" : " ") + std::to_string(b);
         Note(("Buttons held: " + (held.empty() ? std::string("none") : held) + (d.pov >= 0 ? ", hat " + std::to_string(d.pov / 100) : "")).c_str());
@@ -866,6 +858,7 @@ void Wheel(Settings& s) {
 void Controls(Settings& s) {
     if (s.keys.size() != input::kControls || s.pad_map.size() != input::kControls) return;  // sized in Get
     if (RowCheck("Keyboard plays as controller 1", &s.keyboard)) Save();
+    if (RowCheck("Keyboard alone (controllers from 2)", &s.keyboard_alone, "Split screen with the keyboard and mouse: they are controller 1 and the first controller is controller 2. Off: the first controller and the keyboard are both controller 1.")) Save();
     if (RowButton("Default keys")) {
         for (int c = 0; c < input::kControls; c++) s.keys[c] = DefaultKeys(c);
         Save();
@@ -947,39 +940,6 @@ void Controls(Settings& s) {
 
 }  // namespace
 
-std::string WheelBindText(const Settings::WheelBind& b) {
-    if (b.axis < 0 && b.button < 0) return "-";
-    std::string dev = b.device.empty() ? "the wheel" : b.device;
-    if (b.axis >= 0) return dev + ": " + kAxisNames[std::clamp(b.axis, 0, 7)] + " axis";
-    return dev + ": button " + std::to_string(b.button);
-}
-
-void WheelDetectStart(WheelDetect kind, Settings::WheelBind& bind) {
-    std::lock_guard lock(g_detect_lock);
-    g_detect = {.kind = kind, .bind = &bind, .start = input::Wheel().devices};
-    g_detect_taken = false;
-}
-void WheelDetectCancel() {
-    std::lock_guard lock(g_detect_lock);
-    g_detect = {};
-}
-WheelDetect WheelDetecting(const Settings::WheelBind* bind) {
-    std::lock_guard lock(g_detect_lock);
-    return bind && g_detect.bind != bind ? WheelDetect::None : g_detect.kind;
-}
-bool WheelDetectPoll() {
-    std::lock_guard lock(g_detect_lock);
-    if (g_detect.kind == WheelDetect::None) return false;
-    Detect(input::Wheel());
-    const bool taken = g_detect.kind == WheelDetect::None && g_detect_taken;
-    g_detect_taken = false;
-    return taken;
-}
-bool WheelDetectQuiet() {
-    std::lock_guard lock(g_detect_lock);
-    return g_detect.kind != WheelDetect::None || std::chrono::steady_clock::now() < g_quiet_until;
-}
-
 bool OverlayOpen() { return g_open; }
 
 void FeedPad() {
@@ -1053,9 +1013,18 @@ void Achievements() {
     }
 }
 
+namespace {
+std::atomic<bool> g_overlays_hidden{false};
+}
+void HideOverlays(bool hide) { g_overlays_hidden = hide; }
+bool OverlaysHidden() { return g_overlays_hidden; }
+
 void DrawHud(double fps) {
     Scale();
+    if (OverlaysHidden()) return;
     DrawUnlock();
+    DrawBlood();
+    DrawCrosshair();
     DrawHitMarkers();
     ImGuiViewport* vp = ImGui::GetMainViewport();
     if (ScreenshotJustSaved()) {
@@ -1151,7 +1120,7 @@ bool KeyCaptureBusy() {
     if (g_capture) return true;
     const uint16_t held = g_capture_held;
     if (!held) return false;
-    if (GetAsyncKeyState(held) & 0x8000) return true;
+    if (input::KeyDown(held)) return true;
     g_capture_held = 0;
     return false;
 }
@@ -1218,7 +1187,11 @@ struct Page {
 };
 const std::vector<Page>& Pages() {
     static const std::vector<Page> pages = [] {
-        std::vector<Page> p = {{"Display", Display}, {"Graphics", Graphics}, {"Game", [](Settings&) { GameOptions(); }}};
+        std::vector<Page> p = {{"Display", Display}, {"Graphics", Graphics}};
+        // a title whose own settings drive the look has its rows on Graphics (GameInfo::style_from_settings)
+        if (!kGame.style_from_settings)
+            p.push_back({"Graphics Style", [](Settings&) { gpu::DrawStyleSettings(gpu::StyleRendererActive()); }});
+        p.push_back({"Game", [](Settings&) { GameOptions(); }});
         if (!kGame.achievements.empty()) p.push_back({"Achievements", [](Settings&) { Achievements(); }});
         p.push_back({"General", General});
         p.push_back({"Wheel", Wheel});
@@ -1258,12 +1231,12 @@ void DrawOverlay() {
     const std::vector<Page>& pages = Pages();
     static int page = 0;
 
-    bool waiting = g_bind_control >= 0 || g_detect.kind != WheelDetect::None;
+    bool waiting = g_bind_control >= 0 || WheelDetecting() != WheelDetect::None;
     bool popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
     bool back = ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false);
     if (back && waiting) {
         g_bind_control = -1;
-        g_detect = {};
+        WheelDetectCancel();
     }
     bool close = back && !waiting && !popup && !busy;
     busy = waiting || popup;

@@ -215,7 +215,6 @@ const char* kBlitHlsl = R"(
 cbuffer B : register(b1) { float4 uvrect; float4 opts; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
-Texture2D<float> depthimg : register(t3);
 SamplerState ls : register(s0);
 SamplerState ps : register(s1);
 struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
@@ -234,39 +233,24 @@ float4 psmain(O i) : SV_Target {
         for (int x = 0; x < n; x++) c += img.SampleLevel(ls, i.uv + px * ((float2(x, y) + 0.5) / n - 0.5), 0);
     c /= n * n;
     c.rgb *= opts.w;
-    if ((int(opts.x) & 1) != 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
+    if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
     return float4(c.rgb, opts.y > 0 ? c.a : 1);
 }
 // two finished frames mixed: this one (img) at the weight opts.w over the last (t2), gamma after, as one frame's would be
 Texture2D last : register(t2);
 float4 psmix(O i) : SV_Target {
     float4 c = lerp(last.SampleLevel(ls, i.uv, 0), img.SampleLevel(ls, i.uv, 0), opts.w);
-    if ((int(opts.x) & 1) != 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
+    if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
     return float4(c.rgb, 1);
 }
-// the finished frame, the settings' passes in one: opts.y bit 0 is FXAA, bit 1 is sharp scaling, bits 2-4 are style,
-// bits 5-10 bloom, 11-16 vignette and 17-22 grain. opts.z packs sharpness (5 bits), contrast (5), saturation (6)
-// and temperature (6); opts.w holds exposure percent and an 8-bit grain phase. The filter: Catmull-Rom up, area sampling down.
-// Catmull-Rom over source pixels going up; going down, the
+// the finished frame, the settings' passes in one (the plain blit without them): opts.y bit 0 for FXAA, bit 1 for the
+// sharp scaling filter, opts.z the sharpening 0 to 1. The filter: Catmull-Rom over source pixels going up; going down, the
 // output pixel's area (four taps, even at a ratio that is not whole) less a little of its neighbours. FXAA: where the luma of a pixel and its four neighbours differs enough to be an edge, the colour is
 // averaged along the edge's direction, found from the diagonal neighbours. Sharpening, contrast adaptive (as AMD's CAS):
 // the pixel less its neighbours, weighted down where they already span much of the range, so strong edges get no halos;
 // a source pixel or an output pixel apart, whichever is larger, so it still shows on a frame rendered above the screen's
 float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 float3 tap(float2 uv) { return img.SampleLevel(ls, uv, 0).rgb; }
-float3 bright(float2 uv, float exposure) {
-    float3 c = tap(uv) * exposure;
-    return c * smoothstep(0.70, 0.92, luma(c));
-}
-float3 bloom(float2 uv, float2 t, float exposure) {
-    float2 r = t * 4.5;
-    float3 c = bright(uv, exposure) * 4;
-    c += (bright(uv + float2(r.x, 0), exposure) + bright(uv - float2(r.x, 0), exposure) +
-          bright(uv + float2(0, r.y), exposure) + bright(uv - float2(0, r.y), exposure)) * 2;
-    c += bright(uv + r * float2(1, 1), exposure) + bright(uv + r * float2(-1, 1), exposure) +
-         bright(uv + r * float2(1, -1), exposure) + bright(uv + r * float2(-1, -1), exposure);
-    return c / 24;
-}
 float3 scaled(float2 uv, float2 t, float2 px) {
     float2 r = px / t;
     if (abs(r.x - 1) < 0.01 && abs(r.y - 1) < 0.01) return tap(uv);
@@ -322,85 +306,9 @@ float4 psfinal(O i) : SV_Target {
     int mode = (int)opts.y;
     float3 c = (mode & 2) != 0 ? scaled(i.uv, t, fwidth(i.uv)) : tap(i.uv);
     if ((mode & 1) != 0) c = fxaa(c, i.uv, t);
-    int adjustment = (int)opts.z;
-    int sharp_q = adjustment & 31;
-    if (sharp_q > 0) c = sharpen(c, i.uv, px, float(sharp_q) / 20.0);
-    float exposure = floor(opts.w) / 100.0;
-    c *= exposure;
-    int bloom_strength = (mode >> 5) & 63;
-    if (bloom_strength > 0) {
-        float3 glow = (int(opts.x) & 2) != 0 ? last.SampleLevel(ls, i.uv, 0).rgb : bloom(i.uv, t, exposure);
-        c = saturate(c + glow * (float(bloom_strength) * 0.005));
-    }
-    int vignette_strength = (mode >> 11) & 63;
-    if (vignette_strength > 0) {
-        float2 centred = float2((i.uv.x - 0.5) * size.x / size.y, i.uv.y - 0.5);
-        float edge = smoothstep(0.22, 0.95, dot(centred, centred));
-        c *= 1 - edge * (float(vignette_strength) / 63) * 0.7;
-    }
-    int grain_strength = (mode >> 17) & 63;
-    if (grain_strength > 0) {
-        int seed = (int(frac(opts.w) * 256.0)) & 255;
-        float2 pixel = floor(i.uv * size) + float(seed) * float2(17, 31);
-        float noise = frac(sin(dot(pixel, float2(12.9898, 78.233))) * 43758.5453) - 0.5;
-        c = saturate(c + noise * (float(grain_strength) / 63) * 0.035);
-    }
-    int contrast_q = (adjustment >> 5) & 31;
-    float contrast = 0.5 + float(contrast_q) * 0.05;
-    c = saturate((c - 0.5) * contrast + 0.5);
-    int saturation_q = (adjustment >> 10) & 63;
-    float saturation = float(saturation_q) * 0.05;
-    float grey = luma(c);
-    c = saturate(lerp(grey.xxx, c, saturation));
-    int temperature_q = (adjustment >> 16) & 63;
-    float temperature = (float(temperature_q) - 20.0) / 20.0;
-    c.r = saturate(c.r + temperature * 0.04);
-    c.b = saturate(c.b - temperature * 0.04);
-    int style = (mode >> 2) & 7;
-    if (style == 1) {
-        c = saturate((c - 0.5) * 1.12 + 0.5);
-        float grey = luma(c);
-        c = saturate(lerp(grey.xxx, c, 1.1));
-    } else if (style == 2) {
-        float y = luma(c);
-        float edge = max(
-            max(abs(y - luma(tap(i.uv + float2(t.x, 0)))), abs(y - luma(tap(i.uv - float2(t.x, 0))))),
-            max(abs(y - luma(tap(i.uv + float2(0, t.y)))), abs(y - luma(tap(i.uv - float2(0, t.y))))));
-        if ((mode & 0x800000) != 0) {
-            float2 ds;
-            depthimg.GetDimensions(ds.x, ds.y);
-            float2 dp = 1 / ds;
-            float z = depthimg.SampleLevel(ps, i.uv, 0);
-            float zL = depthimg.SampleLevel(ps, i.uv - float2(dp.x, 0), 0);
-            float zR = depthimg.SampleLevel(ps, i.uv + float2(dp.x, 0), 0);
-            float zU = depthimg.SampleLevel(ps, i.uv - float2(0, dp.y), 0);
-            float zD = depthimg.SampleLevel(ps, i.uv + float2(0, dp.y), 0);
-            float dz = max(max(abs(z - zR), abs(z - zL)), max(abs(z - zD), abs(z - zU)));
-            edge = max(edge, saturate((dz - max(0.001, z * 0.004)) * 80));
-            // Compare depth-derived slopes on either side: creases can be visible even when the depth step is small.
-            float zsafe = max(abs(z), 1e-4);
-            float sxL = (z - zL) / zsafe, sxR = (zR - z) / zsafe;
-            float syU = (z - zU) / zsafe, syD = (zD - z) / zsafe;
-            float nx = 1 - dot(normalize(float2(1, sxL)), normalize(float2(1, sxR)));
-            float ny = 1 - dot(normalize(float2(1, syU)), normalize(float2(1, syD)));
-            edge = max(edge, saturate((max(nx, ny) - 0.002) * 24));
-        }
-        float bands = floor(saturate(y) * 5) / 4;
-        c = saturate(c * (bands / max(y, 0.05)));
-        c = lerp(c, float3(0.025, 0.03, 0.04), saturate((edge - 0.08) * 10) * 0.85);
-    } else if (style == 3) {
-        float3 levels = float3(5, 6, 5);
-        float dither = frac(dot(floor(i.uv * size), float2(0.06711056, 0.00583715)) * 52.9829189) - 0.5;
-        c = floor(saturate(c * float3(1.05, 1.0, 0.88)) * levels + 0.5 + dither) / levels;
-    } else if (style == 4) {
-        float y = luma(c);
-        float red = saturate((c.r - max(c.g, c.b) * 0.65 - 0.04) * 4);
-        float3 mono = y.xxx;
-        float3 noir = lerp(mono, float3(y * 0.32, y * 0.015, y * 0.02), smoothstep(0.12, 0.48, y));
-        c = lerp(noir, float3(y, y * 0.025, y * 0.015), red * 0.85);
-    }
-
-    if ((int(opts.x) & 1) != 0) c = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
+    if (opts.z > 0) c = sharpen(c, i.uv, px, opts.z);
+    c *= opts.w;
+    if (opts.x > 0) c = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
     return float4(c, 1);
 }
 )";

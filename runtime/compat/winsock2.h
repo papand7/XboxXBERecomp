@@ -1,5 +1,6 @@
 #pragma once
-// harness only: Winsock names on POSIX sockets
+// off Windows (the headless harness, the Linux build): Winsock names on POSIX sockets. This folder is on the include
+// path only off Windows, so <winsock2.h> finds this there and Windows' own on Windows.
 #include <arpa/inet.h>
 #include <cerrno>
 #include <fcntl.h>

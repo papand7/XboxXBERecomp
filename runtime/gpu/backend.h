@@ -47,6 +47,8 @@ public:
     virtual void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects_va,
                       uint32_t dst_points_va) = 0;
     virtual void Present(const Surface& front) = 0;
+    // after a present (app::Pace): a frame of the renderer's own half way to the next (smooth turning), or nothing
+    virtual void MidFrame() {}
     // the CPU is about to touch this resource's memory: write GPU results back first
     virtual void Sync(uint32_t data_va, uint32_t size) = 0;
     // a lock that does not wait for the GPU (NOOVERWRITE): a result a frame or two old is what the console gives too
@@ -85,8 +87,12 @@ private:
 };
 
 std::unique_ptr<Backend> CreateBackend();
-// The Vulkan renderer is the only host graphics backend.
+// Windows: the Direct3D 11 renderer, which CreateBackend returns when the settings ask for it
+std::unique_ptr<Backend> CreateD3D11Backend();
+// Windows: the Vulkan renderer (renderer = "vulkan"), optional: it falls back to Direct3D 12 when it cannot start
 std::unique_ptr<Backend> CreateVulkanBackend();
+// another renderer to try when the first one's Init fails (Direct3D 11 after 12, 12 after Vulkan), null when there is none
+std::unique_ptr<Backend> CreateFallbackBackend();
 // the same backend driven from a thread of its own: calls return once recorded
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner);
 // in-between frames for a title drawing one frame a step (GameInfo::step_interpolation)

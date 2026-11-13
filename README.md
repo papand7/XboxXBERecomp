@@ -36,7 +36,7 @@ The template also carries what a game repository needs beyond the build: `script
 scripts in `sdk/scripts`, the game's values in `scripts/game.env`: harness, smoke and soak tests, system link test,
 Windows syntax check, shader check, Ghidra helpers), `launcher/` and `launcher.bat` (the player's launcher, see
 `launcher/README.md`), `.github/workflows/release.yml` (builds the launcher and publishes a release on a tag `v*`),
-and CLAUDE.md, PROGRESS.md and FINDINGS.md to start from.
+and PROGRESS.md and FINDINGS.md to start from.
 
 A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles whose configs are complete: `xbe_symbols --sign config/a.toml [config/b.toml] --out sdk/xdk/<build>/signatures.toml`. Signatures are lengths and hashes of the functions with addresses masked, never library code.
 

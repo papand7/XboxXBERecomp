@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -51,6 +52,10 @@ struct Settings {
     uint32_t render_percent = 100;   // of the output height
     uint32_t fps_cap = 60;           // 0: only the title's present interval
     bool vsync = true;
+    // HDR output (the Vulkan renderer, on a screen in Windows' HDR mode): the picture at Windows' SDR white, the 3D
+    // scene's highlights raised toward the peak; nits, 0 the screen's own (Windows' "SDR content brightness", DXGI's peak)
+    bool hdr = false;
+    uint32_t hdr_peak = 0, hdr_paper = 0;
     uint32_t aniso = 0;              // 0 as the game asks
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
     // LAN play in lockstep (core/netplay.h; XBE_NETPLAY first): "" off, "host", "join" (join_ip) or an address
@@ -67,9 +72,15 @@ struct Settings {
     std::vector<uint8_t> pad_map;    // empty: each input drives itself
     std::vector<std::array<uint16_t, 2>> keys;  // empty: the default keys
     bool keyboard = true;
+    // the keyboard and mouse are controller 1 alone, the controllers 2 to 4 (split screen with one controller and the
+    // keyboard); else the first controller is controller 1 with them
+    bool keyboard_alone = false;
     // the mouse moves controller 1's right stick, for a title that offers it (GameInfo::mouse_look): the cursor is
     // held in the window while the game has it
     bool mouse_look = true;
+    // the on-screen touch controls on a touch screen (Windows; Android always has them): a finger on the screen plays
+    // controller 1, see app/touch.cpp
+    bool touch_controls = false;
     uint32_t mouse_sensitivity = 100;  // percent
     bool mouse_invert_y = false;
     uint32_t monitor = 0;            // 0 the primary display, n the nth display Windows lists
@@ -82,12 +93,17 @@ struct Settings {
     uint32_t screenshot_key = 0x7B;  // the Windows key that saves a screenshot (F12)
     bool perf_overlay = false;       // a corner panel: frames a second, frame time and its graph, the render size
     bool hide_2d = false;            // a game's photo mode: every 2D draw (HUD, menus) is left out; never saved
+    // aim-down-sights tuning, millimetres (settings.toml): + x moves the gun left, + y up
+    int aim_sight_x_mm = 0, aim_sight_y_mm = 0;
+    bool damage_numbers = false;     // the damage a hit did, a number floating up from the mark
+    uint32_t hit_feedback = 2;       // a player's shot hitting (HitMarker): 0 nothing, 1 a mark, 2 a mark and a tick
     bool sharp_2d = true;            // GameInfo::sharpen_2d: the HUD's, menus' and text's pictures enlarged sharp
+    uint32_t menu_colors = 0;        // the title's menus recoloured (its own texture_bound): 0 as drawn, 1 blue and silver
     uint32_t msaa = 0;               // 0 none, 1 2 3 MSAA 2x 4x 8x on the scene
     bool fxaa = false;               // FXAA on the finished frame
     bool smaa = false;               // SMAA on the finished frame, in place of FXAA
     bool temporal_aa = false;        // jittered Vulkan temporal antialiasing; weapon/UI can ghost
-    // temporal upscaler (Vulkan, gpu/upscale_fsr.h): 0 off, 1 AMD FSR 2. The 3D scene drawn smaller by the quality's
+    // temporal upscaler (Vulkan, gpu/upscale.h): 0 off, 1 AMD FSR 2. The 3D scene drawn smaller by the quality's
     // ratio (0 Quality 1.5x, 1 Balanced 1.7x, 2 Performance 2x, 3 Ultra Performance 3x), jittered, and rebuilt at the
     // target's size with the frames before (camera motion from the depth) before the HUD; temporal_aa and SMAA are
     // left out meanwhile
@@ -102,10 +118,10 @@ struct Settings {
     bool dump_textures = false;     // dump originals to mods/textures/dump
     bool low_latency = false;        // a waitable swap chain holding one frame, at the next start
     uint32_t sharpen = 0;            // percent, contrast adaptive sharpening of the finished frame
-    uint32_t hit_feedback = 2;       // a player's shot hitting (HitMarker): 0 nothing, 1 a mark, 2 a mark and a tick
-    bool damage_numbers = false;     // the damage a hit did, a number floating up from the mark
     int32_t fx[kFxMax] = {};         // the FxId settings; FxDefaults() fills them at the first Load
     int32_t FxOf(int id) const { return fx[id]; }
+    // the picture's look as settings of their own (Agent Under Fire's menus): with GameInfo::style_from_settings they
+    // are handed to the Vulkan renderer's gpu::GraphicsStyle (app/style_settings.cpp); otherwise graphics.toml holds it
     uint32_t color_style = 0;        // 0 original, 1 Enhanced Color, 2 Toon Screen, 3 Retro, 4 Noir
     uint32_t bloom = 0;              // percent, screen-space glow around bright pixels
     uint32_t light_shafts = 0;       // screen-space rays from bright scene regions; Vulkan only
@@ -126,7 +142,7 @@ struct Settings {
     uint32_t contrast = 100;         // screen contrast in percent
     uint32_t saturation = 100;       // colour saturation in percent
     int32_t temperature = 0;         // colour temperature, -100 cool to 100 warm
-    uint32_t renderer = 0;           // Vulkan, at the next start
+    uint32_t renderer = 0;           // 0 Direct3D 12, 1 Direct3D 11, 2 Vulkan, at the next start
     uint32_t language = 1;           // the console's language (XC_LANGUAGE, GameInfo::languages), at the next start
     // a steering wheel and its kit (core/wheel.cpp), playing as controller 1: each control on any DirectInput device,
     // named by the device (and its instance, telling two of the same apart), then an axis (0-7: X Y Z Rx Ry Rz,
@@ -148,11 +164,33 @@ struct Settings {
     std::vector<WheelBind> wheel_gears;    // an H-pattern shifter's positions: R, 1 to 7 (kGears)
     uint32_t ffb_strength = 70;      // force feedback overall, percent, 0 off
     uint32_t ffb_road = 50;          // the game's rumble (kerbs, impacts) felt in the wheel, percent
+    bool hurt_effects = true;  // the red pulse at low health (app/blood.cpp SetHealth)
+    // 3D sound (xdk/dsound.cpp): the game's 3D voices panned by their direction, duller behind, muffled through walls,
+    // and a room's reverb, as the title reports them (audio::SetRoom, SetOcclusion); off: the plain mix
+    bool audio_3d = true;
+    // the crosshair (app/crosshair.cpp): 0 the game's own, 1 dot, 2 cross, 3 ring, 4 cross and dot; colour as RGBA
+    // (IM_COL32 layout, red in the low byte), size and gap in pixels at 1080 lines, thickness too
+    uint32_t crosshair_style = 0;
+    uint32_t crosshair_color = 0xFFFFFFFFu;
+    uint32_t crosshair_size = 10, crosshair_gap = 4;
+    uint32_t crosshair_thickness = 2;
 };
 // the wheel buttons of a Logitech G920/G923 (Xbox) for each input::Control, -1 none
 int8_t DefaultWheelButton(int c);
 constexpr int kGears = 8;  // an H-pattern shifter's positions: R, 1 to 7
 const char* GearName(int g);  // "R", "1" ... "7"
+// a wheel control bound by moving or pressing it on any device (core/wheel.cpp; the settings window's Wheel tab and a
+// title's own menus): every device's state is kept as it begins, then the first axis moved far enough (the steering a
+// little, a pedal most of its travel) or button newly pressed becomes the binding, saved at once (Save, then
+// input::WheelSetup). One at a time, any thread. While it waits the rig reaches no controller, nor until the button
+// taken is let go (it would press the menu's own buttons)
+enum class WheelDetect { None, Steer, Pedal, Button };
+void WheelDetectStart(WheelDetect kind, Settings::WheelBind& bind);
+void WheelDetectCancel();
+WheelDetect WheelDetecting(const Settings::WheelBind* bind = nullptr);  // what waits (for that binding), None nothing
+bool WheelDetectPoll();  // each frame while one waits: true when the binding was taken
+const char* WheelAxisName(int axis);                       // "X", "Y", "Z", "Rx", "Ry", "Rz", "Slider 1", "Slider 2"
+std::string WheelBindText(const Settings::WheelBind& b);  // "the wheel: X axis", "G27 Pedals: button 3", "-" unbound
 // the default keys for input::Control c
 std::array<uint16_t, 2> DefaultKeys(int c);
 std::string KeyToName(uint16_t vk);  // settings file names of Windows virtual keys
@@ -165,24 +203,14 @@ void OverlayInit();  // the fonts, after ImGui's context and before a renderer's
 // a key pressed while the overlay waits for one to bind (window thread); true takes it
 bool OverlayKey(uint16_t vk);
 // a title's own key binding (its menus, any thread): the next key or mouse button pressed is taken for it, and the
-// keyboard reaches no controller while it waits, nor until that key is let go
+// keyboard and mouse reach neither the controllers nor the menu pointer while it waits, nor until that key is let go
 void BeginKeyCapture();
 void EndKeyCapture();
 bool KeyCaptureWaiting();             // begun, no key taken yet
 bool TakeCapturedKey(uint16_t& vk);  // the key taken (VK_ESCAPE: the player cleared it), once
 bool KeyCaptureBusy();                // waiting, or the key taken still held
 bool CaptureKey(uint16_t vk);         // window thread, a new press (not a repeat): true when the capture takes it
-// a wheel control bound by moving or pressing it on any device (a title's own menus, as the settings window's Wheel tab
-// does): every device's state is kept as it begins, then the first axis moved far enough (the steering a little, a pedal
-// most of its travel) or button newly pressed becomes the binding, saved at once. One at a time. While it waits, and
-// for half a second after, the rig reaches no controller (its button would press the menu's own)
-enum class WheelDetect { None, Steer, Pedal, Button };
-void WheelDetectStart(WheelDetect kind, Settings::WheelBind& bind);
-void WheelDetectCancel();
-WheelDetect WheelDetecting(const Settings::WheelBind* bind = nullptr);  // what waits (for that binding), None nothing
-bool WheelDetectPoll();   // each frame while one waits: true when the binding was taken
-bool WheelDetectQuiet();  // waiting, or just taken: input::WheelRead gives nothing
-std::string WheelBindText(const Settings::WheelBind& b);  // "the wheel: X axis", "G27 Pedals: button 3", "-" unbound
+bool WheelDetectQuiet();  // a wheel binding waiting, or just taken: input::WheelRead gives nothing (WheelDetectStart)
 
 // the Vulkan device has ray queries and acceleration structures (set when the device is made): ray tracing settings show only then
 inline std::atomic<bool> ray_query_ok{false};
@@ -206,16 +234,29 @@ bool TakeScreenshotRequest();
 void SaveScreenshot(std::vector<uint8_t> bgra, uint32_t w, uint32_t h);
 bool ScreenshotJustSaved();  // for a few seconds after one is written
 void DrawHud(double fps);         // the frame counter, inside the ImGui frame (overlay.cpp)
+// the runtime's own drawing over the frame (the frame counter, hit markers, blood, unlock pop-ups) left out while
+// hidden: a title's photo mode (any thread)
+void HideOverlays(bool hide);
+bool OverlaysHidden();
+// Discord Rich Presence (discord.cpp): what the player is doing, on their Discord profile while Discord runs on this
+// PC (its local IPC, a background thread; nothing without Discord, Settings::discord off or no discord_app_id).
+// details the first line ("Playing The Exchange"), state the second (may be empty), start the Unix time the elapsed
+// time counts from (0 none). Any thread; sent when it changes
+void SetPresence(const std::string& details, const std::string& state, int64_t start);
 // hit feedback (hit_marker.cpp): a game's hook when a local player's shot hits a character, at that player's
 // crosshair (x, y the shown frame's fractions); kind 0 a hit, 1 the head, 2 a kill
 void HitMarker(float x, float y, int kind, float damage = 0);  // damage > 0: a number shows (damage_numbers)
-// Discord Rich Presence (discord.cpp): what the player is doing, on their Discord profile while Discord runs on this
-// PC (its local IPC, a background thread; nothing without Discord, Settings::discord off or no discord_app_id).
-// details the first line ("Playing Cold Reception"), state the second (may be empty), start the Unix time the elapsed
-// time counts from (0 none). Any thread; sent when it changes
-void SetPresence(const std::string& details, const std::string& state, int64_t start);
 void DrawHitMarkers();                          // inside the ImGui frame, from DrawHud
 void MixHitSound(float* out, uint32_t frames);  // the ticks into the mixer's stereo output
+// blood (gpu::GraphicsStyle::blood, blood.cpp): a game's hooks, a spray where a player's shot hit a character (x, y
+// the shown frame's fractions, strength 0 to 1), and a player's view (its corners, the same) hit, by how much (0 to 1)
+void BloodSpray(float x, float y, float strength);
+void BloodHurt(float x0, float y0, float x1, float y1, float amount);
+// Low health (Settings::hurt_effects): the player's health as a fraction (1 full, 0 none), set each frame by the game;
+// under a third the view's edges go red and pulse, faster the lower it is (drawn over the picture, every renderer)
+void SetHealth(float fraction);
+void DrawCrosshair();  // the custom crosshair, if one is set (app/crosshair.cpp)
+void DrawBlood();                               // inside the ImGui frame, from DrawHud
 void FeedPad();                   // controllers to the settings window's navigation, before each ImGui frame
 Mode Output();
 float RenderScale(uint32_t guest_height);
@@ -227,6 +268,10 @@ bool Widescreen();
 float FrameAspect();
 // the shape the title's 2D is laid out for in the mode the console reports: GameInfo::hud_aspect, 4:3 on a 4:3 TV
 float HudAspect();
+// the cursor in the title's 2D layout (0 to 1 across its width and height as GameInfo::hud_aspect lays it out, the
+// shown frame's letterbox and ultrawide squeeze taken out); false when it is outside the window
+bool FramePoint(float& u, float& v);
+void SetFramePointOverride(float u, float v);  // XBE_PAD_CMD's PTR: a pointer of the test's in its place
 
 std::filesystem::path ExeDir();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
@@ -246,7 +291,34 @@ bool PrepareGameCode(const GameFiles& game);
 // done> <bytes>", then "ready" or "failed <why>"), for --prepare-code; the process's exit code
 int PrepareGameCodeHeadless(const GameFiles& game);
 int Instance();  // --instance N on the command line, 0 without: a second copy on this PC for system link tests
-void* Window();  // HWND
+void* Window();  // HWND (off Windows the SDL_Window*)
+// on-screen touch controls (app/touch.cpp): Android's, Windows' with the touch_controls setting, else XBE_TOUCH=1
+bool TouchEvent(const void* sdl_event);         // window thread, each event first; true: taken (fingers, Android's back)
+// a Windows touch point (WM_POINTER*): kind 0 down, 1 moved, 2 up, 3 cancelled; x, y in client pixels
+void TouchPoint(uint32_t id, int kind, float x, float y);
+bool TouchRead(float* out);  // input::kControls entries: controller 1's inputs from the screen, 0 to 1 each; false while hidden
+bool TouchControlsShown();
+void DrawTouch();                               // inside the ImGui frame, UiLock held
+#ifndef _WIN32
+// off Windows (app/main_sdl.cpp, SDL3): the Vulkan renderer's way into the window, and the displays
+std::vector<const char*> VulkanInstanceExtensions();  // the instance extensions the window's surface needs
+bool CreateVulkanSurface(void* instance, void* surface);  // a VkInstance, a VkSurfaceKHR* to fill; false logged
+void* VulkanGetInstanceProcAddr();  // the loader SDL opened for the window: a PFN_vkGetInstanceProcAddr
+void WindowPixels(uint32_t& width, uint32_t& height);  // the window's drawable size in pixels (GetClientRect's)
+// Android: the app is in the background, its window's surface gone (nothing is presented), and a count of the
+// surfaces the window has had (a new one after each return: the renderer makes its Vulkan surface again); elsewhere
+// false and 0
+bool Backgrounded();
+uint32_t SurfaceGeneration();
+std::vector<Mode> DisplayModes();  // the monitor setting's display's fullscreen sizes, widest first, each once
+std::string Utf8(const wchar_t* w);  // a wide string (kGame's, UTF-32 here) as UTF-8
+// a message box over the game window (SDL's); yes_no: Yes and No buttons, true for Yes, else OK and true
+bool MessageBox(const wchar_t* text, bool error, bool yes_no = false);
+#ifdef __ANDROID__
+// Android: the other image's library started in a new process of the app (kernel::Relaunch's exec), this one ends
+[[noreturn]] void AndroidRelaunch(const char* exe);
+#endif
+#endif
 // leave the game as closing its window does (the settings window's Quit, a title's own quit item); from any thread
 void Quit();
 // boot splash: GameInfo::splash .bmp or .png beside the exe, up before the game window
@@ -261,6 +333,16 @@ void FinishHandover();  // any thread but the window thread's: opens the game wi
 
 // held around ImGui: the window thread's messages and the renderer's frame
 std::recursive_mutex& UiLock();
+
+// an on-screen touch button (app/touch.cpp): the console control it holds, its label (another in the title's menus,
+// GameInfo::menu_up), its centre in screen heights from the right edge (from the left edge when negative) and from the
+// bottom, and its radius
+struct TouchButton {
+    int control;  // input::Control
+    const char* label;
+    const char* menu_label;
+    float x, y, r;
+};
 
 // what the game repo defines once
 struct Option {  // a setting in the settings file, flag or value
@@ -385,18 +467,43 @@ struct GameInfo {
     // a fixed-function stage with no texture reads (0,0,0,0) as its texture, as the hardware's stage with texture mode NONE
     // does, not white: True Crime clears its shadow map's border with untextured lines that select the texture
     bool unbound_texture_zero = false;
+    // a menu of the title's is up: the mouse is a pointer there (the cursor shown and free, not mouse look)
+    bool (*menu_up)() = nullptr;
+    // the pointer's picture in the menus: size x size premultiplied B8G8R8A8 pixels for a cursor that many pixels
+    // high, and its hot spot; none, the system's arrow
+    void (*menu_cursor)(int size, std::vector<uint32_t>& bgra, int& hot_x, int& hot_y) = nullptr;
+    // Vulkan always (Settings::renderer held at 2, the settings window's Renderer choice not shown): a title whose
+    // look is Vulkan's. Direct3D 12 still starts in its place on a PC where Vulkan cannot
+    bool vulkan_only = false;
+    // the picture's look from the settings' own fields (Settings::fx, color_style, bloom ... : a title whose menus set
+    // them, Agent Under Fire) handed to gpu::Style() at load and each save, in place of graphics.toml's
+    bool style_from_settings = false;
+    // the gun and hands (drawn after a mid-frame depth clear) left out of the ray traced occlusion, as the sky: a title
+    // whose first-person model the traced scene does not match (Agent Under Fire's darkened in patches)
+    bool rt_gun_left_out = false;
     // F1 (and a controller's Back + Start) open the settings window; off for a title whose own menus hold every setting
     bool settings_window = true;
+    // smooth turning (GraphicsStyle::smooth_turn): how far the view will turn by the mouse the title has not read yet,
+    // radians (yaw right, pitch up), and the tangent of half its vertical field of view; false when it does not
+    // (menus, cutscenes, a controller)
+    bool (*view_turn)(float& yaw, float& pitch, float& tan_half_fov) = nullptr;
+    // the on-screen touch buttons (Android); none, the console's face buttons, triggers, Start and Back
+    std::vector<TouchButton> touch_buttons = {};
 };
 extern const GameInfo kGame;
 
 // sleeps out the rest of the frame: the title's present interval (vertical blanks a frame at 60 Hz, 0 unpaced)
 // within the fps cap
 void Pace(uint32_t vblanks = 1);
+// called by Pace after each present: the renderer's in-between frame (smooth turning), drawn half way to the next
+void SetMidFrame(void (*fn)());
 // frames a second for a title asking for vblanks within cap (0 unlimited); 0 unpaced
 // the display rate a present interval counts in: the console's 60, a title drawing faster sets more (its cap still applies)
 inline std::atomic<uint32_t> g_pace_hz{60};
 inline uint32_t PaceRate(uint32_t cap, uint32_t vblanks) {
+    // NF_UNCAPPED=1 (diagnostic): no pacing, so the frame's real work time shows (the 10 s average, from Pace)
+    static const bool uncapped = [] { const char* e = std::getenv("NF_UNCAPPED"); return e && *e == '1'; }();
+    if (uncapped) return 0;
     if (!vblanks) return cap;
     uint32_t fps = g_pace_hz.load(std::memory_order_relaxed) / vblanks;
     return cap && cap < fps ? cap : fps;

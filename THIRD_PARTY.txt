@@ -135,6 +135,34 @@ NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 
+SMAA (https://github.com/iryoku/smaa, commit 71c806a8)
+
+Copyright (C) 2013 Jorge Jimenez (jorge@iryoku.com)
+Copyright (C) 2013 Jose I. Echevarria (joseignacioechevarria@gmail.com)
+Copyright (C) 2013 Belen Masia (bmasia@unizar.es)
+Copyright (C) 2013 Fernando Navarro (fernandn@microsoft.com)
+Copyright (C) 2013 Diego Gutierrez (diegog@unizar.es)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software. As clarification, there is no
+requirement that the copyright notice and permission be included in binary
+distributions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
 AMD FidelityFX Super Resolution 2 (https://github.com/GPUOpen-Effects/FidelityFX-FSR2, v2.2.1)
 (its shaders compiled at build time by glslang, which is not part of the executable)
 
@@ -156,6 +184,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
 
 Real-ESRGAN models (https://github.com/xinntao/Real-ESRGAN), in tools/realesrgan/models
 
@@ -333,3 +362,13 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 vcomp140.dll: Microsoft Visual C++ OpenMP runtime, redistributed with realesrgan-ncnn-vulkan under the Visual Studio redistribution terms.
 
 
+NVIDIA DLSS Super Resolution / NGX SDK v310.9.16 (https://github.com/NVIDIA/DLSS): nvngx_dlss.dll beside the game's
+executables and the NGX loader library linked into them (when built with XBE_DLSS, the default)
+
+Copyright (c) NVIDIA Corporation. All rights reserved. Used and redistributed in object code form under the NVIDIA
+RTX SDKs License (v. March 14, 2024; https://github.com/NVIDIA/DLSS/blob/v310.9.16/LICENSE.txt), which is not an open
+source licence and is not changed by this project's MIT licence. The NVIDIA software is provided AS IS, without
+warranty of any kind. You may not reverse engineer, decompile or disassemble it, remove its notices, circumvent any of
+its technical limits, distribute it on its own, or use it in any way that would subject it to an open source licence.
+It is for use on systems with NVIDIA GPUs. NVIDIA may update it over the air through its driver. NVIDIA, RTX and DLSS
+are trademarks of NVIDIA Corporation; this project is not sponsored or endorsed by NVIDIA.

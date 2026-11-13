@@ -1,5 +1,6 @@
 #pragma once
-// Unpacking the toolchain's archives: .zip (and .vsix, a zip) with miniz, .tar.xz with xz-embedded, streamed
+// Unpacking the toolchain's archives: .zip (and .vsix, a zip) with miniz, .tar.xz with xz-embedded, .tar.gz with
+// miniz's inflate, streamed. Off Windows a file keeps its archive's execute bits (the tools' programs)
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -16,6 +17,8 @@ using Progress = std::function<void(uint64_t done, uint64_t total)>;
 bool Unzip(const std::filesystem::path& zip, const std::filesystem::path& dest, const EntryFilter& filter,
            const Progress& progress, const std::atomic<bool>* cancel, std::string& error);
 bool UntarXz(const std::filesystem::path& file, const std::filesystem::path& dest, const EntryFilter& filter,
+             const Progress& progress, const std::atomic<bool>* cancel, std::string& error);
+bool UntarGz(const std::filesystem::path& file, const std::filesystem::path& dest, const EntryFilter& filter,
              const Progress& progress, const std::atomic<bool>* cancel, std::string& error);
 
 // "a/b/c" without its first n components, empty when it has no more

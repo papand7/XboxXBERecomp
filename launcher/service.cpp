@@ -111,7 +111,7 @@ struct Service {
                   {"job", job_name},
                   {"update", bool(update)},
                   {"agreed", !*kLicenseUrl || fs::exists(root / "agreed.txt", ec)},
-                  {"os", "windows"},  // this launcher builds on Windows only
+                  {"os", platform->Os()},
                   {"license_url", kLicenseUrl},
                   {"free_bytes", FreeBytes(root)},
                   {"build_bytes", builder->BuildFilesBytes()},

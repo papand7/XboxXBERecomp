@@ -1,24 +1,18 @@
-// F12: the frame as shown, without the settings window, as a PNG in the screenshots folder beside the exe. The renderer
-// reads its back buffer before it draws the interface; the encoding runs on a thread of its own, so a frame loses
-// only the read.
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
-#include <objbase.h>
-#include <wincodec.h>
-#include <wrl/client.h>
-
+// F12: the frame as a PNG in the screenshots folder beside the exe. The Vulkan renderer writes the frame as shown
+// (gpu::RequestScreenshot, frame_info.cpp); the Direct3D ones read their back buffer before they draw the interface
+// and hand it here (SaveScreenshot), encoded on a thread of its own, so a frame loses only the read.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
+#include <string>
 #include <thread>
 
 #include "app/app.h"
+#include "app/image.h"
 #include "core/log.h"
-
-using Microsoft::WRL::ComPtr;
+#include "gpu/style.h"
 
 namespace app {
 
@@ -26,56 +20,69 @@ namespace {
 
 std::atomic<bool> g_requested{false};
 std::atomic<int64_t> g_saved_ms{0};  // when the last one was written
+uint32_t g_vulkan_shots = 0;         // gpu::ScreenshotResult's count when the last F12 asked the Vulkan renderer
 
 int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-bool WritePng(const std::filesystem::path& path, const std::vector<uint8_t>& bgra, uint32_t w, uint32_t h) {
-    ComPtr<IWICImagingFactory> wic;
-    ComPtr<IWICStream> stream;
-    ComPtr<IWICBitmapEncoder> encoder;
-    ComPtr<IWICBitmapFrameEncode> frame;
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
-    if (SUCCEEDED(hr)) hr = wic->CreateStream(&stream);
-    if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
-    if (SUCCEEDED(hr)) hr = wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
-    if (SUCCEEDED(hr)) hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
-    if (SUCCEEDED(hr)) hr = encoder->CreateNewFrame(&frame, nullptr);
-    if (SUCCEEDED(hr)) hr = frame->Initialize(nullptr);
-    if (SUCCEEDED(hr)) hr = frame->SetSize(w, h);
-    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
-    if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
-    if (SUCCEEDED(hr) && format != GUID_WICPixelFormat32bppBGRA) hr = E_FAIL;
-    if (SUCCEEDED(hr)) hr = frame->WritePixels(h, w * 4, UINT(bgra.size()), const_cast<BYTE*>(bgra.data()));
-    if (SUCCEEDED(hr)) hr = frame->Commit();
-    if (SUCCEEDED(hr)) hr = encoder->Commit();
-    if (FAILED(hr)) LOGR("screenshot: could not write %s (%08X)", reinterpret_cast<const char*>(path.filename().u8string().c_str()), unsigned(hr));
-    return SUCCEEDED(hr);
+// screenshots/<title> <date> <time>.png
+std::filesystem::path NextPath() {
+    std::time_t now = std::time(nullptr);
+    std::tm t{};
+#ifdef _WIN32
+    localtime_s(&t, &now);
+#else
+    localtime_r(&now, &t);
+#endif
+    char stamp[32];
+    std::strftime(stamp, sizeof stamp, "%Y-%m-%d %H-%M-%S", &t);
+    std::wstring name;
+    for (const wchar_t* c = kGame.short_title; c && *c; c++) name += *c;
+    name += L' ';
+    for (const char* c = stamp; *c; c++) name += wchar_t(*c);
+    std::filesystem::path dir = ExeDir() / "screenshots";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir / (name + L".png");
 }
 
 }  // namespace
 
-void RequestScreenshot() { g_requested = true; }
+void RequestScreenshot() {
+    if (gpu::StyleRendererActive()) {
+        // the Vulkan renderer writes it at its next present (the picture as shown)
+        std::wstring path;
+        bool ok = false;
+        g_vulkan_shots = gpu::ScreenshotResult(path, ok);
+        gpu::RequestScreenshot(NextPath().wstring());
+        return;
+    }
+    g_requested = true;
+}
 bool TakeScreenshotRequest() { return g_requested.exchange(false); }
-bool ScreenshotJustSaved() { return NowMs() - g_saved_ms.load() < 3000 && g_saved_ms.load(); }
+bool ScreenshotJustSaved() {
+    std::wstring path;
+    bool ok = false;
+    if (uint32_t n = gpu::ScreenshotResult(path, ok); n != g_vulkan_shots) {
+        g_vulkan_shots = n;
+        if (ok) g_saved_ms = NowMs();
+    }
+    return NowMs() - g_saved_ms.load() < 3000 && g_saved_ms.load();
+}
 
 void SaveScreenshot(std::vector<uint8_t> bgra, uint32_t w, uint32_t h) {
-    for (size_t i = 3; i < bgra.size(); i += 4) bgra[i] = 255;  // a back buffer's alpha means nothing
-    SYSTEMTIME t;
-    GetLocalTime(&t);
-    wchar_t name[64];
-    swprintf(name, 64, L"%ls %04u-%02u-%02u %02u-%02u-%02u.png", kGame.short_title, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-    std::filesystem::path dir = ExeDir() / "screenshots";
-    std::thread([bgra = std::move(bgra), w, h, dir, path = dir / name] {
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (WritePng(path, bgra, w, h)) {
+    std::filesystem::path path = NextPath();
+    std::thread([bgra = std::move(bgra), w, h, path] {
+        std::vector<uint32_t> px(size_t(w) * h);
+        for (size_t i = 0; i < px.size() && i * 4 + 3 < bgra.size(); i++)
+            px[i] = uint32_t(bgra[i * 4]) | uint32_t(bgra[i * 4 + 1]) << 8 | uint32_t(bgra[i * 4 + 2]) << 16 | 0xFF000000u;
+        if (EncodePng(path, px, w, h)) {  // a back buffer's alpha means nothing: opaque
             g_saved_ms = NowMs();
-            LOGR("screenshot: %s (%ux%u)", reinterpret_cast<const char*>(path.filename().u8string().c_str()), w, h);
+            LOGR("screenshot: %s (%ux%u)", path.filename().string().c_str(), w, h);
+        } else {
+            LOGR("screenshot: could not write %s", path.filename().string().c_str());
         }
-        CoUninitialize();
     }).detach();
 }
 

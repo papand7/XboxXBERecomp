@@ -1,4 +1,4 @@
-// PNG and other image files for the Windows build (see image.h).
+// picture files through WIC on Windows, stb_image elsewhere (see image.h)
 #include "app/image.h"
 
 #include <algorithm>
@@ -124,13 +124,73 @@ bool EncodeJpeg(const std::filesystem::path& path, const std::vector<uint32_t>& 
 }  // namespace app
 
 #else
+
+// stb_image and stb_image_write (public domain / MIT, Sean Barrett), fetched by CMake's Linux branch
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STBI_NO_STDIO_FILENAME_HELPERS
+#include <stb_image.h>
+#include <stb_image_write.h>
+
+#include <cstdio>
+#include <cstring>
+
 namespace app {
-bool DecodeImage(const std::filesystem::path&, std::vector<uint32_t>& bgra, uint32_t&, uint32_t&, bool, uint32_t, uint32_t* error) {
+
+bool DecodeImage(const std::filesystem::path& path, std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height,
+                 bool premultiplied, uint32_t max_side, uint32_t* error) {
     bgra.clear();
-    if (error) *error = 0x80004001u;
-    return false;
+    int w = 0, h = 0, n = 0;
+    stbi_uc* px = nullptr;
+    if (FILE* f = std::fopen(path.c_str(), "rb")) {
+        px = stbi_load_from_file(f, &w, &h, &n, 4);
+        std::fclose(f);
+    }
+    if (!px || w <= 0 || h <= 0 || (max_side && (uint32_t(w) > max_side || uint32_t(h) > max_side))) {
+        if (px) stbi_image_free(px);
+        if (error) *error = px ? 0x80070057u : 0x80004005u;  // E_INVALIDARG for a size refused, else E_FAIL
+        return false;
+    }
+    bgra.resize(size_t(w) * h);
+    for (size_t i = 0; i < bgra.size(); i++) {
+        uint32_t r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2], a = px[i * 4 + 3];
+        if (premultiplied && a != 255) {
+            r = (r * a + 127) / 255;
+            g = (g * a + 127) / 255;
+            b = (b * a + 127) / 255;
+        }
+        bgra[i] = b | g << 8 | r << 16 | a << 24;
+    }
+    stbi_image_free(px);
+    width = uint32_t(w);
+    height = uint32_t(h);
+    return true;
 }
-bool EncodePng(const std::filesystem::path&, const std::vector<uint32_t>&, uint32_t, uint32_t) { return false; }
-bool EncodeJpeg(const std::filesystem::path&, const std::vector<uint32_t>&, uint32_t, uint32_t, int) { return false; }
+
+bool EncodePng(const std::filesystem::path& path, const std::vector<uint32_t>& bgra, uint32_t width, uint32_t height) {
+    if (bgra.size() < size_t(width) * height) return false;
+    std::vector<uint8_t> rgba(size_t(width) * height * 4);
+    for (size_t i = 0; i < size_t(width) * height; i++) {
+        uint32_t v = bgra[i];
+        rgba[i * 4] = uint8_t(v >> 16);
+        rgba[i * 4 + 1] = uint8_t(v >> 8);
+        rgba[i * 4 + 2] = uint8_t(v);
+        rgba[i * 4 + 3] = uint8_t(v >> 24);
+    }
+    return stbi_write_png(path.c_str(), int(width), int(height), 4, rgba.data(), int(width * 4)) != 0;
+}
+
+bool EncodeJpeg(const std::filesystem::path& path, const std::vector<uint32_t>& bgra, uint32_t width, uint32_t height,
+                int quality) {
+    if (bgra.size() < size_t(width) * height) return false;
+    std::vector<uint8_t> rgb(size_t(width) * height * 3);
+    for (size_t i = 0; i < size_t(width) * height; i++) {
+        uint32_t v = bgra[i];
+        rgb[i * 3] = uint8_t(v >> 16), rgb[i * 3 + 1] = uint8_t(v >> 8), rgb[i * 3 + 2] = uint8_t(v);
+    }
+    return stbi_write_jpg(path.c_str(), int(width), int(height), 3, rgb.data(), std::clamp(quality, 1, 100)) != 0;
+}
+
 }  // namespace app
+
 #endif

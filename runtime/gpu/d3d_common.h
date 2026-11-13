@@ -92,6 +92,7 @@ struct PsoKey {
     float zslope;
     uint32_t rtfmt;
     uint32_t samples;  // MSAA, 0 or 1 none
+    uint32_t quads;    // Vulkan: points drawn as instanced quads (no geometry shaders: MoltenVK)
 };
 
 // the bound targets as the pipeline key sees them

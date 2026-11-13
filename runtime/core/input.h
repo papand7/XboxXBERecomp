@@ -25,12 +25,34 @@ enum Control : int {
 const char* ControlName(int c);  // settings file name, "dpad_up" ...
 const char* ControlLabel(int c); // shown to the player, "D-pad up" ...
 int ControlByName(const char* name);  // -1 when unknown
+// a game's own rebinding of a controller button (its menus): ArmPadCapture when the wait starts (what is down then does
+// not count); PadPressedControl then gives the physical input of controller 1 pressed since, -1 none
+void ArmPadCapture();
+int PadPressedControl();
 
 void Init();  // window thread, before boot; the game code window starts it earlier
 uint16_t HeldOnAnyController();  // face buttons as XINPUT_GAMEPAD_A/B/X/Y masks, GameInfo::pad left out
+#ifndef _WIN32
+// the window thread's SDL events (an SDL_Event*), each one: true when it was a controller plugged in or out, taken here
+bool HandleSdlEvent(const void* event);
+// the virtual key of an SDL scancode, as Windows' WM_KEYDOWN has it (either shift VK_SHIFT ...); 0 for none
+int VkOfScancode(int scancode);
+#endif
 // the controller on that port, then GameInfo::pad
 Pad Poll(int port);
-// raw mouse movement, from the window thread (WM_INPUT): read into controller 1's right stick (Settings::mouse_look)
+// the keyboard and mouse by Windows virtual key code (core/vk_codes.h; the settings and key bindings store them), any
+// thread: held now wherever the focus is, mouse buttons VK_LBUTTON .. VK_XBUTTON2 the physical ones (Windows:
+// GetAsyncKeyState; elsewhere SDL's keyboard and mouse state, the codes mapped to scancodes)
+bool KeyDown(int vk);
+// a game's own tool using the arrow keys, PageUp/PageDown, Enter and Delete (src/game/aim.cpp's sight tuner): while on,
+// those keys do not reach the game's controls
+void HoldBackToolKeys(bool on);
+// the game window has the keyboard (Windows: it is the foreground window)
+bool GameFocused();
+// held while the game window has the keyboard
+inline bool KeyHeld(int vk) { return GameFocused() && KeyDown(vk); }
+// raw mouse movement, from the window thread (Windows WM_INPUT, SDL's relative mouse motion): read into controller 1's
+// right stick (Settings::mouse_look) or taken by the title (TakeMouse)
 void MouseMoved(int dx, int dy);
 // the Windows pointer moved over the game window (WM_MOUSEMOVE), pixels: only makes the mouse the one in use (a Remote
 // Desktop session's raw input may be positions, or nothing)
@@ -41,10 +63,15 @@ void MouseFree(bool free);
 bool MouseIsFree();
 // the mouse plays the right stick now: mouse look on, the game window in front, the settings window shut
 bool MouseLooking();
+// the mouse a pointer in a title's menu (GameInfo::menu_up), the window in front: its buttons and wheel are read
+bool MousePointing();
 // for a title taking the mouse itself (GameInfo::mouse_direct): the movement since the last call as a rate, in full
 // stick deflections (2400 counts a second at 100% sensitivity is 1), up positive, the settings' sensitivity and invert
 // applied; false and nothing taken while the mouse is not looking
 bool TakeMouse(float& x, float& y);
+// the counts moved since the title last took them (times the sensitivity, y up), left for it: false when the mouse
+// does not look (GameInfo::view_turn's smooth turning between the title's frames)
+bool PeekMouse(float& x, float& y);
 // what controller 1 was last played with: true for the keyboard and mouse (a bound key or mouse button pressed, the
 // mouse moved while it looks; the keyboard alone when no controller is plugged in), false for a controller or wheel
 // (a button pressed, a stick pushed half way); a title's button pictures may follow it
@@ -55,7 +82,7 @@ std::array<uint16_t, 2> ControlKeys(int c);
 // positive), and the buttons held (1 left, 2 right, 4 middle)
 int TakeWheel();
 uint32_t MouseButtons();
-void MouseWheel(int delta);  // window thread, WHEEL_DELTA (120) a notch
+void MouseWheel(int delta);  // window thread, WHEEL_DELTA (120) a notch (an SDL wheel step is one notch)
 void Rumble(int port, uint16_t left, uint16_t right);
 // the physical controls held on any controller, a bit per Control, from the last polls (the settings window's
 // navigation)

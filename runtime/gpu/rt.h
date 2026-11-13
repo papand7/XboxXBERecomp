@@ -1,5 +1,6 @@
 #pragma once
-// What a game's hooks tell the Vulkan renderer's ray tracing (gpu/rt_hlsl.h) about its scene.
+// What a game's hooks tell the Vulkan renderer's ray tracing about its scene (app/style_settings.cpp: the renderer's
+// sun direction, gpu::SetSunDirection).
 
 namespace gpu {
 

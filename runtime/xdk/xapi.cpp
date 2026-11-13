@@ -1,4 +1,6 @@
 // XAPI functions that talk to hardware: controller ports and the hard disk cache partition
+#include <cstdio>
+#include <cstdlib>
 #include <chrono>
 
 #include "core/input.h"
@@ -180,6 +182,16 @@ HLE_STDCALL(XInputSetState, 2) {
 X86_EXTERN_FUNC(GUEST_ORIG(XLaunchNewImageA));
 X86_FUNC(GUEST(XLaunchNewImageA)) {
     std::string path = ReadCString(R32(ctx.esp + 4));
+    // XBE_LAUNCH_DUMP=<folder>: each launch's data (3072 bytes) written there, for working out what a title hands over
+    if (const char* dir = std::getenv("XBE_LAUNCH_DUMP"); dir && *dir && R32(ctx.esp + 8)) {
+        static int n = 0;
+        std::string f = std::string(dir) + "/launch" + std::to_string(n++) + ".bin";
+        if (FILE* o = std::fopen(f.c_str(), "wb")) {
+            std::fwrite(kernel::HostPtr(R32(ctx.esp + 8)), 1, 3072, o);
+            std::fclose(o);
+        }
+        LOGR("xapi: launch of %s, its data written to %s", path.c_str(), f.c_str());
+    }
     if (ImageExe(path)) {
         GUEST_ORIG(XLaunchNewImageA)(ctx, base);
         return;

@@ -120,7 +120,11 @@ public:
         STARTUPINFOW si{sizeof(si)};
         si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdOutput = si.hStdError = write;
-        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        // nothing to read: NUL, never this program's own input. The service reads its commands from a pipe; a git
+        // handed that pipe stops at its start (Git for Windows asks the pipe's name, which waits for the service's read
+        // in progress, so until the next command comes)
+        HANDLE nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+        si.hStdInput = nul == INVALID_HANDLE_VALUE ? nullptr : nul;
         PROCESS_INFORMATION pi{};
         std::vector<wchar_t> block = EnvBlock(env);
         // a job: closing it ends the program and every program it started
@@ -133,6 +137,7 @@ public:
                                  CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED, block.data(),
                                  dir.empty() ? nullptr : dir.c_str(), &si, &pi);
         CloseHandle(write);
+        if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
         if (!ok) {
             if (line) line(LastError(("cannot start " + Narrow(cmd)).c_str()));
             CloseHandle(read);
@@ -235,6 +240,7 @@ public:
 
     std::string ExeSuffix() const override { return ".exe"; }
     char PathSeparator() const override { return ';'; }
+    std::string Os() const override { return "windows"; }
     std::string GetEnv(const std::string& name) const override {
         std::wstring n = Wide(name);
         DWORD len = GetEnvironmentVariableW(n.c_str(), nullptr, 0);

@@ -1,5 +1,6 @@
-# The launcher: one exe a player runs to build and play a game from their own disc (Windows), and launcher_cli, its
-# steps from a terminal (any platform, for testing).
+# The launcher: one exe a player runs to build and play a game from their own disc (Windows), launcher_service, the
+# same work driven over stdin/stdout by a launcher window drawn elsewhere (an Electron one; Windows and Linux), and
+# launcher_cli, its steps from a terminal (Linux, for testing).
 #   cmake -S sdk/launcher -B build/launcher -DLAUNCHER_GAME=<the game's launcher folder, with game.json>
 cmake_minimum_required(VERSION 3.25)
 project(xbe_launcher CXX C)
@@ -55,30 +56,31 @@ target_compile_definitions(launcher_core PUBLIC XZ_USE_CRC64 XZ_DEC_X86 XZ_DEC_C
 set_source_files_properties(${XZ}/xz_crc32.c ${XZ}/xz_crc64.c ${XZ}/xz_dec_lzma2.c ${XZ}/xz_dec_stream.c
     ${XZ}/xz_dec_bcj.c PROPERTIES COMPILE_OPTIONS "-include;${xz_embedded_SOURCE_DIR}/userspace/xz_config.h")
 
+# the launcher's version: a release's tag when GitHub Actions builds one (GITHUB_REF_TYPE tag), else "dev"; set
+# LAUNCHER_VERSION to override. A release launcher offers newer releases and builds its own tag (core/update.h)
+if(NOT LAUNCHER_VERSION)
+    if("$ENV{GITHUB_REF_TYPE}" STREQUAL "tag")
+        set(LAUNCHER_VERSION "$ENV{GITHUB_REF_NAME}")
+    else()
+        set(LAUNCHER_VERSION "dev")
+    endif()
+endif()
+message(STATUS "launcher version: ${LAUNCHER_VERSION}")
+# the game's json built in
+file(READ ${LAUNCHER_GAME}/game.json GAME_JSON)
+file(READ ${LAUNCHER_GAME}/toolchain.json TOOLCHAIN_JSON)
+configure_file(win/embedded.h.in ${CMAKE_BINARY_DIR}/include/embedded.h @ONLY)
+string(JSON SHORT GET "${GAME_JSON}" short)
+
 if(WIN32)
-    # the launcher itself: a window (Dear ImGui on Direct3D 11), WinHTTP, the game's json built in
+    # the launcher itself: a window (Dear ImGui on Direct3D 11), WinHTTP
     FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.91.0 GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(imgui)
-    # the launcher's version: a release's tag when GitHub Actions builds one (GITHUB_REF_TYPE tag), else "dev"; set
-    # LAUNCHER_VERSION to override. A release launcher offers newer releases and builds its own tag (core/update.h)
-    if(NOT LAUNCHER_VERSION)
-        if("$ENV{GITHUB_REF_TYPE}" STREQUAL "tag")
-            set(LAUNCHER_VERSION "$ENV{GITHUB_REF_NAME}")
-        else()
-            set(LAUNCHER_VERSION "dev")
-        endif()
-    endif()
-    message(STATUS "launcher version: ${LAUNCHER_VERSION}")
-    file(READ ${LAUNCHER_GAME}/game.json GAME_JSON)
-    file(READ ${LAUNCHER_GAME}/toolchain.json TOOLCHAIN_JSON)
-    configure_file(win/embedded.h.in ${CMAKE_BINARY_DIR}/include/embedded.h @ONLY)
     set(ICON "${LAUNCHER_GAME}/icon.ico")
     if(EXISTS ${ICON})
         file(WRITE ${CMAKE_BINARY_DIR}/launcher.rc "1 ICON \"${ICON}\"\n")
         set(RC ${CMAKE_BINARY_DIR}/launcher.rc)
     endif()
-    file(READ ${LAUNCHER_GAME}/game.json GJ)
-    string(JSON SHORT GET "${GJ}" short)
     add_executable(launcher WIN32 win/main.cpp win/screen.cpp win/platform_win.cpp ${RC}
         ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp ${imgui_SOURCE_DIR}/imgui_tables.cpp
         ${imgui_SOURCE_DIR}/imgui_widgets.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
@@ -87,11 +89,9 @@ if(WIN32)
     target_include_directories(launcher PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends win ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_compile_definitions(launcher PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(launcher PRIVATE launcher_core winhttp d3d11 dxgi shell32 ole32 comdlg32 dwmapi)
-    # the same work without a window, driven over stdin/stdout by a launcher drawn elsewhere (007 Remastered's Electron
-    # launcher, service.cpp)
+    # the same work without a window, driven over stdin/stdout by a launcher drawn elsewhere (an Electron one)
     add_executable(launcher_service service.cpp win/platform_win.cpp ${RC})
     set_target_properties(launcher_service PROPERTIES OUTPUT_NAME "${SHORT}LauncherService")
-    target_include_directories(launcher_service PRIVATE ${CMAKE_BINARY_DIR}/include)
     target_compile_definitions(launcher_service PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(launcher_service PRIVATE launcher_core winhttp shell32 ole32)
     if(MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -99,17 +99,27 @@ if(WIN32)
         set_property(TARGET launcher launcher_service launcher_core PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
     endif()
 else()
-    add_executable(launcher_cli test/cli.cpp test/posix.cpp)
-    target_link_libraries(launcher_cli PRIVATE launcher_core)
+    # Linux and macOS: programs through fork and exec, downloads through curl (posix/platform_posix.cpp)
+    add_executable(launcher_service service.cpp posix/platform_posix.cpp)
+    set_target_properties(launcher_service PROPERTIES OUTPUT_NAME "${SHORT}LauncherService")
+    # one program that runs on any distribution of the same age or newer (an AppImage carries it): the C++ library
+    # linked in
+    # (macOS's clang has no -static-libgcc and its C++ library is part of the system)
+    if(NOT APPLE)
+        target_link_options(launcher_service PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
+    target_link_libraries(launcher_service PRIVATE launcher_core pthread)
+    add_executable(launcher_cli test/cli.cpp posix/platform_posix.cpp)
+    target_link_libraries(launcher_cli PRIVATE launcher_core pthread)
     # the screen as PNGs, with no window or GPU (test/screen_preview.cpp)
     FetchContent_Declare(imgui_preview GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.91.0 GIT_SHALLOW TRUE)
     FetchContent_GetProperties(imgui_preview)
     if(NOT imgui_preview_POPULATED)
         FetchContent_Populate(imgui_preview)
     endif()
-    add_executable(screen_preview test/screen_preview.cpp win/screen.cpp test/posix.cpp
+    add_executable(screen_preview test/screen_preview.cpp win/screen.cpp posix/platform_posix.cpp
         ${imgui_preview_SOURCE_DIR}/imgui.cpp ${imgui_preview_SOURCE_DIR}/imgui_draw.cpp
         ${imgui_preview_SOURCE_DIR}/imgui_tables.cpp ${imgui_preview_SOURCE_DIR}/imgui_widgets.cpp)
     target_include_directories(screen_preview PRIVATE ${imgui_preview_SOURCE_DIR} win ${CMAKE_CURRENT_SOURCE_DIR}/..)
-    target_link_libraries(screen_preview PRIVATE launcher_core)
+    target_link_libraries(screen_preview PRIVATE launcher_core pthread)
 endif()

@@ -6,7 +6,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#include "gpu/upscale.h"
+#include "gpu/upscale_edge.h"
 int main(int argc, char** argv) {
     std::ifstream f(argv[1], std::ios::binary);
     std::string m;

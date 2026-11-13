@@ -1,4 +1,4 @@
-#include "gpu/upscale.h"
+#include "gpu/upscale_edge.h"
 
 #include <algorithm>
 #include <array>

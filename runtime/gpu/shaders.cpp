@@ -66,7 +66,9 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 pts;  // point sprites on, size min, size max, D3DRS_POINTSIZE
     float4 vattr[16];  // the v registers a draw gives no stream
     float4 zclip;  // the depth clip planes
-    float4 taa;    // temporal projection jitter in clip units
+    float4 style;  // graphics styles: xy the vertex snapping grid, 0 off
+    float4 pbr;  // materials: 1 / target width and height, tan of half the vertical view, strength
+    float4 taa;  // TAA: xy the frame's jitter in clip units (0 off, and for 2D)
 };
 )";
 
@@ -242,6 +244,8 @@ const char* kVsEpilogue = R"(
     if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;
     q.x = p.x * 2 / surf.x - 1;
     q.y = 1 - p.y * 2 / surf.y;
+    // Retro style: positions on a coarse screen grid, the console era's wobbling vertices
+    if (style.x > 0) q.xy = round(q.xy * style.xy) / style.xy;
     q.z = p.z * surf.z;
     // W-buffered (hud.w): the pixel shader writes the depth from w and the console clips nothing past the far plane,
     // so z stays within w here: PGR2's sky dome and far hills lie past it and were clipped away (Nurburgring)
@@ -249,7 +253,7 @@ const char* kVsEpilogue = R"(
     q.xyz *= p.w;
     q.w = p.w;
     o.pos = q;
-    o.pos.xy += taa.xy * o.pos.w;
+    o.pos.xy += taa.xy * o.pos.w;  // TAA's jitter (0 for a 2D draw)
     o.clipz = float2(q.z - zclip.x * q.w, zclip.y * q.w - q.z);
     o.d0 = saturate(oD0);
     o.d1 = saturate(oD1);
@@ -914,7 +918,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     if (surf.w == 0 && abs(sp.y - (surf.y - 0.5)) < 1e-3) cp.y = -cp.w;
     if (hud.w != 0) cp.z = min(cp.z, cp.w);  // W-buffered: nothing clipped past the far plane (the programs' epilogue)
     o.pos = cp;
-    o.pos.xy += taa.xy * o.pos.w;
+    o.pos.xy += taa.xy * o.pos.w;  // TAA's jitter (0 for a 2D draw)
     o.clipz = float2(cp.z - zclip.x * cp.w, zclip.y * cp.w - cp.z);
     o.d0 = saturate(oD0);
     o.d1 = saturate(oD1);

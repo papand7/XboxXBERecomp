@@ -8,7 +8,7 @@ the SDK runtime as they are, with these stand ins.
 - `null_audio.cpp` the mixer pulled every 10 ms, output dropped or written to a WAV file
 - `null_backend.cpp` counts frames, lists draws, draws chosen frames with `reference_renderer.cpp` (CPU, into guest memory)
 - `main_test.cpp` runs `GameInfo::init` and `window` (with no window), then boots the image
-- `compat/` the few Win32, Winsock and DXGI names portable sources use
+- `sdk/runtime/compat` (shared with the Linux build): the few Win32, Winsock and DXGI names portable sources use
 
 Needs clang and the game's generated code. The game repo supplies stand ins for its own Windows only sources.
 

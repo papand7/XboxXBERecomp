@@ -9,7 +9,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#if defined(__x86_64__) || defined(_M_X64)
 #include <smmintrin.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -47,7 +49,7 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
-enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport };
+enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport, Mid };
 
 struct Cmd {
     Op op;
@@ -129,6 +131,9 @@ inline bool AllZero(__m128i v) { return _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_
 
 // equal bytes, 16 at a time: most of the state is compared on every draw
 bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
+#if !defined(__x86_64__) && !defined(_M_X64)
+    return !std::memcmp(a, b, n);  // Arm (Android): the C library's own vector compare
+#else
     size_t i = 0;
     __m128i diff = _mm_setzero_si128();
     for (; i + 16 <= n; i += 16)
@@ -136,6 +141,7 @@ bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
                                                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i))));
     if (!AllZero(diff)) return false;
     return i == n || !std::memcmp(a + i, b + i, n - i);
+#endif
 }
 
 using Clock = std::chrono::steady_clock;
@@ -166,15 +172,16 @@ public:
         if (record_) std::thread([this] { Record(); }).detach();
         std::thread([this] { Run(); }).detach();
     }
-    ~Threaded() override {
+    // the worker told to finish; false when it has not within 500 ms (at exit it may be gone mid-batch, or still
+    // drawing): then this object, its queue and the inner backend must outlive it, and Owner leaves them unfreed
+    bool Stop() {
         {
             std::lock_guard lock(m_);
             stop_ = true;
         }
         cv_.notify_all();
         std::unique_lock lock(m_);
-        // at exit the worker may be gone mid-batch: then the inner backend is left, not freed under it
-        if (!done_cv_.wait_for(lock, std::chrono::milliseconds(500), [&] { return exited_; })) (void)inner_.release();
+        return done_cv_.wait_for(lock, std::chrono::milliseconds(500), [&] { return exited_; });
     }
 
     bool Init(uint32_t width, uint32_t height) override { return inner_->Init(width, height); }
@@ -233,8 +240,8 @@ public:
         auto t = Clock::now();
         Cmd c{Op::Copy};
         c.a = count;
-        c.b = count && src_rects ? Scratch(kernel::HostPtr(src_rects), count * 16) : 0;
-        c.c = count && dst_points ? Scratch(kernel::HostPtr(dst_points), count * 8) : 0;
+        c.b = count && src_rects ? Scratch(kernel::HostPtr(src_rects), size_t(count) * 16) : 0;
+        c.c = count && dst_points ? Scratch(kernel::HostPtr(dst_points), size_t(count) * 8) : 0;
         c.s1 = src;
         c.s1.header = Header(src.header);
         c.s2 = dst;
@@ -304,6 +311,12 @@ public:
     }
     void Kick() override {
         cur_->cmds.push_back(Cmd{Op::Flush});
+        Submit();
+    }
+
+    // the in-between frame: run on the render thread after the present before it (it waits for its time there)
+    void MidFrame() override {
+        cur_->cmds.push_back(Cmd{Op::Mid});
         Submit();
     }
 
@@ -414,9 +427,14 @@ private:
         Wait(Submit(), WaitFor::ReadBack, "read-back");
     }
 
-    // bytes the render thread reads through a guest address, in the header ring
-    uint32_t Scratch(const void* p, uint32_t n) {
-        uint32_t size = (n + kHeaderSlot - 1) & ~(kHeaderSlot - 1);
+    // bytes the render thread reads through a guest address, in the header ring; 0 without the ring or for more than
+    // half of it (a copy's rects then read as none: the whole surface)
+    uint32_t Scratch(const void* p, size_t n) {
+        if (!ring_ || n > kHeaderRing / 2) {
+            LOG_FIRST(4, "render thread: %zu bytes for the header ring (%s), left out", n, ring_ ? "too many" : "no ring");
+            return 0;
+        }
+        uint32_t size = (uint32_t(n) + kHeaderSlot - 1) & ~(kHeaderSlot - 1);
         if (ring_pos_ % kHeaderRing + size > kHeaderRing) ring_pos_ += kHeaderRing - ring_pos_ % kHeaderRing;
         uint32_t at = ring_ + uint32_t(ring_pos_ % kHeaderRing);
         ring_pos_ += size;
@@ -881,6 +899,7 @@ private:
             case Op::GetReport:
                 if (!record_reports_) inner_->GetReport(c.a);
                 break;
+            case Op::Mid: inner_->MidFrame(); break;
         }
     }
 
@@ -964,8 +983,48 @@ private:
     std::condition_variable ran_cv_;
 };
 
+// the Threaded the title holds, freed only once its worker has finished: a worker still running at exit keeps using
+// its mutex, queue and inner backend, so then all of it is left to the process's end on purpose
+class Owner final : public Backend {
+public:
+    explicit Owner(std::unique_ptr<Backend> inner) : t_(new Threaded(std::move(inner))) {}
+    ~Owner() override {
+        if (t_->Stop()) delete t_;
+    }
+    bool Init(uint32_t width, uint32_t height) override { return t_->Init(width, height); }
+    void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z, uint32_t stencil) override {
+        t_->Clear(s, count, rects, flags, color, z, stencil);
+    }
+    void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
+        t_->Draw(s, prim, start, count, indices);
+    }
+    void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override {
+        t_->Copy(src, dst, count, src_rects, dst_points);
+    }
+    void Present(const Surface& front) override { t_->Present(front); }
+    void Sync(uint32_t data, uint32_t size) override { t_->Sync(data, size); }
+    void SyncVertices(uint32_t data) override { t_->SyncVertices(data); }
+    void SyncLate(uint32_t data) override { t_->SyncLate(data); }
+    bool DeliverLate(uint32_t data) override { return t_->DeliverLate(data); }
+    void RecordLate(uint32_t data) override { t_->RecordLate(data); }
+    void Flush() override { t_->Flush(); }
+    void Kick() override { t_->Kick(); }
+    void SetGamma(const uint8_t* ramp) override { t_->SetGamma(ramp); }
+    void MidFrame() override { t_->MidFrame(); }
+    void ClearReport() override { t_->ClearReport(); }
+    void GetReport(uint32_t report) override { t_->GetReport(report); }
+    uint32_t Fence() override { return t_->Fence(); }
+    bool FencePending(uint32_t fence) override { return t_->FencePending(fence); }
+    void WaitFence(uint32_t fence) override { t_->WaitFence(fence); }
+    bool Busy(uint32_t resource) override { return t_->Busy(resource); }
+    void WaitResource(uint32_t resource) override { t_->WaitResource(resource); }
+
+private:
+    Threaded* t_;
+};
+
 }  // namespace
 
-std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner) { return std::make_unique<Threaded>(std::move(inner)); }
+std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner) { return std::make_unique<Owner>(std::move(inner)); }
 
 }  // namespace gpu

@@ -24,7 +24,7 @@
 
 #ifdef _WIN32
 #include <intrin.h>
-#else
+#elif defined(__x86_64__)
 #include <x86intrin.h>
 #endif
 
