@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <thread>
 
@@ -138,6 +139,16 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
 
     // a quick reboot into this title left its launch data page behind
     g_launch_file = data_dir + "/launch.bin";
+    // only a fresh one: the relaunch reads it at once, while a copy closed by force before its successor started left
+    // one that would put the next ordinary start straight into a mission
+    std::error_code age_err;
+    const auto age = std::filesystem::file_time_type::clock::now() - std::filesystem::last_write_time(g_launch_file, age_err);
+    if (!age_err && age > std::chrono::minutes(2)) {
+        std::remove(g_launch_file.c_str());
+        std::remove(PersistFile().c_str());
+        LOGI("boot: launch data from an earlier run left behind, %lld s old: not used",
+             (long long)std::chrono::duration_cast<std::chrono::seconds>(age).count());
+    }
     std::ifstream lf(g_launch_file, std::ios::binary);
     if (lf) {
         uint32_t page = mem::AllocContiguous(0x1000, 0, 0xFFFFFFFF, 0x1000);

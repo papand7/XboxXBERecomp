@@ -387,9 +387,9 @@ void Pace(uint32_t vblanks) {
     auto now = clock::now();
     if (!cap) {
         next = now;
+        netplay::Frame(60);
         return;
     }
-        netplay::Frame(60);
     auto period = std::chrono::nanoseconds(1000000000ull / cap);
     // stutter: frames that took more than one and a half periods, a line every 10 seconds that had any (loading
     // screens count too)
@@ -415,9 +415,9 @@ void Pace(uint32_t vblanks) {
     if (next < now - period) next = now;
     while (clock::now() + std::chrono::milliseconds(2) < next) Sleep(1);
     while (clock::now() < next) std::this_thread::yield();
+    netplay::Frame(cap);  // LAN play: the next frame's controllers of every player
 }
 
-    netplay::Frame(cap);  // LAN play: the next frame's controllers of every player
 }  // namespace app
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {

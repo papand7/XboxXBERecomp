@@ -11,5 +11,7 @@ std::recursive_mutex& Lock();
 void FrameLogNote(const char* text);
 // the next frame shown is blended: this much of its image over the last image, and whether the image is a new one
 void SetFrameBlend(float weight, bool new_image);
+// the title's draws and clears dropped while on (LAN play: another player's split screen view, its logic still run)
+void SetDrawsOff(bool off);
 
 }  // namespace d3d

@@ -437,6 +437,9 @@ void VerticalBlank(X86Context& ctx) {
 
 }  // namespace
 
+bool g_draws_off = false;  // the title's draws and clears dropped (SetDrawsOff)
+void SetDrawsOff(bool off) { g_draws_off = off; }
+
 void SetFrameBlend(float weight, bool new_image) {
     g_frame_blend = weight;
     if (new_image) g_frame_blend_new = true;
@@ -644,7 +647,7 @@ HLE_STDCALL(D3DDevice_Reset, 1) {
     }
     UpdateViewportConstants();
     constexpr uint32_t kClearTarget = 1, kClearZBuffer = 2;
-    if (g_backend) g_backend->Clear(g_state, 0, nullptr, kClearTarget | kClearZBuffer, 0, 1.0f, 0);
+    if (g_backend && !d3d::g_draws_off) g_backend->Clear(g_state, 0, nullptr, kClearTarget | kClearZBuffer, 0, 1.0f, 0);
     return 0;
 }
 
@@ -1056,11 +1059,11 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     static const bool log_clears = std::getenv("XBE_CLEAR_LOG") != nullptr;  // each clear: target, flags, colour
     if (log_clears)
-        LOG_FIRST(100000, "d3d: Clear frame %u target data %08X depth data %08X rects %u flags %X colour %08X", g_presents.load(),
+        LOG_FIRST(100000, "d3d: Clear frame %u target data %08X depth data %08X rects %u flags %X colour %08X vp %u %u %u %u", g_presents.load(),
                   Dev(kDevRenderTarget) ? R32(Dev(kDevRenderTarget) + 4) : 0, Dev(kDevDepth) ? R32(Dev(kDevDepth) + 4) : 0,
-                  a[0], a[2], a[3]);
+                  a[0], a[2], a[3], g_state.viewport.x, g_state.viewport.y, g_state.viewport.w, g_state.viewport.h);
     const uint8_t* rects = a[0] && a[1] ? static_cast<const uint8_t*>(HostPtr(a[1])) : nullptr;
-    if (g_backend) g_backend->Clear(g_state, a[0], rects, a[2], a[3], ArgF(a, 4), a[5]);
+    if (g_backend && !d3d::g_draws_off) g_backend->Clear(g_state, a[0], rects, a[2], a[3], ArgF(a, 4), a[5]);
     return 0;
 }
 
@@ -1890,7 +1893,7 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     SyncDeferred();
     if (KeepDraw(a[0], a[1], a[2], 0)) return 0;
     FrameLogDraw(a[0], a[1], a[2], nullptr);
-    if (g_backend) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
+    if (g_backend && !d3d::g_draws_off) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
     return 0;
 }
 
@@ -1901,7 +1904,7 @@ HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     if (KeepDraw(a[0], 0, a[1], a[2])) return 0;
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
     FrameLogDraw(a[0], 0, a[1], indices);
-    if (g_backend) g_backend->Draw(g_state, a[0], 0, a[1], indices);
+    if (g_backend && !d3d::g_draws_off) g_backend->Draw(g_state, a[0], 0, a[1], indices);
     return 0;
 }
 
@@ -1942,7 +1945,7 @@ void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride
     bool input = g_state.input_active;  // vertices from memory are read by the shader's declaration
     g_state.streams[0] = {UpVertices(vertices, count * stride), stride};
     g_state.input_active = false;
-    g_backend->Draw(g_state, prim, 0, count, nullptr);
+    if (!d3d::g_draws_off) g_backend->Draw(g_state, prim, 0, count, nullptr);
     g_state.streams[0] = stream;
     g_state.input_active = input;
 }
@@ -1975,7 +1978,7 @@ void FlushPushedTriangles() {
         auto idx = reinterpret_cast<const uint8_t*>(g_im_batch.data());
         uint32_t count = uint32_t(g_im_batch.size());
         FrameLogDraw(5, 0, count, idx);
-        g_backend->Draw(g_state, 5, 0, count, idx);
+        if (!d3d::g_draws_off) g_backend->Draw(g_state, 5, 0, count, idx);
     }
     g_im_batch.clear();
 }
@@ -2162,7 +2165,7 @@ void Walk(uint32_t end) {
                 if (g_im_prim && g_backend) {
                     SyncDeferred();
                     FrameLogDraw(g_im_prim, v & 0xFFFFFF, (v >> 24) + 1, nullptr);
-                    g_backend->Draw(g_state, g_im_prim, v & 0xFFFFFF, (v >> 24) + 1, nullptr);
+                    if (!d3d::g_draws_off) g_backend->Draw(g_state, g_im_prim, v & 0xFFFFFF, (v >> 24) + 1, nullptr);
                 }
                 continue;
             }
@@ -2187,7 +2190,7 @@ void Walk(uint32_t end) {
                             auto idx = reinterpret_cast<const uint8_t*>(g_im_indices.data());
                             uint32_t count = uint32_t(g_im_indices.size());
                             FrameLogDraw(prim, 0, count, idx);
-                            g_backend->Draw(g_state, prim, 0, count, idx);
+                            if (!d3d::g_draws_off) g_backend->Draw(g_state, prim, 0, count, idx);
                         }
                     }
                     g_im_indices.clear();
@@ -2323,9 +2326,9 @@ void ReplayPushBuffer(uint32_t pb, uint32_t fixup, PbRecording& r) {
         if (!d->up.empty()) {
             s.streams[0] = {UpVertices(d->up.data(), uint32_t(d->up.size())), d->up_stride};
             s.input_active = false;
-            g_backend->Draw(s, d->prim, 0, d->count, nullptr);
+            if (!d3d::g_draws_off) g_backend->Draw(s, d->prim, 0, d->count, nullptr);
         } else {
-            g_backend->Draw(s, d->prim, d->start, d->count,
+            if (!d3d::g_draws_off) g_backend->Draw(s, d->prim, d->start, d->count,
                             d->indices ? static_cast<const uint8_t*>(HostPtr(d->indices)) : nullptr);
         }
     }
