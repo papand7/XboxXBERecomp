@@ -599,6 +599,11 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
                 MessageBoxW(nullptr, L"No renderer could start (Direct3D 12, Direct3D 11 and Vulkan all failed). "
                             L"Update the graphics driver, see the log in the logs folder.", app::kGame.short_title,
                             0x10 /*MB_ICONERROR*/);
+#else
+                // macOS and Linux: Vulkan is the only renderer (MoltenVK on a Mac), so say why nothing draws
+                app::MessageBox(L"The renderer could not start: Vulkan did not open on this computer. On a Mac it needs "
+                                L"MoltenVK (libMoltenVK.dylib, beside the game) and a GPU with Vulkan 1.3 through it; on "
+                                L"Linux a Vulkan 1.3 driver. The log in the logs folder says what failed.", true);
 #endif
                 kernel::Shutdown(1);
             }

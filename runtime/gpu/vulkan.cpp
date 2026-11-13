@@ -4424,7 +4424,10 @@ bool VulkanBackend::LoadVulkan() {
     vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(app::VulkanGetInstanceProcAddr());
     if (!vkGetInstanceProcAddr) {
 #ifdef __APPLE__
-        // the Vulkan loader, else MoltenVK itself (beside the exe, or Homebrew's)
+        // MoltenVK beside the exe first (the build puts it there; a bare name is not looked for beside the program),
+        // then the Vulkan loader, else MoltenVK by name (Homebrew's)
+        const std::string own = (app::ExeDir() / "libMoltenVK.dylib").string();
+        lib_ = dlopen(own.c_str(), RTLD_NOW | RTLD_LOCAL);
         for (const char* name : {"libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib",
                                  "/opt/homebrew/lib/libvulkan.1.dylib", "/opt/homebrew/lib/libMoltenVK.dylib"})
             if (!lib_) lib_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
