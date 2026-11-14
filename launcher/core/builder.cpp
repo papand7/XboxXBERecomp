@@ -1024,7 +1024,7 @@ bool Builder::BuildPackage(std::string& error) {
     step = Step::Package;
     if (fs::exists(zip, ec)) {
         Log("package beside the launcher: " + U8(zip));
-        id = std::to_string(fs::file_size(zip, ec)) + " " + std::to_string(fs::last_write_time(zip, ec).time_since_epoch().count());
+        id = std::to_string(uint64_t(fs::file_size(zip, ec))) + " " + std::to_string(int64_t(fs::last_write_time(zip, ec).time_since_epoch().count()));
     } else if (!Timed("package download", [&] {
                    std::string tag = game_.version;
                    if (!IsReleaseVersion(tag)) {  // a dev launcher takes the newest release
