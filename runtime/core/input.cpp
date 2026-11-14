@@ -226,7 +226,11 @@ void MouseMoved(int dx, int dy) {
 
 std::atomic<bool> g_free{false};
 void MouseFree(bool free) {
+#ifdef _WIN32
     if (g_free.exchange(free) != free && free) ClipCursor(nullptr);  // let go at once, not at the next move
+#else
+    g_free = free;  // SDL's relative mode follows MouseLooking each poll (app/main_sdl.cpp)
+#endif
 }
 bool MouseIsFree() { return g_free; }
 

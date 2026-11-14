@@ -153,9 +153,11 @@ void LogSystem() {
 #endif
     Mode desk = Desktop();
     LOGR("Desktop: %ux%u", desk.width, desk.height);
+#ifdef _WIN32
     DEVMODEW display{};
     display.dmSize = sizeof(display);
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &display)) LOGR("Display: %u Hz", unsigned(display.dmDisplayFrequency));
+#endif
     LogSettings();
     // experiment and diagnostic switches stay set in a shell or the user's environment between runs: list them
     std::wstring game;

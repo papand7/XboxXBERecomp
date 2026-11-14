@@ -1147,6 +1147,7 @@ bool OverlayKey(uint16_t vk) {
 void OverlayInit() {
     ImGuiIO& io = ImGui::GetIO();
     // Tahoma, as classic Steam, at the size the desktop's height wants; the default font on a machine without it
+#ifdef _WIN32
     wchar_t dir[MAX_PATH];
     UINT len = GetWindowsDirectoryW(dir, MAX_PATH);
     std::filesystem::path fonts = std::filesystem::path(std::wstring(dir, len)) / L"Fonts";
@@ -1155,6 +1156,10 @@ void OverlayInit() {
     if (std::filesystem::exists(fonts / L"tahoma.ttf", ec)) io.Fonts->AddFontFromFileTTF((fonts / L"tahoma.ttf").string().c_str(), px);
     if (io.Fonts->Fonts.empty()) io.Fonts->AddFontDefault();
     if (std::filesystem::exists(fonts / L"tahomabd.ttf", ec)) g_bold = io.Fonts->AddFontFromFileTTF((fonts / L"tahomabd.ttf").string().c_str(), px);
+#else
+    // no Tahoma off Windows: ImGui's own font
+    if (io.Fonts->Fonts.empty()) io.Fonts->AddFontDefault();
+#endif
 }
 
 namespace {

@@ -24,6 +24,7 @@
 namespace gpu {
 
 namespace {
+#ifdef _WIN32
 class ShaderBlob final : public ID3DBlob {
 public:
     explicit ShaderBlob(std::size_t bytes) : bytes_(bytes) {}
@@ -47,6 +48,24 @@ private:
     std::atomic<ULONG> refs_{1};
     std::vector<uint8_t> bytes_;
 };
+#else
+// off Windows ID3DBlob is compat/d3dcommon.h's: reference counted bytes, no COM
+class ShaderBlob final : public ID3DBlob {
+public:
+    explicit ShaderBlob(std::size_t bytes) : bytes_(bytes) {}
+    unsigned long AddRef() override { return refs_.fetch_add(1, std::memory_order_relaxed) + 1; }
+    unsigned long Release() override {
+        unsigned long refs = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (!refs) delete this;
+        return refs;
+    }
+    void* GetBufferPointer() override { return bytes_.data(); }
+    size_t GetBufferSize() override { return bytes_.size(); }
+private:
+    std::atomic<unsigned long> refs_{1};
+    std::vector<uint8_t> bytes_;
+};
+#endif
 }  // namespace
 
 // ---- the shader cache: "XBESHC1" and a zero byte, then records of hash (8 bytes), size (4) and the blob
