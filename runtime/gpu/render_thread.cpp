@@ -126,8 +126,10 @@ uint64_t CheckHash(const State& s, const std::vector<Range>& ranges) {
     return h;
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
 // a 16 byte value all zero, in SSE2 (_mm_testz_si128 is SSE4.1: a build without that target, Debug, failed)
 inline bool AllZero(__m128i v) { return _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128())) == 0xFFFF; }
+#endif
 
 // equal bytes, 16 at a time: most of the state is compared on every draw
 bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
@@ -486,6 +488,9 @@ private:
             // whole 64 byte pieces in one pass, stopping only at one that changed; the same pieces Delta would send
             size_t off = r.off, end = r.off + r.len;
             for (; off + 64 <= end; off += 64) {
+#if !defined(__x86_64__) && !defined(_M_X64)
+                if (std::memcmp(sent + off, now + off, 64)) Send(off, now + off, 64);  // Arm (Android)
+#else
                 const __m128i* a = reinterpret_cast<const __m128i*>(sent + off);
                 const __m128i* b = reinterpret_cast<const __m128i*>(now + off);
                 __m128i d = _mm_or_si128(_mm_or_si128(_mm_xor_si128(_mm_loadu_si128(a), _mm_loadu_si128(b)),
@@ -493,6 +498,7 @@ private:
                                          _mm_or_si128(_mm_xor_si128(_mm_loadu_si128(a + 2), _mm_loadu_si128(b + 2)),
                                                       _mm_xor_si128(_mm_loadu_si128(a + 3), _mm_loadu_si128(b + 3))));
                 if (!AllZero(d)) Send(off, now + off, 64);
+#endif
             }
             if (off < end) Delta(sent + off, now + off, end - off);
         }

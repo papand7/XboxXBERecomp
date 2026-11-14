@@ -558,13 +558,13 @@ void WindowPixels(uint32_t& width, uint32_t& height) {
 #ifdef __ANDROID__
 // kernel::Relaunch on Android: the app's GameActivity.relaunch(library, environment) starts the image's library in a
 // new process of the app (an exec has no Android form; one process cannot load a second copy of the runtime), with
-// this process's XBE_ and NF_ environment and XBE_RELAUNCHED=1 handed over as the exec keeps them on Linux. The launch
-// data and the hdd are files beside the library, as on the desktop.
+// this process's XBE_, NF_ and AUF_ environment and XBE_RELAUNCHED=1 handed over as the exec keeps them on Linux. The
+// launch data and the hdd are files beside the library, as on the desktop.
 void AndroidRelaunch(const char* exe) {
     setenv("XBE_RELAUNCHED", "1", 1);
     std::vector<std::string> env;
     for (char** e = environ; e && *e; e++)
-        if (!std::strncmp(*e, "XBE_", 4) || !std::strncmp(*e, "NF_", 3)) env.push_back(*e);
+        if (!std::strncmp(*e, "XBE_", 4) || !std::strncmp(*e, "NF_", 3) || !std::strncmp(*e, "AUF_", 4)) env.push_back(*e);
     auto* jni = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
     auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
     bool asked = false;

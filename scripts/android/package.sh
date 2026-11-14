@@ -80,6 +80,13 @@ cmake -S "$REPO" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI="$ABI" \
     -DANDROID_PLATFORM=android-29 -DANDROID_STL=c++_static -DXBE_HOST_TOOLS="$HOSTB" -DXBE_ANDROID_DXC="$DXC" \
     -DXBE_DLSS=OFF > "$B.cfg.log" 2>&1 || { tail -30 "$B.cfg.log"; exit 1; }
+# the programs this disc has (game.json lists every release's: Agent Under Fire's USA disc has no French or German one)
+HAVE=
+for e in $EXES; do
+    grep -q "^build $e: phony" "$B/build.ninja" && HAVE="$HAVE $e"
+done
+EXES=${HAVE# }
+[ -n "$EXES" ] || { echo "package: none of the game's programs is a target of the build" >&2; exit 1; }
 cmake --build "$B" -j "$JOBS" --target $EXES 2>&1 | tee "$B.build.log" || { grep -m 20 -B2 -A8 "error" "$B.build.log" | head -80; exit 1; }
 
 # the package: libraries, DXC, the disc, a manifest the app checks

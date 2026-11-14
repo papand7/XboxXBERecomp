@@ -5,7 +5,9 @@
 #include <cstring>
 
 #include <dxgiformat.h>
+#if defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
+#endif
 
 #include "core/log.h"
 #include "kernel/kernel.h"
@@ -231,7 +233,9 @@ IndexBounds IndexRange(const uint8_t* ip, uint32_t count) {
     uint16_t lo16 = 0xFFFF;
     uint16_t hi16 = 0;
     uint32_t i = 0;
-    // 8 at a time: SSE2 has signed 16 bit min and max only, so each index is offset by 0x8000 first
+#if defined(__x86_64__) || defined(_M_X64)
+    // 8 at a time: SSE2 has signed 16 bit min and max only, so each index is offset by 0x8000 first (Arm: the loop
+    // below, which the compiler vectorises)
     if (count >= 16) {
         const __m128i flip = _mm_set1_epi16(int16_t(0x8000));
         __m128i lo = _mm_set1_epi16(0x7FFF), hi = _mm_set1_epi16(int16_t(0x8000));
@@ -245,6 +249,7 @@ IndexBounds IndexRange(const uint8_t* ip, uint32_t count) {
         _mm_store_si128(reinterpret_cast<__m128i*>(h), _mm_xor_si128(hi, flip));
         for (int k = 0; k < 8; k++) lo16 = std::min(lo16, l[k]), hi16 = std::max(hi16, h[k]);
     }
+#endif
     for (; i < count; i++) {
         uint16_t v;
         std::memcpy(&v, ip + i * 2, 2);
