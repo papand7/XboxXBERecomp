@@ -56,7 +56,10 @@ public:
     // game.json's package: the prebuilt runtime and compiler, unpacked into play (saves, music and settings left alone),
     // then the game's code compiled there. BuildAll takes this way when there is one
     bool BuildPackage(std::string& error);
-    bool Prebuilt() const { return !game_.package.empty() || !game_.packages.empty(); }
+    // the packages hold Windows programs: Linux and macOS build the game from its source
+    bool Prebuilt() const {
+        return platform_.Os() == "windows" && (!game_.package.empty() || !game_.packages.empty());
+    }
     std::string PackageName() const;
     // a game built the old way (its exe with no code DLL beside it): the next build installs the package over it, keeping
     // saves, music and settings
