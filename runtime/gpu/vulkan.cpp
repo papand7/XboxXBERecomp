@@ -829,10 +829,11 @@ float3 grade(float3 c) {
     c *= float3(1 + 0.1 * p[2].x, 1, 1 - 0.1 * p[2].x);
     return saturate(c);
 }
-// noir: black and white, hard, but what is red (blood, lamps, the HUD's red) kept a deep red; the player's own gun
+// noir: black and white, hard, but what is deeply red (blood, lamps, the HUD's red: r over 3.5 times g or b; an orange
+// sunset is not) kept a deep red; the player's own gun
 // and hands never (skin under a red or warm lamp passes for red)
 float3 noir(float3 c, bool hands) {
-    float red = hands ? 0 : saturate((c.r / max(max(c.g, c.b), 0.02) - 2.2) * 2) * saturate(c.r * 4);
+    float red = hands ? 0 : saturate((c.r / max(max(c.g, c.b), 0.02) - 3.5) * 1.5) * saturate(c.r * 4);
     float g = saturate((sqrt(luma(c)) - 0.15) / 0.55);  // a dim level's mid tones kept off black
     g = g * g * (3 - 2 * g);
     return lerp(g.xxx, float3(0.85, 0.03, 0.03) * (0.4 + 0.6 * saturate(c.r * 1.3)), red);
