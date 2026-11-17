@@ -3977,6 +3977,11 @@ private:
     bool fill_lines_ = false;
     bool aniso_ok_ = false;
     bool gs_ok_ = false;  // geometry shaders, which points are drawn with
+    bool bc_ok_ = false;  // BC1-3 images (textureCompressionBC): else DXT textures are decoded to B8G8R8A8
+    PFN_vkGetDeviceFaultInfoEXT get_fault_info_ = nullptr;  // VK_EXT_device_fault, when the driver has it
+    bool lost_told_ = false;
+    // VK_ERROR_DEVICE_LOST: said once, with what the driver tells of the fault
+    void Lost(VkResult r);
     // points as instanced quads instead: no geometry shaders (MoltenVK), or XBE_POINT_QUADS=1 (a test)
     bool PointQuads() const {
         static const bool forced = std::getenv("XBE_POINT_QUADS") != nullptr;
@@ -4311,13 +4316,16 @@ private:
     VkQueryPool stamps_ = VK_NULL_HANDLE;
     uint32_t stamp_written_[kFramesInFlight] = {};  // bits of those written
     // the scene pass's passes timed (XBE_PERF's log): stamp 4 + k after pass k, its time from the stamp before
-    static constexpr uint32_t kStamps = 4 + 24;
-    static constexpr const char* kPassNames[24] = {"relight", "rt ao", "rt reflect", "gtao", "lights", "bounce",
+    static constexpr uint32_t kPasses = 25;  // the timed passes: timed(k) for k below it (a stamp past the pool faulted Mali)
+    static constexpr uint32_t kStamps = 4 + kPasses;
+    static_assert(kStamps <= 32, "stamp_written_ holds a bit per stamp");
+    static constexpr const char* kPassNames[kPasses] = {"relight", "rt ao", "rt reflect", "gtao", "lights", "bounce",
                                                    "atmosphere", "weather", "tone", "style", "smaa", "dof",
                                                    "rt-gi", "rt-lit", "rt-vol", "rt-build",
-                                                   "lt-tiles", "lt-pick", "lt-light", "motion", "contact", "taa-up", "rt-denoise", "particles"};
-    double pass_ms_[24] = {};
-    uint32_t pass_n_[24] = {};
+                                                   "lt-tiles", "lt-pick", "lt-light", "motion", "contact", "taa-up", "rt-denoise", "particles",
+                                                   "blood"};
+    double pass_ms_[kPasses] = {};
+    uint32_t pass_n_[kPasses] = {};
     bool frame_stamp_due_ = true;
     double gpu_frame_ms_ = 0, gpu_post_ms_ = 0;
     double gpu_last_ms_ = 0;     // the last frame read back's GPU time (a performance overlay's, LastFrameStats)
@@ -4663,6 +4671,10 @@ bool VulkanBackend::CreateDevice() {
     void** tail = &f13.pNext;
     if (robust2) *tail = &robust_f, tail = &robust_f.pNext;
     if (border) *tail = &border_f, tail = &border_f.pNext;
+    // what a lost device faulted on (VK_EXT_device_fault: Mali, AMD, NVIDIA), told in the log when it happens
+    const bool fault_ext = HasExtension(ext, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    VkPhysicalDeviceFaultFeaturesEXT fault_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (fault_ext) *tail = &fault_f, tail = &fault_f.pNext;
     if (rt_exts) *tail = &as_f, as_f.pNext = &rq_f, tail = &rq_f.pNext;
     vkGetPhysicalDeviceFeatures2(pd_, &f2);
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
@@ -4698,6 +4710,9 @@ bool VulkanBackend::CreateDevice() {
     on.features.fragmentStoresAndAtomics = f2.features.fragmentStoresAndAtomics;
     // the vertex shaders' depth clip planes (SV_ClipDistance, State::depth_clip: SetDepthClipPlanes)
     on.features.shaderClipDistance = f2.features.shaderClipDistance;
+    // without them (Mali) the shaders write none and the pixel shaders clip instead (gpu::g_clip_distance)
+    g_clip_distance = f2.features.shaderClipDistance;
+    if (!g_clip_distance) LOGR("vulkan: no clip distances; the depth clip planes are done in the pixel shaders");
     // NGX (DLSS) reads its buffers by address
     if (dlss_dev_) on12.bufferDeviceAddress = f12.bufferDeviceAddress;
     // FSR 2's compute shaders (gpu/upscale_fsr.cpp): storage images without a format, wave64 where it asks for it
@@ -4710,7 +4725,10 @@ bool VulkanBackend::CreateDevice() {
     aniso_ok_ = f2.features.samplerAnisotropy;
     gs_ok_ = f2.features.geometryShader;
     if (!f2.features.geometryShader) LOGW("vulkan: no geometry shaders, points are not drawn");
-    if (!f2.features.textureCompressionBC) LOGW("vulkan: no BC texture compression, DXT textures are not drawn");
+    // no BC formats (Mali, Adreno): a BC image there is no image at all, and uploading one crashed the Mali-G715's
+    // driver; DXT textures are made B8G8R8A8 and decoded as they are uploaded instead
+    bc_ok_ = f2.features.textureCompressionBC;
+    if (!bc_ok_) LOGR("vulkan: no BC texture compression; DXT textures are decoded to B8G8R8A8 when uploaded");
     if (robust2 && robust_f.nullDescriptor) {
         want.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
         robust_on.nullDescriptor = VK_TRUE;
@@ -4723,6 +4741,12 @@ bool VulkanBackend::CreateDevice() {
         border_on.customBorderColorWithoutFormat = VK_TRUE;
         *tail = &border_on, tail = &border_on.pNext;
         custom_border_ = true;
+    }
+    VkPhysicalDeviceFaultFeaturesEXT fault_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (fault_ext && fault_f.deviceFault) {
+        want.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        fault_on.deviceFault = VK_TRUE;
+        *tail = &fault_on, tail = &fault_on.pNext;
     }
     // ray tracing: the vertex shaders write the scene's positions (stores), acceleration structures are built from
     // buffers' addresses, ray queries read them, a hit's texture is one of an array (cut-outs, reflections)
@@ -4773,6 +4797,9 @@ bool VulkanBackend::CreateDevice() {
 #undef VK_LOAD_RT
         if (!rt_ok_) LOGW("vulkan: the driver lists ray queries but not all their entry points; no ray tracing");
     }
+    if (fault_on.deviceFault)
+        get_fault_info_ = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(vkGetDeviceProcAddr(dev_, "vkGetDeviceFaultInfoEXT"));
+    if (get_fault_info_) LOGR("vulkan: a lost device's fault is reported (VK_EXT_device_fault)");
     if (rt_ok_) {
         VkPhysicalDeviceAccelerationStructurePropertiesKHR ap{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -4949,6 +4976,7 @@ bool VulkanBackend::CreateSwapchain() {
     ci.oldSwapchain = swap_;
     VkSwapchainKHR made = VK_NULL_HANDLE;
     VkResult r = vkCreateSwapchainKHR(dev_, &ci, nullptr, &made);
+    Lost(r);
     if (swap_) DestroySwapchain();
     if (r != VK_SUCCESS) {
         LOGE("vulkan: no swap chain: %s", VkResultName(r));
@@ -5325,6 +5353,7 @@ void VulkanBackend::Submit(VkSemaphore wait, VkSemaphore signal) {
         r = vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
     }
     if (r != VK_SUCCESS) LOG_FIRST(8, "vulkan: vkQueueSubmit failed: %s", VkResultName(r));
+    Lost(r);
     cmd_ = VK_NULL_HANDLE;
     dirty_ = true;  // the next command buffer has no memory dependency on this one's writes without a barrier
     perf_submits_++;
@@ -5347,7 +5376,37 @@ void VulkanBackend::Wait(uint64_t serial) {
     VkResult r = vkWaitSemaphores(dev_, &wi, 5'000'000'000ull);
     perf_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (r != VK_SUCCESS) LOG_FIRST(8, "vulkan: waiting for the GPU: %s", VkResultName(r));
+    Lost(r);
     Completed();
+}
+
+void VulkanBackend::Lost(VkResult r) {
+    if (r != VK_ERROR_DEVICE_LOST || lost_told_) return;
+    lost_told_ = true;
+    LOGE("vulkan: the GPU device was lost (frame %llu)", (unsigned long long)presents_);
+    if (!get_fault_info_) return;
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (get_fault_info_(dev_, &counts, nullptr) != VK_SUCCESS) return;
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0;  // the vendor's crash dump: not kept
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.data();
+    info.pVendorInfos = vendor.data();
+    VkResult q = get_fault_info_(dev_, &counts, &info);
+    if (q != VK_SUCCESS && q != VK_INCOMPLETE) return;
+    LOGE("vulkan: the fault: %s", info.description);
+    static const char* const kTypes[] = {"none", "read from an invalid address", "write to an invalid address",
+                                         "execution at an invalid address", "instruction pointer (unknown)",
+                                         "instruction pointer (invalid)", "instruction pointer (fault)"};
+    for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
+        const VkDeviceFaultAddressInfoEXT& a = addresses[i];
+        LOGE("vulkan:   %s at 0x%llx (within 0x%llx)", a.addressType < 7 ? kTypes[a.addressType] : "unknown",
+             (unsigned long long)a.reportedAddress, (unsigned long long)a.addressPrecision);
+    }
+    for (uint32_t i = 0; i < counts.vendorInfoCount; i++)
+        LOGE("vulkan:   %s (code 0x%llx, data 0x%llx)", vendor[i].description, (unsigned long long)vendor[i].vendorFaultCode,
+             (unsigned long long)vendor[i].vendorFaultData);
 }
 
 void VulkanBackend::WaitIdle() {
@@ -6396,6 +6455,7 @@ bool VulkanBackend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInf
     tx = Tex{};
     tx.d = d;
     tx.fmt = VkFormatOf(HostFormat(fi.host));
+    if (fi.compressed && !bc_ok_) tx.fmt = VK_FORMAT_B8G8R8A8_UNORM;  // decoded in UploadTexture
     uint32_t w = d.width, h = d.height;
     tx.levels = d.levels;
     if (fi.compressed && ((w & 3) || (h & 3))) {
@@ -6434,14 +6494,29 @@ void VulkanBackend::UploadTexture(Tex& tx, const TextureDesc& d, const uint8_t* 
     uint32_t block = BlockBytes(tx.fmt);
     bool volume = d.depth > 1;
     uint32_t w0 = tx.img.w, h0 = tx.img.h;
-    std::vector<uint8_t> px, rows;
+    // DXT on a GPU without BC formats (CreateTexture made it B8G8R8A8): the blocks decoded here
+    const FormatInfo& fi = Format(d.format);
+    const bool unpack = fi.compressed && !block;
+    std::vector<uint8_t> px, rows, slice;
+    std::vector<uint32_t> texels;
     for (uint32_t f = 0; f < faces; f++) {
         for (uint32_t l = 0; l < tx.levels; l++) {
             uint32_t pitch = 0;
             DecodeLevel(d, l, f, p, colours, px, pitch);
             uint32_t lw = std::max(1u, w0 >> l), lh = std::max(1u, h0 >> l);
-            if (f == 0 && l == 0) tx.glass = GlassScore(tx.fmt, px, pitch, lw, lh, tx.solid);
             uint32_t slices = volume ? std::max(1u, d.depth >> l) : 1;
+            if (unpack && pitch) {
+                const size_t slice_bytes = px.size() / slices;
+                rows.resize(size_t(lw) * lh * 4 * slices);
+                for (uint32_t z = 0; z < slices; z++) {
+                    slice.assign(px.begin() + std::ptrdiff_t(z * slice_bytes), px.begin() + std::ptrdiff_t((z + 1) * slice_bytes));
+                    DecodeBlocksBgra(fi.host, lw, lh, slice, pitch, texels);
+                    std::memcpy(&rows[size_t(z) * lw * lh * 4], texels.data(), size_t(lw) * lh * 4);
+                }
+                px.swap(rows);
+                pitch = lw * 4;
+            }
+            if (f == 0 && l == 0) tx.glass = GlassScore(tx.fmt, px, pitch, lw, lh, tx.solid);
             uint32_t row_bytes = block ? std::max(1u, (lw + 3) / 4) * block : lw * 4;
             uint32_t n_rows = block ? std::max(1u, (lh + 3) / 4) : lh;
             size_t src_rows = pitch ? px.size() / pitch / slices : 0;
@@ -7256,6 +7331,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // the pixel shader made for the textures
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
+    pk.zclip = !g_clip_distance && s.depth_clip ? 1 : 0;
     static const bool wbuffer = [] {
         const char* e = std::getenv("XBE_WBUFFER");
         return !(e && *e == '0');
@@ -9214,6 +9290,7 @@ bool VulkanBackend::Acquire(uint32_t& index) {
     for (int attempt = 0; attempt < 2; attempt++) {
         VkResult r = vkAcquireNextImageKHR(dev_, swap_, UINT64_MAX, acquire_sem_[frame_slot_], VK_NULL_HANDLE, &index);
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) return true;
+        Lost(r);
         if (r != VK_ERROR_OUT_OF_DATE_KHR) {
             LOG_FIRST(8, "vulkan: vkAcquireNextImageKHR failed: %s", VkResultName(r));
             if (r == VK_ERROR_SURFACE_LOST_KHR) surface_generation_--;  // made again at the next frame
@@ -9386,6 +9463,7 @@ void VulkanBackend::Present(const Surface& front) {
         VkResult r = vkQueuePresentKHR(queue_, &pi);
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR)
             LOG_FIRST(8, "vulkan: vkQueuePresentKHR failed: %s", VkResultName(r));
+        Lost(r);
         {
             auto pnow = std::chrono::steady_clock::now();
             double gap = std::chrono::duration<double>(pnow - last_present_).count();
@@ -11268,7 +11346,8 @@ void VulkanBackend::SmaaPass(Target& rt) {
 
 // a timestamp of the frame slot being recorded: 0 frame start, 1 frame end, 2 scene pass start, 3 its end
 void VulkanBackend::Stamp(uint32_t which) {
-    if (!stamps_ || (stamp_written_[frame_slot_] >> which & 1)) return;
+    // past the frame slot's stamps it would be the next slot's, or past the pool (the GPU faulted on Mali)
+    if (!stamps_ || which >= kStamps || (stamp_written_[frame_slot_] >> which & 1)) return;
     vkCmdWriteTimestamp2(Cmd(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, stamps_, frame_slot_ * kStamps + which);
     stamp_written_[frame_slot_] |= 1u << which;
 }
@@ -11288,10 +11367,10 @@ void VulkanBackend::ReadStamps(uint32_t slot) {
     if ((w & 12) == 12 && t[3] > t[2]) gpu_post_ms_ += double(t[3] - t[2]) * ns / 1e6, gpu_posts_++;
     // each pass: from the stamp just before it in time (the scene pass's start, 2, or another pass's end)
     if (w & 4)
-        for (uint32_t k = 0; k < 24; k++) {
+        for (uint32_t k = 0; k < kPasses; k++) {
             if (!(w >> (4 + k) & 1)) continue;
             uint64_t before = t[2];
-            for (uint32_t j = 0; j < 24; j++)
+            for (uint32_t j = 0; j < kPasses; j++)
                 if (j != k && (w >> (4 + j) & 1) && t[4 + j] <= t[4 + k] && t[4 + j] > before) before = t[4 + j];
             if (t[4 + k] >= before) pass_ms_[k] += double(t[4 + k] - before) * ns / 1e6, pass_n_[k]++;
         }
@@ -11321,11 +11400,11 @@ void VulkanBackend::LogPerf() {
     {
         std::string passes;
         char one[48];
-        for (uint32_t k = 0; k < 24; k++)
+        for (uint32_t k = 0; k < kPasses; k++)
             if (pass_n_[k] && kPassNames[k])
                 std::snprintf(one, sizeof(one), " %s %.2f", kPassNames[k], pass_ms_[k] / pass_n_[k]), passes += one;
         if (!passes.empty()) LOGR("perf: vulkan scene passes (GPU ms):%s", passes.c_str());
-        for (uint32_t k = 0; k < 24; k++) pass_ms_[k] = 0, pass_n_[k] = 0;
+        for (uint32_t k = 0; k < kPasses; k++) pass_ms_[k] = 0, pass_n_[k] = 0;
     }
     LOGR("perf: vulkan streamed a frame: %.1f KB in vertex and index data, %.0f indexed draws; %.1f KB of distinct meshes (%zu)",
          perf_bytes_ / n / 1024.0, perf_indexed_ / n, perf_uniq_bytes_ / n / 1024.0, size_t(perf_uniq_count_ / n));

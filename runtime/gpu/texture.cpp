@@ -660,6 +660,11 @@ float Cubic(float t, int i) {  // Catmull-Rom weight of tap i (0..3) around t
 }
 }  // namespace
 
+void DecodeBlocksBgra(Host host, uint32_t w, uint32_t h, const std::vector<uint8_t>& blocks, uint32_t row_pitch,
+                      std::vector<uint32_t>& out) {
+    DecodeBlocks(host, w, h, blocks, row_pitch, out);
+}
+
 bool DecodeBgra(const TextureDesc& d, uint32_t level, const uint8_t* guest, std::vector<uint32_t>& out,
                 const uint32_t* palette) {
     const FormatInfo& fi = Format(d.format);

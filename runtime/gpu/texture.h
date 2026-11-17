@@ -41,6 +41,10 @@ uint32_t TotalSize(const TextureDesc& d);
 // converts one level (one face) from guest memory into what Host describes, rows tightly packed
 void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint8_t* guest, const uint32_t* palette,
                  std::vector<uint8_t>& out, uint32_t& row_pitch);
+// DXT1/3/5 blocks (Host BC1 BC2 BC3 rows from DecodeLevel, row_pitch apart) to w x h B8G8R8A8 texels: for a GPU
+// without BC formats (Mali, Adreno)
+void DecodeBlocksBgra(Host host, uint32_t w, uint32_t h, const std::vector<uint8_t>& blocks, uint32_t row_pitch,
+                      std::vector<uint32_t>& out);
 
 uint32_t LinearColorFormat(uint32_t fmt);
 uint32_t LinearDepthFormat(uint32_t fmt);
