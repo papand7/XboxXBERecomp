@@ -4325,13 +4325,16 @@ private:
     VkQueryPool stamps_ = VK_NULL_HANDLE;
     uint32_t stamp_written_[kFramesInFlight] = {};  // bits of those written
     // the scene pass's passes timed (XBE_PERF's log): stamp 4 + k after pass k, its time from the stamp before
-    static constexpr uint32_t kStamps = 4 + 24;
-    static constexpr const char* kPassNames[24] = {"relight", "rt ao", "rt reflect", "gtao", "lights", "bounce",
+    static constexpr uint32_t kPasses = 25;  // the timed passes: timed(k) for k below it (a stamp past the pool faulted Mali)
+    static constexpr uint32_t kStamps = 4 + kPasses;
+    static_assert(kStamps <= 32, "stamp_written_ holds a bit per stamp");
+    static constexpr const char* kPassNames[kPasses] = {"relight", "rt ao", "rt reflect", "gtao", "lights", "bounce",
                                                    "atmosphere", "weather", "tone", "style", "smaa", "dof",
                                                    "rt-gi", "rt-lit", "rt-vol", "rt-build",
-                                                   "lt-tiles", "lt-pick", "lt-light", "motion", "contact", "taa-up", "rt-denoise", "particles"};
-    double pass_ms_[24] = {};
-    uint32_t pass_n_[24] = {};
+                                                   "lt-tiles", "lt-pick", "lt-light", "motion", "contact", "taa-up", "rt-denoise", "particles",
+                                                   "blood"};
+    double pass_ms_[kPasses] = {};
+    uint32_t pass_n_[kPasses] = {};
     bool frame_stamp_due_ = true;
     double gpu_frame_ms_ = 0, gpu_post_ms_ = 0;
     double gpu_last_ms_ = 0;     // the last frame read back's GPU time (a performance overlay's, LastFrameStats)
@@ -11467,7 +11470,8 @@ void VulkanBackend::SmaaPass(Target& rt) {
 
 // a timestamp of the frame slot being recorded: 0 frame start, 1 frame end, 2 scene pass start, 3 its end
 void VulkanBackend::Stamp(uint32_t which) {
-    if (!stamps_ || (stamp_written_[frame_slot_] >> which & 1)) return;
+    // past the frame slot's stamps it would be the next slot's, or past the pool (the GPU faulted on Mali)
+    if (!stamps_ || which >= kStamps || (stamp_written_[frame_slot_] >> which & 1)) return;
     vkCmdWriteTimestamp2(Cmd(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, stamps_, frame_slot_ * kStamps + which);
     stamp_written_[frame_slot_] |= 1u << which;
 }
@@ -11487,10 +11491,10 @@ void VulkanBackend::ReadStamps(uint32_t slot) {
     if ((w & 12) == 12 && t[3] > t[2]) gpu_post_ms_ += double(t[3] - t[2]) * ns / 1e6, gpu_posts_++;
     // each pass: from the stamp just before it in time (the scene pass's start, 2, or another pass's end)
     if (w & 4)
-        for (uint32_t k = 0; k < 24; k++) {
+        for (uint32_t k = 0; k < kPasses; k++) {
             if (!(w >> (4 + k) & 1)) continue;
             uint64_t before = t[2];
-            for (uint32_t j = 0; j < 24; j++)
+            for (uint32_t j = 0; j < kPasses; j++)
                 if (j != k && (w >> (4 + j) & 1) && t[4 + j] <= t[4 + k] && t[4 + j] > before) before = t[4 + j];
             if (t[4 + k] >= before) pass_ms_[k] += double(t[4 + k] - before) * ns / 1e6, pass_n_[k]++;
         }
@@ -11520,11 +11524,11 @@ void VulkanBackend::LogPerf() {
     {
         std::string passes;
         char one[48];
-        for (uint32_t k = 0; k < 24; k++)
+        for (uint32_t k = 0; k < kPasses; k++)
             if (pass_n_[k] && kPassNames[k])
                 std::snprintf(one, sizeof(one), " %s %.2f", kPassNames[k], pass_ms_[k] / pass_n_[k]), passes += one;
         if (!passes.empty()) LOGR("perf: vulkan scene passes (GPU ms):%s", passes.c_str());
-        for (uint32_t k = 0; k < 24; k++) pass_ms_[k] = 0, pass_n_[k] = 0;
+        for (uint32_t k = 0; k < kPasses; k++) pass_ms_[k] = 0, pass_n_[k] = 0;
     }
     LOGR("perf: vulkan streamed a frame: %.1f KB in vertex and index data, %.0f indexed draws; %.1f KB of distinct meshes (%zu)",
          perf_bytes_ / n / 1024.0, perf_indexed_ / n, perf_uniq_bytes_ / n / 1024.0, size_t(perf_uniq_count_ / n));
