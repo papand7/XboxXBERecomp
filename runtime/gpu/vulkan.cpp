@@ -3991,6 +3991,10 @@ private:
     bool aniso_ok_ = false;
     bool gs_ok_ = false;  // geometry shaders, which points are drawn with
     bool bc_ok_ = false;  // BC1-3 images (textureCompressionBC): else DXT textures are decoded to B8G8R8A8
+    PFN_vkGetDeviceFaultInfoEXT get_fault_info_ = nullptr;  // VK_EXT_device_fault, when the driver has it
+    bool lost_told_ = false;
+    // VK_ERROR_DEVICE_LOST: said once, with what the driver tells of the fault
+    void Lost(VkResult r);
     // points as instanced quads instead: no geometry shaders (MoltenVK), or XBE_POINT_QUADS=1 (a test)
     bool PointQuads() const {
         static const bool forced = std::getenv("XBE_POINT_QUADS") != nullptr;
@@ -4753,6 +4757,10 @@ bool VulkanBackend::CreateDevice() {
     void** tail = &f13.pNext;
     if (robust2) *tail = &robust_f, tail = &robust_f.pNext;
     if (border) *tail = &border_f, tail = &border_f.pNext;
+    // what a lost device faulted on (VK_EXT_device_fault: Mali, AMD, NVIDIA), told in the log when it happens
+    const bool fault_ext = HasExtension(ext, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    VkPhysicalDeviceFaultFeaturesEXT fault_f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (fault_ext) *tail = &fault_f, tail = &fault_f.pNext;
     if (rt_exts) *tail = &as_f, as_f.pNext = &rq_f, tail = &rq_f.pNext;
     vkGetPhysicalDeviceFeatures2(pd_, &f2);
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
@@ -4821,6 +4829,12 @@ bool VulkanBackend::CreateDevice() {
         *tail = &border_on, tail = &border_on.pNext;
         custom_border_ = true;
     }
+    VkPhysicalDeviceFaultFeaturesEXT fault_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (fault_ext && fault_f.deviceFault) {
+        want.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        fault_on.deviceFault = VK_TRUE;
+        *tail = &fault_on, tail = &fault_on.pNext;
+    }
     // ray tracing: the vertex shaders write the scene's positions (stores), acceleration structures are built from
     // buffers' addresses, ray queries read them, a hit's texture is one of an array (cut-outs, reflections)
     if (rt_exts && as_f.accelerationStructure && rq_f.rayQuery && f12.bufferDeviceAddress &&
@@ -4871,6 +4885,9 @@ bool VulkanBackend::CreateDevice() {
 #undef VK_LOAD_RT
         if (!rt_ok_) LOGW("vulkan: the driver lists ray queries but not all their entry points; no ray tracing");
     }
+    if (fault_on.deviceFault)
+        get_fault_info_ = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(vkGetDeviceProcAddr(dev_, "vkGetDeviceFaultInfoEXT"));
+    if (get_fault_info_) LOGR("vulkan: a lost device's fault is reported (VK_EXT_device_fault)");
     if (rt_ok_) {
         VkPhysicalDeviceAccelerationStructurePropertiesKHR ap{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -5054,6 +5071,7 @@ bool VulkanBackend::CreateSwapchain() {
     ci.oldSwapchain = swap_;
     VkSwapchainKHR made = VK_NULL_HANDLE;
     r = vkCreateSwapchainKHR(dev_, &ci, nullptr, &made);
+    Lost(r);
     if (swap_) DestroySwapchain();
     if (r != VK_SUCCESS) {
         LOGE("vulkan: no swap chain (%ux%u, format %d, present mode %d): %s", w, h, int(sf.format), int(present_mode_),
@@ -5483,6 +5501,7 @@ void VulkanBackend::Submit(VkSemaphore wait, VkSemaphore signal) {
         r = vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
     }
     if (r != VK_SUCCESS) LOG_FIRST(8, "vulkan: vkQueueSubmit failed: %s", VkResultName(r));
+    Lost(r);
     cmd_ = VK_NULL_HANDLE;
     dirty_ = true;  // the next command buffer has no memory dependency on this one's writes without a barrier
     perf_submits_++;
@@ -5505,7 +5524,37 @@ void VulkanBackend::Wait(uint64_t serial) {
     VkResult r = vkWaitSemaphores(dev_, &wi, 5'000'000'000ull);
     perf_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (r != VK_SUCCESS) LOG_FIRST(8, "vulkan: waiting for the GPU: %s", VkResultName(r));
+    Lost(r);
     Completed();
+}
+
+void VulkanBackend::Lost(VkResult r) {
+    if (r != VK_ERROR_DEVICE_LOST || lost_told_) return;
+    lost_told_ = true;
+    LOGE("vulkan: the GPU device was lost (frame %llu)", (unsigned long long)presents_);
+    if (!get_fault_info_) return;
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (get_fault_info_(dev_, &counts, nullptr) != VK_SUCCESS) return;
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0;  // the vendor's crash dump: not kept
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.data();
+    info.pVendorInfos = vendor.data();
+    VkResult q = get_fault_info_(dev_, &counts, &info);
+    if (q != VK_SUCCESS && q != VK_INCOMPLETE) return;
+    LOGE("vulkan: the fault: %s", info.description);
+    static const char* const kTypes[] = {"none", "read from an invalid address", "write to an invalid address",
+                                         "execution at an invalid address", "instruction pointer (unknown)",
+                                         "instruction pointer (invalid)", "instruction pointer (fault)"};
+    for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
+        const VkDeviceFaultAddressInfoEXT& a = addresses[i];
+        LOGE("vulkan:   %s at 0x%llx (within 0x%llx)", a.addressType < 7 ? kTypes[a.addressType] : "unknown",
+             (unsigned long long)a.reportedAddress, (unsigned long long)a.addressPrecision);
+    }
+    for (uint32_t i = 0; i < counts.vendorInfoCount; i++)
+        LOGE("vulkan:   %s (code 0x%llx, data 0x%llx)", vendor[i].description, (unsigned long long)vendor[i].vendorFaultCode,
+             (unsigned long long)vendor[i].vendorFaultData);
 }
 
 void VulkanBackend::WaitIdle() {
@@ -9403,6 +9452,7 @@ bool VulkanBackend::Acquire(uint32_t& index) {
     for (int attempt = 0; attempt < 2; attempt++) {
         VkResult r = vkAcquireNextImageKHR(dev_, swap_, UINT64_MAX, acquire_sem_[frame_slot_], VK_NULL_HANDLE, &index);
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) return true;
+        Lost(r);
         if (r != VK_ERROR_OUT_OF_DATE_KHR) {
             LOG_FIRST(8, "vulkan: vkAcquireNextImageKHR failed: %s", VkResultName(r));
             if (r == VK_ERROR_SURFACE_LOST_KHR) surface_lost_ = true;
@@ -9582,6 +9632,7 @@ void VulkanBackend::Present(const Surface& front) {
         } else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
             LOG_FIRST(8, "vulkan: vkQueuePresentKHR failed: %s", VkResultName(r));
         }
+        Lost(r);
         {
             auto pnow = std::chrono::steady_clock::now();
             double gap = std::chrono::duration<double>(pnow - last_present_).count();
