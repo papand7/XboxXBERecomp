@@ -3990,6 +3990,7 @@ private:
     bool fill_lines_ = false;
     bool aniso_ok_ = false;
     bool gs_ok_ = false;  // geometry shaders, which points are drawn with
+    bool bc_ok_ = false;  // BC1-3 images (textureCompressionBC): else DXT textures are decoded to B8G8R8A8
     // points as instanced quads instead: no geometry shaders (MoltenVK), or XBE_POINT_QUADS=1 (a test)
     bool PointQuads() const {
         static const bool forced = std::getenv("XBE_POINT_QUADS") != nullptr;
@@ -4800,7 +4801,10 @@ bool VulkanBackend::CreateDevice() {
     aniso_ok_ = f2.features.samplerAnisotropy;
     gs_ok_ = f2.features.geometryShader;
     if (!f2.features.geometryShader) LOGW("vulkan: no geometry shaders, points are not drawn");
-    if (!f2.features.textureCompressionBC) LOGW("vulkan: no BC texture compression, DXT textures are not drawn");
+    // no BC formats (Mali, Adreno): a BC image there is no image at all, and uploading one crashed the Mali-G715's
+    // driver; DXT textures are made B8G8R8A8 and decoded as they are uploaded instead
+    bc_ok_ = f2.features.textureCompressionBC;
+    if (!bc_ok_) LOGR("vulkan: no BC texture compression; DXT textures are decoded to B8G8R8A8 when uploaded");
     if (robust2 && robust_f.nullDescriptor) {
         want.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
         robust_on.nullDescriptor = VK_TRUE;
@@ -6547,6 +6551,7 @@ bool VulkanBackend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInf
     tx = Tex{};
     tx.d = d;
     tx.fmt = VkFormatOf(HostFormat(fi.host));
+    if (fi.compressed && !bc_ok_) tx.fmt = VK_FORMAT_B8G8R8A8_UNORM;  // decoded in UploadTexture
     uint32_t w = d.width, h = d.height;
     tx.levels = d.levels;
     if (fi.compressed && ((w & 3) || (h & 3))) {
@@ -6585,14 +6590,29 @@ void VulkanBackend::UploadTexture(Tex& tx, const TextureDesc& d, const uint8_t* 
     uint32_t block = BlockBytes(tx.fmt);
     bool volume = d.depth > 1;
     uint32_t w0 = tx.img.w, h0 = tx.img.h;
-    std::vector<uint8_t> px, rows;
+    // DXT on a GPU without BC formats (CreateTexture made it B8G8R8A8): the blocks decoded here
+    const FormatInfo& fi = Format(d.format);
+    const bool unpack = fi.compressed && !block;
+    std::vector<uint8_t> px, rows, slice;
+    std::vector<uint32_t> texels;
     for (uint32_t f = 0; f < faces; f++) {
         for (uint32_t l = 0; l < tx.levels; l++) {
             uint32_t pitch = 0;
             DecodeLevel(d, l, f, p, colours, px, pitch);
             uint32_t lw = std::max(1u, w0 >> l), lh = std::max(1u, h0 >> l);
-            if (f == 0 && l == 0) tx.glass = GlassScore(tx.fmt, px, pitch, lw, lh, tx.solid);
             uint32_t slices = volume ? std::max(1u, d.depth >> l) : 1;
+            if (unpack && pitch) {
+                const size_t slice_bytes = px.size() / slices;
+                rows.resize(size_t(lw) * lh * 4 * slices);
+                for (uint32_t z = 0; z < slices; z++) {
+                    slice.assign(px.begin() + std::ptrdiff_t(z * slice_bytes), px.begin() + std::ptrdiff_t((z + 1) * slice_bytes));
+                    DecodeBlocksBgra(fi.host, lw, lh, slice, pitch, texels);
+                    std::memcpy(&rows[size_t(z) * lw * lh * 4], texels.data(), size_t(lw) * lh * 4);
+                }
+                px.swap(rows);
+                pitch = lw * 4;
+            }
+            if (f == 0 && l == 0) tx.glass = GlassScore(tx.fmt, px, pitch, lw, lh, tx.solid);
             uint32_t row_bytes = block ? std::max(1u, (lw + 3) / 4) * block : lw * 4;
             uint32_t n_rows = block ? std::max(1u, (lh + 3) / 4) : lh;
             size_t src_rows = pitch ? px.size() / pitch / slices : 0;
