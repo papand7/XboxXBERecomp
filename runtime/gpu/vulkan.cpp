@@ -4785,6 +4785,9 @@ bool VulkanBackend::CreateDevice() {
     on.features.fragmentStoresAndAtomics = f2.features.fragmentStoresAndAtomics;
     // the vertex shaders' depth clip planes (SV_ClipDistance, State::depth_clip: SetDepthClipPlanes)
     on.features.shaderClipDistance = f2.features.shaderClipDistance;
+    // without them (Mali) the shaders write none and the pixel shaders clip instead (gpu::g_clip_distance)
+    g_clip_distance = f2.features.shaderClipDistance;
+    if (!g_clip_distance) LOGR("vulkan: no clip distances; the depth clip planes are done in the pixel shaders");
     // NGX (DLSS) reads its buffers by address
     if (dlss_dev_) on12.bufferDeviceAddress = f12.bufferDeviceAddress;
     // FSR 2's compute shaders (gpu/upscale_fsr.cpp): storage images without a format, wave64 where it asks for it
@@ -7404,6 +7407,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // the pixel shader made for the textures
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
+    pk.zclip = !g_clip_distance && s.depth_clip ? 1 : 0;
     static const bool wbuffer = [] {
         const char* e = std::getenv("XBE_WBUFFER");
         return !(e && *e == '0');

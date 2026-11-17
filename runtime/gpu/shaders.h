@@ -55,6 +55,7 @@ struct PixelKey {
     uint32_t quad = 0;       // a screen quad: QuadHlsl
     uint32_t wbuf = 0;       // D3DZB_USEW: the depth written is the pixel's w (DrawConstants::wdepth)
     uint32_t coverage = 0;   // Settings::alpha_coverage: the target's samples, an alpha test becomes partial coverage
+    uint32_t zclip = 0;      // the depth clip planes set on a GPU without clip distances (g_clip_distance): VOut::clipz clipped here
     bool operator==(const PixelKey& o) const;
 };
 
@@ -110,6 +111,10 @@ struct ShaderHooks {
     virtual std::string Output() const;
 };
 inline const ShaderHooks* g_shader_hooks = nullptr;
+// the GPU has clip distances (Vulkan's shaderClipDistance), the backend's to say before shaders are made. Without them
+// VOut::clipz (the depth clip planes, DrawConstants::zclip) is a plain varying the pixel shader clips by (PixelKey::zclip):
+// Mali GPUs lack the feature, and the Mali-G715's driver crashes compiling a vertex shader that writes SV_ClipDistance
+inline bool g_clip_distance = true;
 
 // the constant buffer layout both stages share, register b1
 struct DrawConstants {

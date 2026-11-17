@@ -77,7 +77,16 @@ const ShaderHooks& Hooks() {
     return g_shader_hooks ? *g_shader_hooks : plain;
 }
 
-std::string Common() { return kCommonHead + Hooks().Constants() + kCommonTail; }
+std::string Common() {
+    std::string head = kCommonHead;
+    // no clip distances: zclip goes to the pixel shader as a plain varying (PixelKey::zclip clips by it there)
+    if (!g_clip_distance) {
+        static const char kClip[] = "SV_ClipDistance0";
+        size_t at = head.find(kClip);
+        if (at != std::string::npos) head.replace(at, sizeof(kClip) - 1, "ZCLIP");
+    }
+    return head + Hooks().Constants() + kCommonTail;
+}
 
 // vertex programs
 
@@ -955,6 +964,9 @@ std::string PixelHlsl(const PixelKey& k) {
     } else {
         s += F("float4 main(VOut i, bool front : SV_IsFrontFace%s) : SV_Target {\n", k.coverage ? ", out uint cov : SV_Coverage" : "");
     }
+    // the depth clip planes on a GPU without clip distances: what they would have cut away is discarded (only in the
+    // draws they are set for, so the rest keep their early depth test)
+    if (k.zclip) s += "    clip(i.clipz);\n";
     s += "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = i.tc3;\n";
     s += k.two_sided ? "    float4 v0 = front ? i.d0 : i.b0, v1 = front ? i.d1 : i.b1;\n" : "    float4 v0 = i.d0, v1 = i.d1;\n";
     // D3DRS_SPECULARENABLE off: no specular added at the end; a texture stage's D3DTA_SPECULAR still reads it (True Crime's
