@@ -197,6 +197,10 @@ struct Service {
             std::ofstream(root / "agreed.txt") << kLicenseUrl;
             Send(State());
         } else if (cmd == "build") {
+            if (busy && job_name == "build") {  // a second click while it runs is not an error
+                Send(State());
+                return;
+            }
             if (!copy.ok) {
                 Send({{"ev", "error"}, {"message", copy.error.empty() ? "No game copy yet." : copy.error}});
                 return;

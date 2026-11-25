@@ -27,6 +27,11 @@ FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3)
 # run time too)
 FetchContent_Declare(VulkanHeaders URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.296.tar.gz
     URL_HASH SHA256=e204e0b3c19f622d197df945737f5db913d6621830999b8578d34e80a7c90585)
+# only its headers are used: its C++ module (CMake 3.28+'s scanning) needs a full standard library that the launcher's
+# clang-scan-deps does not find on Windows
+set(VULKAN_HEADERS_ENABLE_MODULE OFF CACHE BOOL "" FORCE)
+set(VULKAN_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+set(VULKAN_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 if(WIN32)
     FetchContent_Declare(dxc URL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2407/dxc_2024_07_31.zip
         URL_HASH SHA256=e2627f004f0f9424d8c71ea1314d04f38c5a5096884ae9217f1f18bd320267b5)

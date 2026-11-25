@@ -41,9 +41,12 @@ if [ ! -f "$SRC/CMakeLists.txt" ]; then
     git clone -q --depth 1 --branch "$TAG" --recurse-submodules --shallow-submodules \
         https://github.com/microsoft/DirectXShaderCompiler.git "$SRC"
 fi
+# CMake 4 removed compatibility with the old minimums and CMP0051 OLD that this DXC tag still carries
+sed -i 's/cmake_policy(SET CMP0051 OLD)/cmake_policy(SET CMP0051 NEW)/' "$SRC/CMakeLists.txt"
+sed -i 's/cmake_minimum_required(VERSION 2\.8\.8)/cmake_minimum_required(VERSION 3.5)/' "$SRC/tools/clang/CMakeLists.txt"
 COMMON=(-G Ninja -C "$SRC/cmake/caches/PredefinedParams.cmake" -DCMAKE_BUILD_TYPE=Release -DHLSL_INCLUDE_TESTS=OFF
         -DLLVM_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_TESTS=OFF -DSPIRV_BUILD_TESTS=OFF -DLLVM_ENABLE_TERMINFO=OFF
-        -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF)
+        -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
 HOST=$WORK/host
 if [ ! -x "$HOST/bin/llvm-tblgen" ] || [ ! -x "$HOST/bin/clang-tblgen" ]; then
     cmake -S "$SRC" -B "$HOST" "${COMMON[@]}" -DCMAKE_C_COMPILER=${CC:-clang} -DCMAKE_CXX_COMPILER=${CXX:-clang++} > "$WORK/host.cfg.log"

@@ -3808,6 +3808,7 @@ private:
     // Init, in order
     bool LoadVulkan();
     bool CreateInstance();
+    bool CreateSurface();
     bool PickDevice();
     bool NextDevice();
     bool CreateDevice();
@@ -3946,6 +3947,8 @@ private:
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     uint32_t surface_generation_ = 0;  // app::SurfaceGeneration's when surface_ was made
     VkSwapchainKHR swap_ = VK_NULL_HANDLE;
+    bool swap_stale_ = false;   // present said out of date: make it again
+    bool surface_lost_ = false; // the window's drawable went away: make the surface again
     VkFormat swap_fmt_ = kBgra;
     // HDR (Settings::hdr): an HDR10 swap chain (PQ, BT.2020) where the screen offers one (Windows' HDR on); the frame
     // and the overlay drawn at the screen's size first (hdr_sdr_, hdr_ui_: the overlay premultiplied), then HdrOut.
@@ -4555,6 +4558,10 @@ bool VulkanBackend::CreateInstance() {
         vkCreateDebugUtilsMessengerEXT(instance_, &mi, nullptr, &messenger_);
         LOGR("vulkan: validation %s", layers.empty() ? "unavailable" : "on");
     }
+    return CreateSurface();
+}
+
+bool VulkanBackend::CreateSurface() {
 #ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     si.hinstance = GetModuleHandleW(nullptr);
@@ -5064,6 +5071,7 @@ bool VulkanBackend::CreateSwapchain() {
     }
     bb_w_ = w;
     bb_h_ = h;
+    swap_stale_ = false;
     return true;
 }
 
@@ -9334,20 +9342,34 @@ void VulkanBackend::CountFps() {
 // the next swap chain image, the chain made again when the window changed size or the vsync setting changed
 bool VulkanBackend::Acquire(uint32_t& index) {
 #ifndef _WIN32
-    // Android: nothing to show on in the background; back, the window has a new surface to make the chain on
+    // Android: nothing to show on in the background
     if (app::Backgrounded()) return false;
-    if (uint32_t g = app::SurfaceGeneration(); g != surface_generation_) {
-        surface_generation_ = g;
+    // the window's surface went away, or was made again after showing/fullscreen
+    uint32_t generation = app::SurfaceGeneration();
+    if (surface_lost_ || generation != surface_generation_) {
+        surface_lost_ = false;
+        surface_generation_ = generation;
         if (swap_) DestroySwapchain();
         if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
         surface_ = VK_NULL_HANDLE;
-        if (!app::CreateVulkanSurface(instance_, &surface_)) return false;
+        if (!CreateSurface()) return false;
+        LOGR("vulkan: the window's surface made again");
+    }
+#else
+    if (surface_lost_) {
+        surface_lost_ = false;
+        if (swap_) DestroySwapchain();
+        if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
+        surface_ = VK_NULL_HANDLE;
+        if (!CreateSurface()) return false;
         LOGR("vulkan: the window's surface made again");
     }
 #endif
     uint32_t w = 1, h = 1;
     WindowSize(w, h);
-    if (!swap_ || w != bb_w_ || h != bb_h_ || swap_vsync_ != WantVsync() || swap_hdr_asked_ != app::Get().hdr) {
+    if (swap_stale_ || !swap_ || w != bb_w_ || h != bb_h_ || swap_vsync_ != WantVsync() ||
+        swap_hdr_asked_ != app::Get().hdr) {
+        swap_stale_ = false;
         if (!CreateSwapchain()) return false;
         if (ui_) ImGui_ImplVulkan_SetMinImageCount(2);
     }
@@ -9356,9 +9378,10 @@ bool VulkanBackend::Acquire(uint32_t& index) {
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) return true;
         if (r != VK_ERROR_OUT_OF_DATE_KHR) {
             LOG_FIRST(8, "vulkan: vkAcquireNextImageKHR failed: %s", VkResultName(r));
-            if (r == VK_ERROR_SURFACE_LOST_KHR) surface_generation_--;  // made again at the next frame
+            if (r == VK_ERROR_SURFACE_LOST_KHR) surface_lost_ = true;
             return false;
         }
+        swap_stale_ = false;
         if (!CreateSwapchain()) return false;
     }
     return false;
@@ -9524,8 +9547,14 @@ void VulkanBackend::Present(const Surface& front) {
         pi.pSwapchains = &swap_;
         pi.pImageIndices = &index;
         VkResult r = vkQueuePresentKHR(queue_, &pi);
-        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR)
+        if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+            swap_stale_ = true;
+        } else if (r == VK_ERROR_SURFACE_LOST_KHR) {
+            swap_stale_ = true;
+            surface_lost_ = true;
+        } else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
             LOG_FIRST(8, "vulkan: vkQueuePresentKHR failed: %s", VkResultName(r));
+        }
         {
             auto pnow = std::chrono::steady_clock::now();
             double gap = std::chrono::duration<double>(pnow - last_present_).count();
@@ -9706,8 +9735,14 @@ void VulkanBackend::MidFrame() {
     pi.pSwapchains = &swap_;
     pi.pImageIndices = &index;
     VkResult r = vkQueuePresentKHR(queue_, &pi);
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR)
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        swap_stale_ = true;
+    } else if (r == VK_ERROR_SURFACE_LOST_KHR) {
+        swap_stale_ = true;
+        surface_lost_ = true;
+    } else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         LOG_FIRST(8, "vulkan: the in-between frame's present failed: %s", VkResultName(r));
+    }
     warp_frames_++;
     Unbind();
     ForgetDrawState();  // the title's next draw binds its own again

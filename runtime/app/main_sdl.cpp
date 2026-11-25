@@ -244,13 +244,25 @@ bool HandleEvent(const SDL_Event& e) {
         if (e.user.code == kApplyDisplay) {
             if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) SDL_RestoreWindow(g_window);
             ApplyNow();
+#ifdef __APPLE__
+            g_surface_generation++;  // the window's layer is new after a display change
+#endif
             g_apply_posted = false;
         } else if (e.user.code == kOpenWindow) {
             auto* r = static_cast<OpenRequest*>(e.user.data1);
             CloseSplash();
+#ifdef __APPLE__
+            // show the window first: macOS enters a fullscreen space only once the window is visible, and the
+            // Vulkan surface must be made again on the visible window's layer
+            SDL_ShowWindow(g_window);
+            if (r->apply) ApplyNow();
+            SDL_RaiseWindow(g_window);
+            g_surface_generation++;
+#else
             if (r->apply) ApplyNow();
             SDL_ShowWindow(g_window);
             SDL_RaiseWindow(g_window);
+#endif
             ReadRefreshRate();
             std::lock_guard lock(r->lock);
             r->done = true;
@@ -654,8 +666,14 @@ int main(int argc, char** argv) {
     if (handover) {
         app::ApplyNow();
     } else if (!splash) {
+#ifdef __APPLE__
+        // macOS: show first, then enter fullscreen, so the window has a layer to draw on
+        SDL_ShowWindow(app::g_window);
+        app::ApplyNow();
+#else
         app::ApplyNow();
         SDL_ShowWindow(app::g_window);
+#endif
     }
 
     IMGUI_CHECKVERSION();
