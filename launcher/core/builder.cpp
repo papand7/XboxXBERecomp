@@ -242,7 +242,19 @@ fs::path Builder::SavedGame() const {
     if (!ReadAll(root_ / "launcher.json", text)) return {};
     json j = json::parse(text, nullptr, false);
     if (j.is_discarded()) return {};
-    return PathOf(j.value("game", ""));
+    fs::path saved = PathOf(j.value("game", ""));
+    std::error_code ec;
+    if (!saved.empty() && fs::exists(saved, ec)) return saved;
+    // the original may be in iCloud (or another folder) and not be there yet: play/assets holds the linked or copied
+    // image the build used, so the launcher still finds the game
+    fs::path assets = PlayDir() / "assets";
+    if (!saved.empty()) {
+        fs::path linked = assets / saved.filename();
+        if (fs::exists(linked, ec)) return linked;
+    }
+    for (const auto& e : fs::directory_iterator(assets, ec))
+        if (e.is_regular_file(ec) && Lower(U8(e.path().extension())) == ".iso") return e.path();
+    return saved;
 }
 
 bool Builder::SetGame(const GameCheck& copy, std::string& error) {
@@ -260,6 +272,7 @@ bool Builder::SetGame(const GameCheck& copy, std::string& error) {
         error = "Cannot replace " + U8(assets) + ": remove it by hand and choose the game again.";
         return false;
     }
+    fs::path remembered = copy.path;
     if (copy.iso) {
         fs::create_directories(assets, ec);
         fs::path to = assets / copy.path.filename();
@@ -284,10 +297,12 @@ bool Builder::SetGame(const GameCheck& copy, std::string& error) {
                 return false;
             }
         }
+        // the launcher's own link/copy, not the player's original (iCloud may remove it): the launcher keeps the game
+        remembered = to;
     } else if (!platform_.LinkFolder(assets, copy.path, error)) {
         return false;
     }
-    Remember("game", U8(copy.path));
+    Remember("game", U8(remembered));
     Remember("game_sha1", copy.sha1);
     Log("game: " + U8(copy.path) + ", " + copy.release + ", sha1 " + copy.sha1);
     return true;
