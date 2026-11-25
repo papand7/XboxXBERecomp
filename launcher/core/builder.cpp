@@ -243,8 +243,10 @@ fs::path Builder::SavedGame() const {
     json j = json::parse(text, nullptr, false);
     if (j.is_discarded()) return {};
     fs::path saved = PathOf(j.value("game", ""));
+    if (saved.empty()) return {};
+    if (saved.is_relative()) saved = root_ / saved;
     std::error_code ec;
-    if (!saved.empty() && fs::exists(saved, ec)) return saved;
+    if (fs::exists(saved, ec)) return saved;
     // the original may be in iCloud (or another folder) and not be there yet: play/assets holds the linked or copied
     // image the build used, so the launcher still finds the game
     fs::path assets = PlayDir() / "assets";
@@ -302,7 +304,9 @@ bool Builder::SetGame(const GameCheck& copy, std::string& error) {
     } else if (!platform_.LinkFolder(assets, copy.path, error)) {
         return false;
     }
-    Remember("game", U8(remembered));
+    std::error_code rel_ec;
+    fs::path stored = fs::relative(remembered, root_, rel_ec);
+    Remember("game", U8(rel_ec ? remembered : stored));
     Remember("game_sha1", copy.sha1);
     Log("game: " + U8(copy.path) + ", " + copy.release + ", sha1 " + copy.sha1);
     return true;
