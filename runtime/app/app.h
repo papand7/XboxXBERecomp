@@ -87,6 +87,9 @@ struct Settings {
     bool pause_unfocused = false;    // the game stands still, silent, while its window is not in front
     bool occlusion_filter = true;    // sounds the title reports behind walls dulled by a low-pass (audio::SetOcclusion)
     bool show_fps = false;           // frames a second in a corner
+    // cheats (the launcher's Cheats page): the player takes no damage, and every weapon keeps its ammo
+    bool god_mode = false;
+    bool infinite_ammo = false;
     // Discord Rich Presence (discord.cpp): on, and the application's id from Discord's developer portal (empty: off)
     bool discord = true;
     std::string discord_app_id;

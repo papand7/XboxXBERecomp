@@ -260,6 +260,8 @@ void Load() {
     s.pause_unfocused = t["pause_unfocused"].value_or(s.pause_unfocused);
     s.occlusion_filter = t["occlusion_filter"].value_or(s.occlusion_filter);
     s.show_fps = t["show_fps"].value_or(s.show_fps);
+    s.god_mode = t["god_mode"].value_or(s.god_mode);
+    s.infinite_ammo = t["infinite_ammo"].value_or(s.infinite_ammo);
     s.perf_overlay = t["perf_overlay"].value_or(s.perf_overlay);
     s.screenshot_key = t["screenshot_key"].value_or(s.screenshot_key);
     s.discord = t["discord"].value_or(s.discord);
@@ -417,6 +419,8 @@ toml::table Table() {
                   {"pause_unfocused", s.pause_unfocused},
                   {"occlusion_filter", s.occlusion_filter},
                   {"show_fps", s.show_fps},
+                  {"god_mode", s.god_mode},
+                  {"infinite_ammo", s.infinite_ammo},
                   {"perf_overlay", s.perf_overlay},
                   {"screenshot_key", int64_t(s.screenshot_key)},
                   {"discord", s.discord},
