@@ -3809,6 +3809,7 @@ private:
     bool LoadVulkan();
     bool CreateInstance();
     bool PickDevice();
+    bool NextDevice();
     bool CreateDevice();
     bool CreateSwapchain();
     void DestroySwapchain();
@@ -3932,6 +3933,15 @@ private:
     VkPhysicalDeviceProperties props_{};
     VkDevice dev_ = VK_NULL_HANDLE;
     uint32_t family_ = 0;
+    // every physical device that can present here, best first; CreateDevice falls through the list
+    struct DeviceCandidate {
+        VkPhysicalDevice pd = VK_NULL_HANDLE;
+        uint32_t family = 0;
+        VkPhysicalDeviceProperties props{};
+        uint64_t local_memory = 0;
+    };
+    std::vector<DeviceCandidate> device_candidates_;
+    size_t device_candidate_ = 0;
     VkQueue queue_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     uint32_t surface_generation_ = 0;  // app::SurfaceGeneration's when surface_ was made
@@ -4447,11 +4457,18 @@ bool VulkanBackend::LoadVulkan() {
         vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib_, "vkGetInstanceProcAddr"));
     }
 #endif
-    if (!vkGetInstanceProcAddr) return false;
+    if (!vkGetInstanceProcAddr) {
+        LOGE("vulkan: the loader has no vkGetInstanceProcAddr");
+        return false;
+    }
 #define VK_LOAD(f) f = reinterpret_cast<PFN_##f>(vkGetInstanceProcAddr(nullptr, #f));
     VK_GLOBAL_FUNCS(VK_LOAD)
 #undef VK_LOAD
-    return vkCreateInstance != nullptr;
+    if (!vkCreateInstance) {
+        LOGE("vulkan: the loader has no vkCreateInstance");
+        return false;
+    }
+    return true;
 }
 
 bool VulkanBackend::CreateInstance() {
@@ -4466,7 +4483,10 @@ bool VulkanBackend::CreateInstance() {
     std::vector<const char*> exts = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
 #else
     std::vector<const char*> exts = app::VulkanInstanceExtensions();  // the window's (SDL's)
-    if (exts.empty()) return false;
+    if (exts.empty()) {
+        LOGE("vulkan: the window has no Vulkan instance extensions");
+        return false;
+    }
 #endif
     {
         // HDR: the swap chain's colour spaces past sRGB (HDR10's)
@@ -4539,12 +4559,16 @@ bool VulkanBackend::CreateInstance() {
     VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     si.hinstance = GetModuleHandleW(nullptr);
     si.hwnd = static_cast<HWND>(app::Window());
-    if (vkCreateWin32SurfaceKHR(instance_, &si, nullptr, &surface_) != VK_SUCCESS) {
-        LOGE("vulkan: no surface for the window");
+    VkResult sr = vkCreateWin32SurfaceKHR(instance_, &si, nullptr, &surface_);
+    if (sr != VK_SUCCESS) {
+        LOGE("vulkan: no surface for the window: %s", VkResultName(sr));
         return false;
     }
 #else
-    if (!app::CreateVulkanSurface(instance_, &surface_)) return false;
+    if (!app::CreateVulkanSurface(instance_, &surface_)) {
+        LOGE("vulkan: no surface for the window");
+        return false;
+    }
 #endif
     return true;
 }
@@ -4555,15 +4579,26 @@ bool HasExtension(const std::vector<VkExtensionProperties>& list, const char* na
     return false;
 }
 
-// a discrete GPU first (hybrid laptops), with Vulkan 1.3, push descriptors and a queue that draws and presents
+// a discrete GPU first (hybrid laptops), then the one with the most memory; Vulkan 1.3, push descriptors and a
+// queue that draws and presents are required. All usable GPUs are kept, so a device that cannot be opened is skipped.
 bool VulkanBackend::PickDevice() {
     uint32_t n = 0;
-    vkEnumeratePhysicalDevices(instance_, &n, nullptr);
-    if (!n) LOGR("vulkan: the driver lists no GPU");
+    VkResult r = vkEnumeratePhysicalDevices(instance_, &n, nullptr);
+    if (r != VK_SUCCESS) {
+        LOGE("vulkan: cannot list GPUs: %s", VkResultName(r));
+        return false;
+    }
+    if (!n) {
+        LOGE("vulkan: the driver lists no GPU");
+        return false;
+    }
     std::vector<VkPhysicalDevice> list(n);
-    vkEnumeratePhysicalDevices(instance_, &n, list.data());
-    int best = -1;
-    uint32_t best_family = 0;
+    r = vkEnumeratePhysicalDevices(instance_, &n, list.data());
+    if (r != VK_SUCCESS) {
+        LOGE("vulkan: cannot list GPUs: %s", VkResultName(r));
+        return false;
+    }
+    std::vector<DeviceCandidate> found;
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(list[i], &p);
@@ -4591,33 +4626,77 @@ bool VulkanBackend::PickDevice() {
         int family = -1;
         for (uint32_t q = 0; q < qn && family < 0; q++) {
             VkBool32 present = VK_FALSE;
-            vkGetPhysicalDeviceSurfaceSupportKHR(list[i], q, surface_, &present);
+            r = vkGetPhysicalDeviceSurfaceSupportKHR(list[i], q, surface_, &present);
+            if (r != VK_SUCCESS) {
+                skip("the window's surface is not usable on this GPU");
+                break;
+            }
             if ((qf[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) family = int(q);
         }
         if (family < 0) {
-            skip("no queue that draws and presents to the window");
+            if (r == VK_SUCCESS) skip("no queue that draws and presents to the window");
             continue;
         }
-        bool discrete = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
-        if (best < 0 || discrete) {
-            best = int(i);
-            best_family = uint32_t(family);
-            if (discrete) break;
-        }
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(list[i], &mp);
+        uint64_t local = 0;
+        for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+            if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local += mp.memoryHeaps[h].size;
+        found.push_back({list[i], uint32_t(family), p, local});
     }
-    if (best < 0) {
+    if (found.empty()) {
         LOGE("vulkan: no GPU with Vulkan 1.3, push descriptors and presentation to this window");
         return false;
     }
-    pd_ = list[size_t(best)];
-    family_ = best_family;
-    vkGetPhysicalDeviceProperties(pd_, &props_);
-    LOGR("Vulkan adapter: %s, Vulkan %u.%u.%u, driver %08X", props_.deviceName, VK_API_VERSION_MAJOR(props_.apiVersion),
-         VK_API_VERSION_MINOR(props_.apiVersion), VK_API_VERSION_PATCH(props_.apiVersion), props_.driverVersion);
+    auto rank = [](VkPhysicalDeviceType t) {
+        return t == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU  ? 3
+               : t == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
+               : t == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU  ? 1
+                                                           : 0;
+    };
+    std::sort(found.begin(), found.end(), [&](const DeviceCandidate& a, const DeviceCandidate& b) {
+        int ar = rank(a.props.deviceType), br = rank(b.props.deviceType);
+        if (ar != br) return ar > br;
+        if (a.local_memory != b.local_memory) return a.local_memory > b.local_memory;
+        if (a.props.apiVersion != b.props.apiVersion) return a.props.apiVersion > b.props.apiVersion;
+        return std::strcmp(a.props.deviceName, b.props.deviceName) < 0;
+    });
+    device_candidates_ = found;
+    device_candidate_ = 0;
+    for (size_t i = 0; i < device_candidates_.size(); i++) {
+        const DeviceCandidate& c = device_candidates_[i];
+        const char* type = c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU    ? "discrete"
+                           : c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
+                           : c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    ? "virtual"
+                                                                                        : "other";
+        LOGR("vulkan: GPU %zu: %s, %s, Vulkan %u.%u.%u, %llu MiB device-local", i, c.props.deviceName, type,
+             VK_API_VERSION_MAJOR(c.props.apiVersion), VK_API_VERSION_MINOR(c.props.apiVersion),
+             VK_API_VERSION_PATCH(c.props.apiVersion), static_cast<unsigned long long>(c.local_memory >> 20));
+    }
+    return NextDevice();
+}
+
+bool VulkanBackend::NextDevice() {
+    if (device_candidate_ >= device_candidates_.size()) return false;
+    const DeviceCandidate& c = device_candidates_[device_candidate_];
+    pd_ = c.pd;
+    family_ = c.family;
+    props_ = c.props;
+    LOGR("vulkan: trying GPU %zu/%zu: %s, Vulkan %u.%u.%u, driver %08X, %llu MiB device-local", device_candidate_ + 1,
+         device_candidates_.size(), props_.deviceName, VK_API_VERSION_MAJOR(props_.apiVersion),
+         VK_API_VERSION_MINOR(props_.apiVersion), VK_API_VERSION_PATCH(props_.apiVersion), props_.driverVersion,
+         static_cast<unsigned long long>(c.local_memory >> 20));
     return true;
 }
 
 bool VulkanBackend::CreateDevice() {
+    // a previous candidate may have got as far as setting these
+    rt_ok_ = false;
+    null_descriptor_ = false;
+    custom_border_ = false;
+    dlss_dev_ = false;
+    host_reset_ = false;
+    mirror_once_ = false;
     uint32_t en = 0;
     vkEnumerateDeviceExtensionProperties(pd_, nullptr, &en, nullptr);
     std::vector<VkExtensionProperties> ext(en);
@@ -4666,7 +4745,8 @@ bool VulkanBackend::CreateDevice() {
     if (rt_exts) *tail = &as_f, as_f.pNext = &rq_f, tail = &rq_f.pNext;
     vkGetPhysicalDeviceFeatures2(pd_, &f2);
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
-        LOGE("vulkan: the GPU lacks dynamic rendering, synchronization2 or timeline semaphores");
+        LOGE("vulkan: %s lacks dynamic rendering (%d), synchronization2 (%d) or timeline semaphores (%d)", props_.deviceName,
+             f13.dynamicRendering, f13.synchronization2, f12.timelineSemaphore);
         return false;
     }
 
@@ -4750,9 +4830,10 @@ bool VulkanBackend::CreateDevice() {
     ci.pQueueCreateInfos = &qi;
     ci.enabledExtensionCount = uint32_t(want.size());
     ci.ppEnabledExtensionNames = want.data();
+    LOGR("vulkan: creating device on %s with %zu extensions", props_.deviceName, want.size());
     VkResult r = vkCreateDevice(pd_, &ci, nullptr, &dev_);
     if (r != VK_SUCCESS) {
-        LOGE("vulkan: vkCreateDevice failed: %s", VkResultName(r));
+        LOGE("vulkan: vkCreateDevice failed on %s: %s", props_.deviceName, VkResultName(r));
         return false;
     }
 #define VK_LOAD(f)                                                          \
@@ -4856,7 +4937,11 @@ static void DisplayLuminance(void*, float& peak, float& paper) { app::DisplayLum
 
 bool VulkanBackend::CreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd_, surface_, &caps);
+    VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd_, surface_, &caps);
+    if (r != VK_SUCCESS) {
+        LOGE("vulkan: cannot read the window's surface capabilities: %s", VkResultName(r));
+        return false;
+    }
     uint32_t w = 1, h = 1;
     WindowSize(w, h);
     if (caps.currentExtent.width != 0xFFFFFFFFu) w = caps.currentExtent.width, h = caps.currentExtent.height;
@@ -4864,7 +4949,10 @@ bool VulkanBackend::CreateSwapchain() {
     // made so with no transform, and the compositor turns it (a pre-rotated chain would save that pass)
     VkSurfaceTransformFlagBitsKHR transform = caps.currentTransform;
     if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-    if (!w || !h) return false;  // minimised
+    if (!w || !h) {
+        LOGE("vulkan: the window has no drawable size");
+        return false;
+    }
     uint32_t fn = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(pd_, surface_, &fn, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(fn);
@@ -4948,10 +5036,11 @@ bool VulkanBackend::CreateSwapchain() {
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = swap_;
     VkSwapchainKHR made = VK_NULL_HANDLE;
-    VkResult r = vkCreateSwapchainKHR(dev_, &ci, nullptr, &made);
+    r = vkCreateSwapchainKHR(dev_, &ci, nullptr, &made);
     if (swap_) DestroySwapchain();
     if (r != VK_SUCCESS) {
-        LOGE("vulkan: no swap chain: %s", VkResultName(r));
+        LOGE("vulkan: no swap chain (%ux%u, format %d, present mode %d): %s", w, h, int(sf.format), int(present_mode_),
+             VkResultName(r));
         return false;
     }
     swap_ = made;
@@ -4994,12 +5083,20 @@ bool VulkanBackend::CreateFixed() {
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = family_;
-    if (vkCreateCommandPool(dev_, &pci, nullptr, &pool_) != VK_SUCCESS) return false;
+    VkResult r = vkCreateCommandPool(dev_, &pci, nullptr, &pool_);
+    if (r != VK_SUCCESS) {
+        LOGE("vulkan: vkCreateCommandPool failed: %s", VkResultName(r));
+        return false;
+    }
     VkSemaphoreTypeCreateInfo tci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
     tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     sci.pNext = &tci;
-    if (vkCreateSemaphore(dev_, &sci, nullptr, &timeline_) != VK_SUCCESS) return false;
+    r = vkCreateSemaphore(dev_, &sci, nullptr, &timeline_);
+    if (r != VK_SUCCESS) {
+        LOGE("vulkan: vkCreateSemaphore (timeline) failed: %s", VkResultName(r));
+        return false;
+    }
     VkSemaphoreCreateInfo bci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (auto& s : acquire_sem_) vkCreateSemaphore(dev_, &bci, nullptr, &s);
     for (auto& s : warp_sem_) vkCreateSemaphore(dev_, &bci, nullptr, &s);
@@ -5019,14 +5116,21 @@ bool VulkanBackend::CreateFixed() {
     dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     dl.bindingCount = kBindCapture + 1;
     dl.pBindings = b;
-    if (vkCreateDescriptorSetLayout(dev_, &dl, nullptr, &set_layout_) != VK_SUCCESS) return false;
+    r = vkCreateDescriptorSetLayout(dev_, &dl, nullptr, &set_layout_);
+    if (r != VK_SUCCESS) {
+        LOGE("vulkan: vkCreateDescriptorSetLayout failed: %s", VkResultName(r));
+        return false;
+    }
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 16};  // RtCapture's: where a draw's positions go
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &set_layout_;
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(dev_, &pl, nullptr, &layout_) != VK_SUCCESS) return false;
+    if (vkCreatePipelineLayout(dev_, &pl, nullptr, &layout_) != VK_SUCCESS) {
+        LOGE("vulkan: vkCreatePipelineLayout failed");
+        return false;
+    }
     // the ray traced passes': the same, and the acceleration structure
     if (rt_ok_) {
         VkDescriptorSetLayoutBinding rb[kBindRtAdj + 1]{};
@@ -5131,8 +5235,10 @@ bool VulkanBackend::CreateFixed() {
     // the gamma lookup: one BGRA texel per ramp entry; the stand-in texture
     const VkImageUsageFlags sampled = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!MakeImage(lut_, VK_IMAGE_TYPE_2D, kBgra, 256, 1, 1, 1, 1, sampled) ||
-        !MakeImage(dummy_, VK_IMAGE_TYPE_2D, kBgra, 1, 1, 1, 1, 1, sampled))
+        !MakeImage(dummy_, VK_IMAGE_TYPE_2D, kBgra, 1, 1, 1, 1, 1, sampled)) {
+        LOGE("vulkan: the gamma or stand-in texture could not be made");
         return false;
+    }
     uint32_t white = 0xFFFFFFFFu;
     UploadLevel(dummy_, 0, 0, 1, 1, 1, &white, 4);
     return true;
@@ -5173,8 +5279,42 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     guest_h_ = height;
     aspect_ = app::FrameAspect();
     scale_ = app::RenderScale(guest_h_);
-    if (!LoadVulkan() || !CreateInstance() || !PickDevice() || !CreateDevice() || !CreateFixed() || !CreateSwapchain())
+    if (!LoadVulkan()) {
+        LOGE("vulkan: renderer init failed: loading the Vulkan loader");
         return false;
+    }
+    if (!CreateInstance()) {
+        LOGE("vulkan: renderer init failed: creating the Vulkan instance");
+        return false;
+    }
+    if (!PickDevice()) {
+        LOGE("vulkan: renderer init failed: no usable Vulkan GPU");
+        return false;
+    }
+    while (!CreateDevice()) {
+        if (dev_) {
+            if (vkDestroyDevice) vkDestroyDevice(dev_, nullptr);
+            dev_ = VK_NULL_HANDLE;
+        }
+        if (device_candidate_ + 1 >= device_candidates_.size()) {
+            LOGE("vulkan: renderer init failed: creating the Vulkan device (no other GPU to try)");
+            return false;
+        }
+        ++device_candidate_;
+        if (!NextDevice()) {
+            LOGE("vulkan: renderer init failed: selecting another Vulkan GPU");
+            return false;
+        }
+        LOGW("vulkan: trying another GPU after the first one could not be opened");
+    }
+    if (!CreateFixed()) {
+        LOGE("vulkan: renderer init failed: creating the fixed Vulkan objects");
+        return false;
+    }
+    if (!CreateSwapchain()) {
+        LOGE("vulkan: renderer init failed: creating the swap chain");
+        return false;
+    }
     // DXC, unless glslang compiles the shaders (macOS has no DXC: ray tracing, its 6.5 shaders, is off there)
     if (!GlslangWanted() && !dxc::Load()) return false;
     // the shaders the passes need, compiled once now: a DXC that cannot make SPIR-V fails here, not mid-game
